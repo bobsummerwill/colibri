@@ -742,6 +742,32 @@ EP2, SM121 kernels, or graph runtime. Cold loads and partial-hit tokens still
 use host expert storage; this is not full model preloading.
 
 Validation covers six-device cache ownership, full/partial/incomplete residency,
-locking through compute, backend-decline fallback, and CPU compilation. These
-checks do not establish GPU numerical equivalence or a throughput improvement;
-the earlier six-GPU benchmark predates this optimization.
+locking through compute, backend-decline fallback, and CPU compilation. The subsequent
+[six-RTX-5090 test](experiments/dsv4-resident-2026-09-27.md) measured about 3.8%
+median decode improvement against an otherwise identical fused-path control.
+Its output matches that control, but differs from the original unfused baseline;
+this is not a claim of numerical equivalence or general model-quality validation.
+
+### Full routed-expert residency (opt-in)
+
+With the CUDA build, `DSV4_CUDA_RESIDENT_EXPERTS=1` loads every target routed
+expert onto its layer's owning device at engine open. Dense weights must also
+use the resident runtime tier. The immutable table is indexed directly by layer
+and expert, following Naruto's prebuilt device expert-table approach. Target
+experts are never evicted; MTP experts retain their separate cache.
+
+The loader uploads dense mirrors first, checks every device's available VRAM
+against its complete expert footprint plus `DSV4_CUDA_VRAM_RESERVE_MB` (default
+2800 MiB, minimum 256 MiB), then uploads experts. The setting overrides the LRU
+mirror capacity: the table has exactly one slot per assigned expert. A failed
+budget check, host lookup, unsupported tensor layout or upload aborts engine
+open and releases partial allocations. Publication occurs only when all cards
+have completed loading. A resident execution failure is reported rather than
+silently loading experts on the CPU.
+
+Prefill currently uses the per-token GPU MoE pipeline with these same tables,
+not the CPU expert union or a duplicate streaming expert bank. This removes
+expert host reads after preload but does not implement batched resident MoE,
+TP/EP, device-only activations, or SM120 MMA kernels. Startup reads the complete
+expert set; cold-start latency and steady-state decode must be measured
+separately. Host expert-cache memory is still governed by the existing budget.
