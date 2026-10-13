@@ -16446,6 +16446,22 @@ static void v4_serve_finish(ColiV4Engine *engine, ColiV4Session *session,
      * they exceeded the wall on a cold tiny run (0.073 s of disk in a 0.034 s turn). */
     double attention_s = (g_v4_prof_block_s - marks->block) - expert_matmul_s - expert_wait_s;
     if (attention_s < 0.0) attention_s = 0.0;
+    {   /* V4_SERVE_STATS_LOG=1: the turn's DONE/PROF numbers on stderr too (the
+         * gateway consumes stdout), for decode benchmarking from the serve log. */
+        static int stats_log = -1;
+        if (stats_log < 0) {
+            const char *setting = getenv("V4_SERVE_STATS_LOG");
+            stats_log = setting && atoi(setting) > 0;
+        }
+        if (stats_log)
+            fprintf(stderr, "v4_serve_turn prompt=%d completion=%d decode_s=%.2f "
+                    "tok_s=%.3f hit=%.1f%% expert_disk_s=%.2f expert_wait_s=%.2f "
+                    "expert_matmul_s=%.2f attention_s=%.2f rss_gb=%.1f\n",
+                    prompt_tokens, completion, decode,
+                    decode > 0.0 ? completion / decode : 0.0, hit_rate,
+                    expert_disk_s, expert_wait_s, expert_matmul_s, attention_s,
+                    v4_serve_rss_gb());
+    }
     v4_prof_emit(elapsed, prompt_tokens, completion,
                  expert_disk_s, expert_wait_s, expert_matmul_s, attention_s,
                  g_v4_prof_head_s - marks->head, g_v4_prof_forwards - marks->forwards);
