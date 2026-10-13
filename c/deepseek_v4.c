@@ -11863,22 +11863,31 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
     }
     if (!outputs || !weights || !config || !store || !inputs || !tokens ||
         batch < 1 || batch > 128) V4_MOE_BATCH_REFUSE("bad arguments");
-    /* The backend batch kernels are hardwired to this geometry. */
-    if (config->n_routed_experts != 256 || config->hidden_size != 4096 ||
-        config->num_experts_per_tok != 6)
+    /* The backend batch kernels are hardwired to this geometry. Expert-pruned
+     * checkpoints (REAP: fewer than 256 routed experts) still fit the
+     * 256-slot bank; only the GPU router needs exactly 256, so they route on
+     * the CPU below. */
+    if (config->n_routed_experts < 1 || config->n_routed_experts > 256 ||
+        config->hidden_size != 4096 || config->num_experts_per_tok != 6)
         V4_MOE_BATCH_REFUSE("unsupported model geometry");
     Dsv4CudaTensor *gate = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "ffn.gate");
     Dsv4CudaTensor *bias = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "ffn.gate.bias");
     Dsv4CudaTensor *sg = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "ffn.shared_experts.w1");
     Dsv4CudaTensor *su = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "ffn.shared_experts.w3");
     Dsv4CudaTensor *sd = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "ffn.shared_experts.w2");
-    if (!gate) V4_MOE_BATCH_REFUSE("no ffn.gate mirror");
+    /* The f32 gate mirror only exists for 256 experts (GPU router); pruned
+     * checkpoints route on the CPU and take the device from the shared
+     * experts instead. */
+    if (!gate && config->n_routed_experts == 256)
+        V4_MOE_BATCH_REFUSE("no ffn.gate mirror");
     if (!sg || !su || !sd) V4_MOE_BATCH_REFUSE("no shared-expert mirrors");
 #undef V4_MOE_BATCH_REFUSE
-    int device = dsv4_cuda_tensor_device(gate);
+    int device = dsv4_cuda_tensor_device(gate ? gate : sg);
     if (device < 0) return -1;
     if (!bank) {
-        bank = dsv4_cuda_expert_bank_create(256, 4096, 2048, device, sg, su, sd);
+        bank = dsv4_cuda_expert_bank_create(
+            dsv4_cuda_expert_bank_slots(config->n_routed_experts), 4096, 2048,
+            device, sg, su, sd);
         if (!bank) {
             /* Out of VRAM, or shared-mirror shapes off: remember instead of
              * retrying a 2 GiB allocation on every chunk. */
@@ -11887,7 +11896,8 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
             bank_failed = 1;
             return -1;
         }
-        fprintf(stderr, "v4_gpu moe-batch=on bank=256-experts\n");
+        fprintf(stderr, "v4_gpu moe-batch=on bank=%d-experts\n",
+                dsv4_cuda_expert_bank_slots(config->n_routed_experts));
     }
     /* Route-aware refill: the persistent bank is a perfect per-layer expert
      * cache. Each chunk routes first, then uploads only the routed experts
@@ -11920,7 +11930,8 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
             if (next >= 0) {
                 if (!v4_moe_bank2) {
                     v4_moe_bank2 = dsv4_cuda_expert_bank_create(
-                        256, 4096, 2048, device, sg, su, sd);
+                        dsv4_cuda_expert_bank_slots(config->n_routed_experts),
+                        4096, 2048, device, sg, su, sd);
                     if (!v4_moe_bank2) {
                         /* Not enough VRAM for two full banks: stay on the
                          * proven single-bank path, permanently and loudly. */
@@ -11952,51 +11963,77 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
         }
     }
     if (!dsv4_cuda_activation_upload(in_mirror, inputs, elements)) return -1;
+    /* V4_MOE_BATCH_PROF=1: one `moebprof` line per chunk-layer splitting the
+     * batched MoE into route / refill (store lookups + bank uploads) /
+     * compute (routed + shared kernels, download, sync). */
+    static int moeb_prof = -1;
+    if (moeb_prof < 0) {
+        const char *setting = getenv("V4_MOE_BATCH_PROF");
+        moeb_prof = setting && atoi(setting) > 0;
+    }
+    struct timespec moeb_t0, moeb_t1, moeb_t2, moeb_t3;
+    if (moeb_prof) clock_gettime(CLOCK_MONOTONIC, &moeb_t0);
+    int moeb_missing = 0;
     int topk = config->num_experts_per_tok;
     int ids[128 * 6];
     float route_weights[128 * 6];
-    if (weights->plan.uses_hash_router) {
+    if (weights->plan.uses_hash_router || config->n_routed_experts != 256) {
         /* Hash layers route on the CPU: ids from the token table, weights
-         * from the bf16 gate logits — identical to the CPU union. */
+         * from the bf16 gate logits — identical to the CPU union. Pruned
+         * expert counts take the same CPU router (score top-k, no table):
+         * the GPU top-6 kernel assumes 256 logits per token. */
+        const int hashed = weights->plan.uses_hash_router;
         const ColiDeepSeekV4TensorSpec *spec = NULL;
         char name[COLI_V4_MAX_TENSOR_NAME];
         snprintf(name, sizeof(name), "layers.%d.ffn.gate.tid2eid",
                  weights->plan.layer);
-        const int64_t *table = coli_v4_layer_data(weights, name, &spec);
+        const int64_t *table = hashed ?
+            coli_v4_layer_data(weights, name, &spec) : NULL;
         snprintf(name, sizeof(name), "layers.%d.ffn.gate.weight",
                  weights->plan.layer);
         const uint16_t *raw_gate = coli_v4_layer_data(weights, name, NULL);
         snprintf(name, sizeof(name), "layers.%d.ffn.gate.bias",
                  weights->plan.layer);
         const float *raw_bias = coli_v4_layer_data(weights, name, NULL);
-        if (!table || !spec || spec->rank != 2 || spec->shape[1] != topk ||
-            !raw_gate)
+        if (!raw_gate) return -1;
+        if (hashed && (!table || !spec || spec->rank != 2 ||
+                       spec->shape[1] != topk))
             return -1;
+        /* Tokens route independently (the router keeps only stack state), so
+         * the chunk spreads over the OpenMP team; each token's gate dot
+         * products keep their serial order, so routing stays bit-identical
+         * to the CPU union and to decode. */
+        int route_failed = 0;
+#pragma omp parallel for schedule(static) if (batch >= 16) reduction(|:route_failed)
         for (int item = 0; item < batch; item++) {
-            for (int rank = 0; rank < topk; rank++)
-                ids[item * topk + rank] =
-                    (int)table[(size_t)tokens[item] * topk + rank];
+            if (hashed)
+                for (int rank = 0; rank < topk; rank++)
+                    ids[item * topk + rank] =
+                        (int)table[(size_t)tokens[item] * topk + rank];
             if (coli_v4_route_bf16(
                     route_weights + (size_t)item * topk,
                     ids + (size_t)item * topk,
                     inputs + (size_t)item * config->hidden_size,
-                    raw_gate, raw_bias, ids + (size_t)item * topk,
+                    raw_gate, raw_bias,
+                    hashed ? ids + (size_t)item * topk : NULL,
                     config->n_routed_experts, config->hidden_size, topk,
                     config->routed_scaling_factor))
-                return -1;
+                route_failed = 1;
         }
+        if (route_failed) return -1;
     } else if (!dsv4_cuda_route_top6_batch(
                    in_mirror, gate, bias, batch,
                    config->routed_scaling_factor, ids, route_weights)) {
         return -1;
     }
+    if (moeb_prof) clock_gettime(CLOCK_MONOTONIC, &moeb_t1);
     /* Upload the chunk's missing routed experts. Lookups run in parallel
      * (thread-safe; the CPU union's loaders already do this), uploads stay
      * sequential on the single bank. */
     int missing[256], missing_count = 0;
     for (int r = 0; r < batch * topk; r++) {
         int expert = ids[r];
-        if (expert < 0 || expert >= 256) return -1;
+        if (expert < 0 || expert >= config->n_routed_experts) return -1;
         if (!bank_valid[expert]) {
             bank_valid[expert] = 2; /* pending */
             missing[missing_count++] = expert;
@@ -12020,10 +12057,10 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
         if (full_min > 0 && missing_count &&
             v4_gpu_moe_batch_hint_tokens >= full_min) {
             int fresh_layer = 1;
-            for (int e = 0; e < 256 && fresh_layer; e++)
+            for (int e = 0; e < config->n_routed_experts && fresh_layer; e++)
                 if (bank_valid[e] == 1) fresh_layer = 0;
             if (fresh_layer)
-                for (int e = 0; e < 256; e++)
+                for (int e = 0; e < config->n_routed_experts; e++)
                     if (!bank_valid[e]) {
                         bank_valid[e] = 2;
                         missing[missing_count++] = e;
@@ -12200,12 +12237,25 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
             return -1;
         }
     }
+    if (moeb_prof) {
+        moeb_missing = missing_count;
+        clock_gettime(CLOCK_MONOTONIC, &moeb_t2);
+    }
     if (!dsv4_cuda_route_moe_ids_batch(in_mirror, ids, route_weights, batch,
                                        bank, config->swiglu_limit,
                                        out_mirror) ||
         !dsv4_cuda_activation_download(outputs, out_mirror, elements) ||
         !dsv4_cuda_activation_sync(out_mirror))
         return -1;
+    if (moeb_prof) {
+#define MOEB_MS(a, b) (((b).tv_sec - (a).tv_sec) * 1e3 + ((b).tv_nsec - (a).tv_nsec) / 1e6)
+        clock_gettime(CLOCK_MONOTONIC, &moeb_t3);
+        fprintf(stderr, "moebprof layer=%d n=%d missing=%d route=%.1f refill=%.1f "
+                "compute=%.1f ms\n", weights->plan.layer, batch, moeb_missing,
+                MOEB_MS(moeb_t0, moeb_t1), MOEB_MS(moeb_t1, moeb_t2),
+                MOEB_MS(moeb_t2, moeb_t3));
+#undef MOEB_MS
+    }
     return 0;
 #undef bank
 #undef bank_layer
