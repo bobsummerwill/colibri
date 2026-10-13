@@ -285,6 +285,39 @@ Answers were identical to the CPU union in every run. Decode is unchanged
 reserve now also covers the prefetch bank (+3.3 GB), so it allocates after
 decode has grown its mirror cache; that costs a few percent of decode speed.
 
+### Decode on two GPUs (peer mirror pool) and VRAM-first lookups
+
+Decode mirrors routed experts in VRAM, but a mirror used to be an upload
+cache only: every routed expert was still fetched from the RAM expert store
+(and the SSD on a miss) before its mirror was found. Two opt-in levers turn
+VRAM into a real tier:
+
+- `V4_GPU_RESIDENT_FIRST=1`: an expert already mirrored in VRAM is computed
+  from the mirror without asking the store, so its RAM slot goes cold and the
+  RAM tier holds other experts.
+- `DSV4_CUDA_PEER_DEVICE=N`: a second mirror pool on GPU N (needs peer
+  access, e.g. NVLink). The fused decode MoE runs the experts mirrored there
+  ON that GPU (`DSV4_CUDA_PEER_COMPUTE`, default 1): the token's input is
+  copied over P2P, the same kernels run on local weights, and each expert's
+  output row is written into the primary GPU's reduce buffer. Results are
+  bit-identical to computing every expert on one GPU.
+
+Measured on the REAP 150B setup above (2× RTX 3090 with an NVLink bridge,
+`--ram 40`, six 300-token answers, greedy; answers identical in every run):
+
+| configuration | decode tok/s (mean) |
+|---|---|
+| one GPU (before) | 2.78 |
+| + `V4_GPU_RESIDENT_FIRST=1` | 2.84 |
+| + `DSV4_CUDA_PEER_DEVICE=1`, `DSV4_CUDA_PEER_COMPUTE=0` (NVLink reads) | 3.32 |
+| + `DSV4_CUDA_PEER_DEVICE=1` (peer compute) | **3.87** |
+
+Prefill is unchanged (it runs on the primary GPU's bank). On this box the
+host→GPU uploads run at ~12 GB/s (PCIe 4.0 x8 per card), so an expert read
+from the peer pool beats an upload from RAM by a wide margin.
+`V4_SERVE_STATS_LOG=1` prints per-turn decode stats and the decode MoE split
+(store fetch wait / VRAM attach / GPU) on stderr.
+
 ## Prefill: segments, chunks, checkpoints
 
 - **Chunks/segments.** Prefill runs layer-major over 128-token chunks
@@ -369,7 +402,7 @@ is no software path to fall back to.
 | generic DLL / `CUDA=1` | any sm_80+ | GPU attention block, indexer, generic batched MoE on the VRAM bank | GPU attention, indexer, expert mirrors |
 | generic, pre-Ampere / `CUDA=1 CUDA_ARCH=portable-pre-ampere NO_TC=1` | sm_61 (Pascal), sm_75 (Turing) | as generic | as generic |
 | DeepGEMM DLL / `CUDA=1 DEEPGEMM=1` | compute 12.x | as generic + tensor-core dense/MoE GEMMs | same as generic |
-| multi-GPU | — | single device today (`DSV4_CUDA_DEVICE` selects); expert-parallel design drafted, not implemented | — |
+| multi-GPU | — | prefill: single device (`DSV4_CUDA_DEVICE`); decode: optional peer mirror pool on a second GPU (`DSV4_CUDA_PEER_DEVICE`, P2P required) | — |
 
 The runtime check `dsv4_cuda_backend_arch_ok` admits sm_60 and up for the
 generic build. It is deliberately independent of what the binary contains: a
@@ -451,6 +484,12 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_MOE_EM_TB` (4, `.cu`) | routes per pass of the expert-major kernel (2, 3, 4, 6) |
 | `DSV4_MM_WARP` (auto, `.cu`) | generic dense batch matmul: warp-per-row kernel for I ≤ 1024; `1` = all fp8 shapes, `0` = off; `DSV4_MM_WARP_VERIFY=1` compares bit for bit |
 | `V4_MOE_BATCH_PROF` (0) | `1` = one `moebprof` line per chunk-layer: route / refill / compute ms |
+| `V4_GPU_RESIDENT_FIRST` (0) | `1` = decode computes VRAM-mirrored experts without an expert-store lookup (VRAM adds to the RAM tier) |
+| `DSV4_CUDA_PEER_DEVICE` (unset) | second GPU for a decode mirror pool (peer access required) |
+| `DSV4_CUDA_PEER_COMPUTE` (1, `.cu`) | run the peer pool's experts on the peer GPU; `0` = read them in place over P2P |
+| `DSV4_CUDA_PEER_MIRRORS` (4096) / `DSV4_CUDA_PEER_RESERVE_MB` (1024) | peer pool capacity / VRAM kept free on the peer |
+| `DSV4_CUDA_PIN_CAP_GB` (20, `.cu`) | cap on page-locked expert-slab bytes for uploads |
+| `V4_SERVE_STATS_LOG` (0) | `1` = per-turn decode stats and decode MoE timing on stderr |
 
 **Prefill / checkpoints**
 | var | meaning |
