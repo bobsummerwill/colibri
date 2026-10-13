@@ -251,6 +251,40 @@ GPU fill branch and the CPU branch using bandwidths measured at runtime, and
 layer's full expert set into a second VRAM bank while the current layer
 computes, falling back to the single bank when VRAM is short.
 
+### Expert-pruned checkpoints (REAP) and the generic kernels
+
+Expert-pruned checkpoints such as `puwaer/DeepSeek-V4-Flash-0731-reap-150b`
+(132 routed experts instead of 256) use the batched prefill MoE path too: the
+CPU router picks their experts (tokens in parallel, bit-identical to the CPU
+union) because the GPU top-6 kernel assumes 256 logits, and on generic
+(non-DeepGEMM) builds the bank is sized to the model's expert count
+(132 slots ≈ 1.6 GB instead of 3.2 GB). DeepGEMM builds keep a 256-slot bank.
+
+The generic kernels themselves got two bit-identical rewrites (same operands
+in the same order for every output; `_VERIFY=1` runs old and new side by side
+and counts mismatching bits):
+
+- `DSV4_MOE_EXPERT_MAJOR` (1): the routed experts run expert-major — one warp
+  per expert row walks every token of the chunk that picked that expert, so
+  each expert's weights are read once per chunk instead of once per route.
+- `DSV4_MM_WARP` (auto): warp-per-row dense batch matmul for short rows
+  (I ≤ 1024, e.g. `attn.wq_b`); `1` forces it on every fp8 shape (measured
+  slower on the 2048/4096-row ones), `0` disables it.
+
+Measured on 2× RTX 3090 (one used; sm_86, CUDA 12.0 `NO_TC=1`), Ryzen 9 9950X3D,
+62 GB RAM (`--ram 40`), one SN850X, REAP 150B, greedy, `--ctx 8192`, cold
+server per run:
+
+| prompt | CPU union (before) | GPU batch, per-route kernels | + expert-major + warp dense | + `COLI_CUDA_MOE_DOUBLE=1` |
+|---|---|---|---|---|
+| 1,992 tokens | 220.5 s | 125.4 s | 79.7 s | **69.1 s** |
+| ~3,000 tokens | 334.4 s | 183.5 s | 118.2 s | **105.8 s** |
+
+Answers were identical to the CPU union in every run. Decode is unchanged
+(2.2–2.9 tok/s, disk-bound). With `COLI_CUDA_MOE_DOUBLE=1` the default VRAM
+reserve now also covers the prefetch bank (+3.3 GB), so it allocates after
+decode has grown its mirror cache; that costs a few percent of decode speed.
+
 ## Prefill: segments, chunks, checkpoints
 
 - **Chunks/segments.** Prefill runs layer-major over 128-token chunks
@@ -408,11 +442,15 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `COLI_CUDA_MOE_BATCH` (0) | `1` = prefill MoE on the transient VRAM expert bank |
 | `COLI_CUDA_MOE_BATCH_MIN` (256) | min fresh tokens to engage the bank |
 | `DSV4_CUDA_EXPERT_MIRRORS` (4096) | upper bound on decode VRAM expert mirrors (~8 MB each); free VRAM sizes the cache at run time |
-| `DSV4_CUDA_VRAM_RESERVE_MB` (2800 with the bank, else 600) | VRAM kept free while mirrors grow (bank + attention buffers) |
+| `DSV4_CUDA_VRAM_RESERVE_MB` (2800 with the bank, +3300 with `COLI_CUDA_MOE_DOUBLE=1`, else 600) | VRAM kept free while mirrors grow (bank + attention buffers) |
 | `V4_MTP_GPU_MIRRORS` (16) | separate mirror cache for the MTP drafter |
 | `DSV4_CUDA_PIN_HOST` (1, `.cu`) | page-lock expert-cache slabs for DMA uploads |
 | `DSV4_CUDA_MOE_GROUPED` (1, `.cu`) | expert-grouped MoE GEMM rows; `0` = legacy replicated |
 | `V4_MOE_BANK_FULL` (off) | `=N`: prefetch a whole layer's experts above N tokens (measured worse) |
+| `DSV4_MOE_EXPERT_MAJOR` (1, `.cu`) | generic batched MoE: expert-major fp4 kernel (weights read once per chunk); `0` = one matvec per route; `_VERIFY=1` compares both bit for bit |
+| `DSV4_MOE_EM_TB` (4, `.cu`) | routes per pass of the expert-major kernel (2, 3, 4, 6) |
+| `DSV4_MM_WARP` (auto, `.cu`) | generic dense batch matmul: warp-per-row kernel for I ≤ 1024; `1` = all fp8 shapes, `0` = off; `DSV4_MM_WARP_VERIFY=1` compares bit for bit |
+| `V4_MOE_BATCH_PROF` (0) | `1` = one `moebprof` line per chunk-layer: route / refill / compute ms |
 
 **Prefill / checkpoints**
 | var | meaning |
