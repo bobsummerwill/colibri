@@ -254,9 +254,12 @@ template<int F,int TB> __global__ void __launch_bounds__(256) mm_batch_w(const u
 }
 __global__ void count_bit_mismatch(const float*a,const float*b,long long n,unsigned long long*count);
 static void run_mm_batch(Dsv4CudaTensor*t,const float*x,float*y,int T,cudaStream_t stream){
+    /* DSV4_MM_WARP: unset = warp kernel for short rows only (I <= 1024, e.g.
+     * attn.wq_b, where mm_batch spends most of each block in its tree; measured
+     * slower on the 2048/4096-row shapes), 1 = every fp8 shape, 0 = never. */
     static int mw=-1,mwv=0;static float*vbuf=nullptr;static size_t vcap=0;static unsigned long long*vcount=nullptr,vcalls=0,vbad=0;
-    if(mw<0){const char*e=getenv("DSV4_MM_WARP");mw=e?atoi(e)!=0:0;e=getenv("DSV4_MM_WARP_VERIFY");mwv=e&&atoi(e)!=0;if(mwv)mw=1;}
-    if(mw&&(t->fmt==8||t->fmt==9)&&t->I%256==0){
+    if(mw<0){const char*e=getenv("DSV4_MM_WARP");mw=e?(atoi(e)!=0?2:0):1;e=getenv("DSV4_MM_WARP_VERIFY");mwv=e&&atoi(e)!=0;if(mwv&&!mw)mw=1;}
+    if(mw&&(t->fmt==8||t->fmt==9)&&t->I%256==0&&(mw==2||t->I<=1024)){
         dim3 wg((t->O+7)/8,(T+7)/8);
         float*dst=y;size_t n=(size_t)T*t->O;
         if(mwv){if(vcap<n){if(vbuf)cudaFree(vbuf);vbuf=nullptr;vcap=0;if(cudaMalloc(&vbuf,n*sizeof(float))!=cudaSuccess)mwv=0;else vcap=n;}
@@ -2023,6 +2026,10 @@ extern "C" Dsv4CudaExpertSet *dsv4_cuda_expert_bank_create(int count,int H,int I
        !ok(cudaMalloc(&set->bank_fc2_dg_scale,fc2_s),"expert FC2 DeepGEMM scale allocation")||
 #endif
        !ok(cudaMalloc(&set->table,(size_t)3*count*sizeof(ExpertPtr)),"expert table allocation")){
+        /* A failed cudaMalloc is also the runtime's last error: clear it, or
+         * the next launch check (cudaGetLastError) reports this OOM and fails
+         * a chunk that never touched the missing bank. */
+        (void)cudaGetLastError();
         dsv4_cuda_expert_set_free(set);return nullptr;
     }
     return set;
@@ -2360,11 +2367,12 @@ extern "C" int dsv4_cuda_route_moe_ids_batch(const Dsv4CudaActivation*input,cons
         const float*x=input->data+(long long)t*H;
         hd[2*r]={fc1,fc1s,x,c->p1+(long long)r*I};
         hd[2*r+1]={fc1+w1,fc1s+s1,x,c->p2+(long long)r*I};}
-    /* DSV4_MOE_EXPERT_MAJOR=1 streams each routed expert once per chunk
-     * (mv_fp4_expert_major); =0 keeps one matvec per route. _VERIFY=1 runs
-     * both and counts bit mismatches (the per-route results are used). */
+    /* Default: stream each routed expert once per chunk (mv_fp4_expert_major,
+     * bit-identical); DSV4_MOE_EXPERT_MAJOR=0 keeps one matvec per route.
+     * DSV4_MOE_EXPERT_MAJOR_VERIFY=1 runs both and counts bit mismatches (the
+     * per-route results are used). DSV4_MOE_EM_TB=2|3|4|6 routes per pass. */
     static int em_mode=-1,em_verify=-1,em_tb=4;static unsigned long long em_calls=0,em_bad1=0,em_bad2=0;
-    if(em_mode<0){const char*v=getenv("DSV4_MOE_EXPERT_MAJOR");em_mode=v?atoi(v)!=0:0;
+    if(em_mode<0){const char*v=getenv("DSV4_MOE_EXPERT_MAJOR");em_mode=v?atoi(v)!=0:1;
         v=getenv("DSV4_MOE_EM_TB");if(v)em_tb=atoi(v);
         v=getenv("DSV4_MOE_EXPERT_MAJOR_VERIFY");em_verify=v?atoi(v)!=0:0;if(em_verify)em_mode=1;}
     int nex=0;

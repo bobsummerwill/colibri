@@ -10879,6 +10879,7 @@ static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_capacity(
 static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create(int device,
                                                             int suggested);
 static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache);
+int v4_bank_double_on(void);
 static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                                           ColiExpertView *view, int sync);
 
@@ -11443,11 +11444,16 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
          * expert bank (~2.2 GiB, COLI_CUDA_MOE_BATCH) plus attention buffers.
          * DSV4_CUDA_VRAM_RESERVE_MB overrides; the default only reserves the
          * bank when that path is enabled, so small cards can still mirror. */
+        /* The COLI_CUDA_MOE_DOUBLE prefetch bank needs room too, or the
+         * mirrors decode grew leave no space for it and it never allocates;
+         * the default adds a 256-slot bank (~3.3 GB). */
         static long long reserve_mb = -1;
         if (reserve_mb < 0) {
             const char *env = getenv("DSV4_CUDA_VRAM_RESERVE_MB");
             reserve_mb = env ? atoll(env)
-                             : (coli_v4_gpu_moe_batch_wanted() ? 2800 : 600);
+                             : (coli_v4_gpu_moe_batch_wanted()
+                                    ? 2800 + (v4_bank_double_on() ? 3300 : 0)
+                                    : 600);
             if (reserve_mb < 256) reserve_mb = 256;
         }
         /* cudaMemGetInfo is a driver round trip; with a large capacity the
@@ -11736,7 +11742,7 @@ static int v4_bank2_disabled;
 static unsigned long long v4_bank2_swaps, v4_bank2_prefetched;
 static struct { ColiExpertStore *store; int layer; } v4_bank2_job;
 
-static int v4_bank_double_on(void) {
+int v4_bank_double_on(void) {
     static int on = -1;
     if (on < 0) {
         const char *setting = getenv("COLI_CUDA_MOE_DOUBLE");
