@@ -166,7 +166,7 @@ int main(void){
                       "%s device: %s: \"%s\"",k?"peer":"primary",cudaGetErrorName(busy[b]),why);
                 CHECK(has_context(1)==0,"device 1 has a context after its %s probe refusal (%s)",k?"own":"primary's",cudaGetErrorName(busy[b]));}
             fail_image_dev=1;fail_image_err=cudaErrorMemoryAllocation;usable=dsv4_cuda_peer_probe(0,1,why,sizeof why);fail_image_dev=-1;fail_image_err=cudaSuccess;
-            CHECK(!usable&&strstr(why,"peer device 1")&&strstr(why,"kernel-image check")&&strstr(why,cudaGetErrorString(cudaErrorMemoryAllocation))&&!rebuild_hint(why),"kernel query out of memory: \"%s\"",why);
+            CHECK(!usable&&strstr(why,"peer device 1")&&strstr(why,"kernel-image check")&&strstr(why,cudaGetErrorString(cudaErrorMemoryAllocation))&&!rebuild_hint(why)&&!strstr(why,"rebuild")&&!strstr(why,"code only"),"kernel query out of memory: \"%s\"",why);
             CHECK(has_context(1)==0,"the refused peer kept the context of its failed kernel-image check");}
         usable=dsv4_cuda_peer_probe(0,1,why,sizeof why);
         printf("probe 0 -> 1: %s%s\n",usable?"usable":"refused: ",why);
