@@ -209,6 +209,7 @@ typedef Dsv4CudaExpertSet *(*fn_expert_set_create)(Dsv4CudaTensor *const *gate, 
 typedef int             (*fn_expert_bank_slots)(int experts);
 typedef long long       (*fn_expert_bank_slot_bytes)(int hidden, int intermediate);
 typedef int             (*fn_peer_access)(int a, int b);
+typedef int             (*fn_peer_probe)(int device, int peer, char *why, int why_size);
 typedef Dsv4CudaExpertSet *(*fn_expert_bank_create)(int count, int hidden, int intermediate, int device,
                                                     Dsv4CudaTensor *shared_gate, Dsv4CudaTensor *shared_up,
                                                     Dsv4CudaTensor *shared_down);
@@ -332,6 +333,7 @@ static struct {
     fn_expert_bank_slots expert_bank_slots; /* optional (older DLLs: 256 only) */
     fn_expert_bank_slot_bytes expert_bank_slot_bytes; /* optional (older DLLs) */
     fn_peer_access peer_access; /* optional (older DLLs: no peer mirror pool) */
+    fn_peer_probe peer_probe;   /* optional (older DLLs: no peer mirror pool) */
     fn_expert_bank_upload expert_bank_upload;
     fn_expert_bank_set_shared expert_bank_set_shared;
     fn_expert_bank_upload_tp2 expert_bank_upload_tp2;
@@ -532,6 +534,7 @@ static int dsv4_cuda_resolve(const char *dllname){
     g_dsv4.expert_bank_slots = (fn_expert_bank_slots)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_slots");
     g_dsv4.expert_bank_slot_bytes = (fn_expert_bank_slot_bytes)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_slot_bytes");
     g_dsv4.peer_access = (fn_peer_access)GetProcAddress(g_dsv4.dll, "dsv4_cuda_peer_access");
+    g_dsv4.peer_probe = (fn_peer_probe)GetProcAddress(g_dsv4.dll, "dsv4_cuda_peer_probe");
     g_dsv4.backend_name = (fn_backend_name)GetProcAddress(g_dsv4.dll, "dsv4_cuda_backend_name");
     _Pragma("GCC diagnostic pop")
     return 1;
@@ -964,6 +967,22 @@ Dsv4CudaExpertSet *dsv4_cuda_expert_set_create(Dsv4CudaTensor *const *gate, Dsv4
 
 int dsv4_cuda_peer_access(int a, int b){
     return g_dsv4.available && g_dsv4.peer_access ? g_dsv4.peer_access(a, b) : 0;
+}
+
+/* Asked before dsv4_cuda_init, so it loads the DLL itself (idempotent; init
+ * then reuses it). An older DLL without the export: no peer mirror pool. */
+int dsv4_cuda_peer_probe(int device, int peer, char *why, int why_size){
+    if(why && why_size > 0) why[0] = 0;
+    if(!dsv4_cuda_load()){
+        if(why && why_size > 0) snprintf(why, (size_t)why_size, "no usable CUDA backend DLL");
+        return 0;
+    }
+    if(!g_dsv4.peer_probe){
+        if(why && why_size > 0)
+            snprintf(why, (size_t)why_size, "%s predates the peer probe (an older build)", g_dsv4.loaded_name);
+        return 0;
+    }
+    return g_dsv4.peer_probe(device, peer, why, why_size);
 }
 
 int dsv4_cuda_expert_bank_slots(int experts){

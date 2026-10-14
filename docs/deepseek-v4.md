@@ -339,12 +339,17 @@ VRAM into a real tier:
   ON that GPU (`DSV4_CUDA_PEER_COMPUTE`, default 1): the token's input is
   copied over P2P, the same kernels run on local weights, and each expert's
   output row is written into the primary GPU's reduce buffer. Results are
-  bit-identical to computing every expert on one GPU. A miss grows the
-  primary cache, then the pool, and once neither can grow recycles the older
-  of the two LRU mirrors; a cache with fewer than 8 live mirrors (a nearly
-  full card, `DSV4_CUDA_PEER_RESERVE_MB` above its free VRAM) is never
-  recycled, so a starved pool only adds mirrors and never sends an expert to
-  the CPU that the primary cache would have taken.
+  bit-identical to computing every expert on one GPU. GPU N is checked before
+  anything is set up on it (a visible device other than the primary, peer
+  access both ways, an architecture and kernel image the build runs); when it
+  fails, it is left untouched, decode runs on the primary alone, and the
+  `peer mirror pool off:` warning gives the reason and, for a missing kernel
+  image, the `CUDA_ARCH` to rebuild with.
+  A miss grows the primary cache, then the pool, and once neither can grow
+  recycles the older of the two LRU mirrors; a cache with fewer than 8 live
+  mirrors (a nearly full card, `DSV4_CUDA_PEER_RESERVE_MB` above its free
+  VRAM) is never recycled, so a starved pool only adds mirrors and never
+  sends an expert to the CPU that the primary cache would have taken.
 
 Measured on the REAP 150B setup above (2× RTX 3090 with an NVLink bridge,
 `--ram 40`, six 300-token answers, greedy; answers identical in every run):

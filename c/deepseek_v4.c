@@ -10984,7 +10984,18 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     const char *peer_setting = getenv("DSV4_CUDA_PEER_DEVICE");
     int peer = peer_setting && *peer_setting ? atoi(peer_setting) : -1;
     int devices[2] = {device, peer};
-    int ndevices = peer >= 0 && peer != device ? 2 : 1;
+    int ndevices = 1;
+    if (peer >= 0) {
+        /* Settle the peer pool BEFORE any init: a peer that gets no pool is
+         * never initialised (no context, streams or buffers held on it for
+         * the whole run). */
+        char why[320];
+        if (!dsv4_cuda_peer_probe(device, peer, why, (int)sizeof why)) {
+            fprintf(stderr, "v4_gpu warning=peer mirror pool off: %s\n", why);
+        } else {
+            ndevices = 2;
+        }
+    }
     /* A failed two-device init released everything it set up and named the
      * device that failed. Never dsv4_cuda_shutdown() before the retry: on
      * Windows the loader's shutdown unloads the DLL. */
@@ -11028,7 +11039,8 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
         engine->experts->gpu =
             v4_gpu_expert_mirrors_create(device, mirror_suggested);
     if (ndevices == 2 && engine->experts && engine->experts->gpu && !g_v4_peer_mirrors) {
-        if (dsv4_cuda_peer_access(device, peer) && dsv4_cuda_backend_arch_ok(peer)) {
+        /* the probe checked access both ways; this is what init enabled */
+        if (dsv4_cuda_peer_access(device, peer)) {
             g_v4_peer_mirrors = v4_peer_mirrors_create(peer);
         } else {
             fprintf(stderr, "v4_gpu warning=no peer access %d<->%d; peer mirror "
