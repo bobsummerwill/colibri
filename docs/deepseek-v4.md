@@ -519,7 +519,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_CUDA_PEER_DEVICE` (unset) | second GPU for a decode mirror pool (peer access required) |
 | `DSV4_CUDA_PEER_COMPUTE` (1, `.cu`) | run the peer pool's experts on the peer GPU; `0` = read them in place over P2P |
 | `DSV4_CUDA_PEER_MIRRORS` (4096) / `DSV4_CUDA_PEER_RESERVE_MB` (1024) | peer pool capacity / VRAM kept free on the peer |
-| `DSV4_CUDA_PIN_CAP_GB` (20, `.cu`) | cap on page-locked expert-slab bytes for uploads |
+| `DSV4_CUDA_PIN_CAP_GB` (20, `.cu`) | cap on page-locked expert-slab bytes for uploads, in GiB; negative = 0 (nothing pinned), empty or unparsable = 20, at most 1 PiB (no cap) |
 | `V4_SERVE_STATS_LOG` (0) | `1` = per-turn decode stats and decode MoE timing on stderr |
 
 **Prefill / checkpoints**
