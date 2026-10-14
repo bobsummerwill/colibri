@@ -5405,6 +5405,22 @@ static int v4_gpu_resident_first(void) {
     return on;
 }
 
+#ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
+/* Finish every lane still reading and give back what it leased. Every exit of
+ * a fetch pass runs this, errors included: a lane left running would write
+ * its result into the caller's jobs[] after that frame is gone. */
+static void v4_lanes_finish(ColiExpertStore *store, ExpertLoadJob *jobs,
+                            ExpertLoadHandle *loaders, int *loader_active) {
+    for (int slot = 0; slot < dual_loader_lanes(); slot++)
+        if (loader_active[slot]) {
+            profiled_expert_load_finish(&loaders[slot]);
+            loader_active[slot] = 0;
+            if (!jobs[slot].result)
+                coli_expert_release(store, &jobs[slot].view);
+        }
+}
+#endif
+
 #if defined(COLI_V4_GPU_TIER) && defined(COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER)
 /* A mirror-only view (leased[i] == 0: VRAM-first computed it from its mirror)
  * has no host data. Fetch those experts from the store, keeping their GPU
@@ -5675,13 +5691,8 @@ static int moe_token_pipeline(float *output,
                     loader_active[slot] = 1;
             }
         }
-        for (int slot = 0; slot < dual_loader_lanes(); slot++)
-            if (loader_active[slot]) {
-                profiled_expert_load_finish(&loaders[slot]);
-                if (!jobs[slot].result)
-                    coli_expert_release(store, &jobs[slot].view);
-            }
     }
+    v4_lanes_finish(store, jobs, loaders, loader_active);
 #ifdef COLI_V4_GPU_TIER
     /* If the token cannot take the fused GPU path after all (an attach
      * failed), its mirror-only views need their host data now. */
