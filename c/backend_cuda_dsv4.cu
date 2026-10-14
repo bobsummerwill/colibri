@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <climits>
+#include <algorithm>
 #include <vector>
 #ifndef _WIN32
 #include <unistd.h>
@@ -60,6 +61,7 @@ struct Dev { int id,sms; cudaStream_t stream,aux; cudaEvent_t ready,fork,join;fl
     int *decode_state;
     MvDesc *mvdesc;size_t mvdesccap;float *expert_weights;size_t expert_weightscap;int *expert_ids;size_t expert_idcap;
     int *emaj;size_t emajcap;float *emv1,*emv2,*emv4;size_t emv1cap,emv2cap,emv4cap;unsigned long long *emcount; /* expert-major MoE */
+    float *mmv;size_t mmvcap;unsigned long long *mmvcount; /* DSV4_MM_WARP_VERIFY */
 #if COLI_DSV4_TC
     cublasLtHandle_t lt;TcPlan plans[2];
 #endif
@@ -77,7 +79,12 @@ static int bok(cublasStatus_t e,const char*s){if(e==CUBLAS_STATUS_SUCCESS)return
 #ifdef COLI_DSV4_NCCL
 static int nok(ncclResult_t e,const char*s){if(e==ncclSuccess)return 1;fprintf(stderr,"[DSV4 NCCL] %s: %s\n",s,ncclGetErrorString(e));return 0;}
 #endif
-static int buf(void **p,size_t *cap,size_t n){if(*cap>=n)return 1;if(*p)cudaFree(*p);*p=nullptr;*cap=0;if(!ok(cudaMalloc(p,n),"buffer allocation"))return 0;*cap=n;return 1;}
+/* For cudaMalloc results: a failed allocation is recoverable (callers fall
+ * back or skip work), but the runtime also keeps it as its last error, and the
+ * next launch check (cudaGetLastError) would report that OOM against a kernel
+ * that never touched the missing buffer. Read it here. */
+static int alloc_ok(cudaError_t e,const char *s){if(e==cudaSuccess)return 1;(void)cudaGetLastError();return ok(e,s);}
+static int buf(void **p,size_t *cap,size_t n){if(*cap>=n)return 1;if(*p)cudaFree(*p);*p=nullptr;*cap=0;if(!alloc_ok(cudaMalloc(p,n),"buffer allocation"))return 0;*cap=n;return 1;}
 
 
 __constant__ float e8_table[256];
@@ -131,6 +138,7 @@ template<int R> __global__ void mv_fp4_grouped(const MvDesc *desc,int count,int 
         #pragma unroll
         for(int r=0;r<R;r++)if(base+r<O)d.y[base+r]=s[r][0];}
 }
+#ifndef COLI_DSV4_DEEPGEMM /* generic batched MoE only (DeepGEMM builds use dg_moe_batch_contiguous) */
 /* Expert-major fp4 matvec for the generic batched MoE (DSV4_MOE_EXPERT_MAJOR).
  * mv_fp4_grouped runs one matvec per route, so an expert picked by k tokens of
  * the chunk has its weights streamed k times, and each 256-thread block spends
@@ -189,6 +197,7 @@ static void run_fp4_expert_major(int tb,const uint8_t*w,const uint8_t*sc,size_t 
 __global__ void count_bit_mismatch(const float*a,const float*b,long long n,unsigned long long*count){
     long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x;
     if(i<n&&__float_as_uint(a[i])!=__float_as_uint(b[i]))atomicAdd(count,1ULL);}
+#endif
 template<int F> static void run_mv(const uint8_t*w,const uint8_t*sc,const float*x,float*y,int O,int I,int groups,cudaStream_t stream){
     static int rows=-1;if(rows<0){const char *p=getenv(F==4?"DSV4_CUDA_ROWS":"DSV4_CUDA_FP8_ROWS");rows=p?atoi(p):(F==4?4:1);}
     if(rows==32)mv_rows<F,32><<<(O+31)/32,256,0,stream>>>(w,sc,x,y,O,I,groups);
@@ -229,6 +238,7 @@ template<int F> __global__ void mm_batch(const uint8_t *w,const uint8_t *sc,cons
         for(int t=0;t<16;t++)s[t][threadIdx.x]+=s[t][threadIdx.x+n];}__syncthreads();}
     if(!threadIdx.x)for(int t=0;t<tcount;t++)y[(long long)(tbase+t)*O+o]=s[t][0];
 }
+#ifndef COLI_DSV4_DEEPGEMM /* run_mm_batch's callers are all generic-build paths */
 /* Warp-per-row mm_batch for fp8 / bf16-rounded fp8 weights (DSV4_MM_WARP).
  * One warp owns one output row and TB tokens; lane l holds the 256-wide
  * tree's partials j = l + 32q, each summing i = j, j+256, ... in mm_batch's
@@ -263,38 +273,51 @@ template<int F,int TB> __global__ void __launch_bounds__(256) mm_batch_w(const u
         if(!lane&&t<tcount)y[(long long)(tbase+t)*O+o]=v;
     }
 }
-__global__ void count_bit_mismatch(const float*a,const float*b,long long n,unsigned long long*count);
 static void run_mm_batch(Dsv4CudaTensor*t,const float*x,float*y,int T,cudaStream_t stream){
-    /* DSV4_MM_WARP: unset = warp kernel for short rows only (I <= 1024, e.g.
-     * attn.wq_b, where mm_batch spends most of each block in its tree; measured
-     * slower on the 2048/4096-row shapes), 1 = every fp8 shape, 0 = never. */
-    static int mw=-1,mwv=0;static float*vbuf=nullptr;static size_t vcap=0;static unsigned long long*vcount=nullptr,vcalls=0,vbad=0;
-    if(mw<0){const char*e=getenv("DSV4_MM_WARP");mw=e?(atoi(e)!=0?2:0):1;e=getenv("DSV4_MM_WARP_VERIFY");mwv=e&&atoi(e)!=0;if(mwv&&!mw)mw=1;}
+    /* DSV4_MM_WARP: unset, empty or "auto" = warp kernel for short rows only
+     * (I <= 1024, e.g. attn.wq_b, where mm_batch spends most of each block in
+     * its tree); 1 (any non-zero number) = every fp8 shape; 0 = never. Kernel
+     * time against mm_batch on sm_86: ~0.4-0.55x at I = 1024, ~0.8x at
+     * I = 2048 (shared w2, 4096x2048), ~1.1x at I = 4096, ~1.65x at I = 8192;
+     * auto stays at I <= 1024 until I = 2048 is checked in the engine.
+     * DSV4_MM_WARP_VERIFY=1 also runs mm_batch, keeps ITS results and counts
+     * mismatching bits; over DSV4_MM_WARP=0 it checks the auto shapes (said
+     * once at startup). */
+    static int mw=-1,mw_env=1,mwv=0;static unsigned long long vcalls=0,vbad=0;
+    if(mw<0){const char*e=getenv("DSV4_MM_WARP");mw_env=!e||!*e||!strcmp(e,"auto")?1:atoi(e)!=0?2:0;mw=mw_env;
+        e=getenv("DSV4_MM_WARP_VERIFY");mwv=e&&atoi(e)!=0;
+        if(mwv&&!mw){mw=1;fprintf(stderr,"[DSV4 CUDA] DSV4_MM_WARP_VERIFY=1 overrides DSV4_MM_WARP=0: the warp kernel runs beside mm_batch on the auto shapes, mm_batch's results are kept\n");}}
     if(mw&&(t->fmt==8||t->fmt==9)&&t->I%256==0&&(mw==2||t->I<=1024)){
-        dim3 wg((t->O+7)/8,(T+7)/8);
-        float*dst=y;size_t n=(size_t)T*t->O;
-        if(mwv){if(vcap<n){if(vbuf)cudaFree(vbuf);vbuf=nullptr;vcap=0;if(cudaMalloc(&vbuf,n*sizeof(float))!=cudaSuccess)mwv=0;else vcap=n;}
-                if(mwv&&!vcount&&cudaMalloc(&vcount,sizeof(*vcount))!=cudaSuccess)mwv=0;
-                if(mwv)dst=vbuf;}
-        if(t->fmt==9)mm_batch_w<9,8><<<wg,256,0,stream>>>((uint8_t*)t->w,t->scale,x,dst,t->O,t->I,T);
-        else mm_batch_w<8,8><<<wg,256,0,stream>>>((uint8_t*)t->w,t->scale,x,dst,t->O,t->I,T);
-        if(!mwv)return;
-        dim3 grid(t->O,(T+15)/16);
-        if(t->fmt==9)mm_batch<9><<<grid,256,0,stream>>>((uint8_t*)t->w,t->scale,x,y,t->O,t->I,T);
-        else mm_batch<8><<<grid,256,0,stream>>>((uint8_t*)t->w,t->scale,x,y,t->O,t->I,T);
-        unsigned long long bad=0;cudaMemsetAsync(vcount,0,sizeof(*vcount),stream);
-        count_bit_mismatch<<<(unsigned)((n+255)/256),256,0,stream>>>(y,vbuf,(long long)n,vcount);
-        cudaMemcpyAsync(&bad,vcount,sizeof(bad),cudaMemcpyDeviceToHost,stream);cudaStreamSynchronize(stream);
-        vcalls++;vbad+=bad;
-        if(bad||vcalls%500==0)fprintf(stderr,"mm-warp verify calls=%llu mismatches=%llu (this call %llu of %zu, %dx%d T=%d fmt=%d)\n",
-                                      vcalls,vbad,bad,n,t->O,t->I,T,t->fmt);
-        return;
+        size_t n=(size_t)T*t->O;Dev*c=mwv?ctx(t->device):nullptr;
+        /* verify buffers are per device; without them verify switches itself
+         * off for good and DSV4_MM_WARP's own setting applies again (an
+         * overridden 0 sends this call to mm_batch below) */
+        if(mwv&&(!c||!buf((void**)&c->mmv,&c->mmvcap,n*sizeof(float))||
+                 (!c->mmvcount&&!alloc_ok(cudaMalloc(&c->mmvcount,sizeof(*c->mmvcount)),"mm-warp verify counter")))){
+            mwv=0;mw=mw_env;fprintf(stderr,"[DSV4 CUDA] DSV4_MM_WARP_VERIFY off: no memory for its buffers\n");}
+        if(mw){
+            dim3 wg((t->O+7)/8,(T+7)/8);float*dst=mwv?c->mmv:y;
+            if(t->fmt==9)mm_batch_w<9,8><<<wg,256,0,stream>>>((uint8_t*)t->w,t->scale,x,dst,t->O,t->I,T);
+            else mm_batch_w<8,8><<<wg,256,0,stream>>>((uint8_t*)t->w,t->scale,x,dst,t->O,t->I,T);
+            if(!mwv)return;
+            dim3 grid(t->O,(T+15)/16);
+            if(t->fmt==9)mm_batch<9><<<grid,256,0,stream>>>((uint8_t*)t->w,t->scale,x,y,t->O,t->I,T);
+            else mm_batch<8><<<grid,256,0,stream>>>((uint8_t*)t->w,t->scale,x,y,t->O,t->I,T);
+            unsigned long long bad=0;cudaMemsetAsync(c->mmvcount,0,sizeof(*c->mmvcount),stream);
+            count_bit_mismatch<<<(unsigned)((n+255)/256),256,0,stream>>>(y,c->mmv,(long long)n,c->mmvcount);
+            cudaMemcpyAsync(&bad,c->mmvcount,sizeof(bad),cudaMemcpyDeviceToHost,stream);cudaStreamSynchronize(stream);
+            vcalls++;vbad+=bad;
+            if(bad||vcalls%500==0)fprintf(stderr,"mm-warp verify calls=%llu mismatches=%llu (this call %llu of %zu, %dx%d T=%d fmt=%d)\n",
+                                          vcalls,vbad,bad,n,t->O,t->I,T,t->fmt);
+            return;
+        }
     }
     dim3 grid(t->O,(T+15)/16);
     if(t->fmt==4)mm_batch<4><<<grid,256,0,stream>>>((uint8_t*)t->w,t->scale,x,y,t->O,t->I,T);
     else if(t->fmt==9)mm_batch<9><<<grid,256,0,stream>>>((uint8_t*)t->w,t->scale,x,y,t->O,t->I,T);
     else mm_batch<8><<<grid,256,0,stream>>>((uint8_t*)t->w,t->scale,x,y,t->O,t->I,T);
 }
+#endif
 __device__ int tc_sf_off(int outer,int inner,int sf_inner_dim){int base=((inner/4)*4+(outer/128)*sf_inner_dim)*128,o=outer&127;return base+(o%32)*16+(o/32)*4+(inner&3);}
 __device__ uint8_t e4m3_code(float x){int best=0;float bd=INFINITY;for(int v=0;v<255;v++){float z=e4m3((uint8_t)v),d=fabsf(z-x);if(d<bd||(d==bd&&!(v&1)&&(best&1))){bd=d;best=v;}}return (uint8_t)best;}
 __global__ void tc_expand(const uint8_t*q4,const uint8_t*src,uint8_t*q8,uint8_t*dst,int O,int I){
@@ -1380,10 +1403,14 @@ extern "C" void dsv4_cuda_shutdown(void){
 #endif
     }
     for(int i=0;i<ng;i++){cudaSetDevice(g[i].id);if(g[i].dx)cudaFree(g[i].dx);if(g[i].dy)cudaFree(g[i].dy);if(g[i].p1)cudaFree(g[i].p1);if(g[i].p2)cudaFree(g[i].p2);if(g[i].p3)cudaFree(g[i].p3);if(g[i].p4)cudaFree(g[i].p4);if(g[i].aux1)cudaFree(g[i].aux1);if(g[i].aux2)cudaFree(g[i].aux2);if(g[i].aux3)cudaFree(g[i].aux3);if(g[i].mvdesc)cudaFree(g[i].mvdesc);if(g[i].expert_weights)cudaFree(g[i].expert_weights);if(g[i].expert_ids)cudaFree(g[i].expert_ids);if(g[i].tcw)cudaFree(g[i].tcw);if(g[i].tcs)cudaFree(g[i].tcs);if(g[i].tcx)cudaFree(g[i].tcx);if(g[i].tcxs)cudaFree(g[i].tcxs);if(g[i].tc_workspace)cudaFree(g[i].tc_workspace);
+        if(g[i].emaj)cudaFree(g[i].emaj);if(g[i].emv1)cudaFree(g[i].emv1);if(g[i].emv2)cudaFree(g[i].emv2);if(g[i].emv4)cudaFree(g[i].emv4);if(g[i].emcount)cudaFree(g[i].emcount);if(g[i].mmv)cudaFree(g[i].mmv);if(g[i].mmvcount)cudaFree(g[i].mmvcount);
 #ifdef COLI_DSV4_DEEPGEMM
         if(g[i].dga1)cudaFree(g[i].dga1);if(g[i].dga2)cudaFree(g[i].dga2);if(g[i].dgsfa1)cudaFree(g[i].dgsfa1);if(g[i].dgsfa2)cudaFree(g[i].dgsfa2);if(g[i].dglayout)cudaFree(g[i].dglayout);if(g[i].dgrowmap)cudaFree(g[i].dgrowmap);if(g[i].dgmm1)cudaFree(g[i].dgmm1);if(g[i].dgmm2)cudaFree(g[i].dgmm2);if(g[i].dgref)cudaFree(g[i].dgref);if(g[i].dgdensews)cudaFree(g[i].dgdensews);
 #endif
-        tc_dev_free(&g[i]);if(g[i].hx)cudaFreeHost(g[i].hx);if(g[i].hy)cudaFreeHost(g[i].hy);if(g[i].ready)cudaEventDestroy(g[i].ready);if(g[i].fork)cudaEventDestroy(g[i].fork);if(g[i].join)cudaEventDestroy(g[i].join);cudaStreamDestroy(g[i].aux);cudaStreamDestroy(g[i].stream);}ng=0;}
+        tc_dev_free(&g[i]);if(g[i].hx)cudaFreeHost(g[i].hx);if(g[i].hy)cudaFreeHost(g[i].hy);if(g[i].ready)cudaEventDestroy(g[i].ready);if(g[i].fork)cudaEventDestroy(g[i].fork);if(g[i].join)cudaEventDestroy(g[i].join);cudaStreamDestroy(g[i].aux);cudaStreamDestroy(g[i].stream);
+        /* zero the slot: every buffer above is grown lazily through buf(), which
+         * would cudaFree a stale pointer (and trust its cap) after a re-init */
+        memset(&g[i],0,sizeof g[i]);}ng=0;}
 extern "C" Dsv4CudaActivation *dsv4_cuda_activation_create(int device,long long elements){Dev*c=ctx(device);if(!c||elements<1||!ok(cudaSetDevice(device),"select activation device"))return nullptr;Dsv4CudaActivation*a=(Dsv4CudaActivation*)calloc(1,sizeof(*a));if(!a)return nullptr;a->device=device;a->elements=elements;if(!ok(cudaMalloc(&a->data,(size_t)elements*sizeof(float)),"activation allocation")){free(a);return nullptr;}return a;}
 extern "C" void dsv4_cuda_activation_free(Dsv4CudaActivation*a){if(!a)return;cudaSetDevice(a->device);cudaFree(a->data);free(a);}
 extern "C" int dsv4_cuda_activation_upload(Dsv4CudaActivation*a,const float*x,long long n){Dev*c=a?ctx(a->device):nullptr;if(!c||!x||n<0||n>a->elements||!ok(cudaSetDevice(a->device),"select activation upload device"))return 0;return ok(cudaMemcpyAsync(a->data,x,(size_t)n*sizeof(float),cudaMemcpyHostToDevice,c->stream),"activation upload");}
@@ -1416,10 +1443,10 @@ extern "C" int dsv4_cuda_graph_end_pair(int primary,int peer,Dsv4CudaGraph **pg,
 extern "C" int dsv4_cuda_graph_launch(Dsv4CudaGraph*g){Dev*c=g?ctx(g->device):nullptr;return c&&ok(cudaSetDevice(g->device),"select graph device")&&ok(cudaGraphLaunch(g->exec,c->stream),"launch graph");}
 extern "C" void dsv4_cuda_graph_free(Dsv4CudaGraph*g){if(!g)return;cudaSetDevice(g->device);if(g->exec)cudaGraphExecDestroy(g->exec);if(g->graph)cudaGraphDestroy(g->graph);free(g);}
 static int upload(Dsv4CudaTensor **pt,const void *w,size_t wb,const uint8_t *sc,size_t sb,int O,int I,int d,int fmt){if(*pt)return 1;Dev *c=ctx(d);if(!c||!ok(cudaSetDevice(d),"select upload device"))return 0;Dsv4CudaTensor *t=(Dsv4CudaTensor*)calloc(1,sizeof(*t));t->O=O;t->I=I;t->device=d;t->fmt=fmt;t->bytes=wb+sb;
-    if(!ok(cudaMalloc(&t->w,wb),"weight allocation")){dsv4_cuda_tensor_free(t);return 0;}t->own_w=1;if(!ok(cudaMemcpy(t->w,w,wb,cudaMemcpyHostToDevice),"weight upload")){dsv4_cuda_tensor_free(t);return 0;}
-    if(sb){if(!ok(cudaMalloc(&t->scale,sb),"scale allocation")){dsv4_cuda_tensor_free(t);return 0;}t->own_scale=1;if(!ok(cudaMemcpy(t->scale,sc,sb,cudaMemcpyHostToDevice),"scale upload")){dsv4_cuda_tensor_free(t);return 0;}}
+    if(!alloc_ok(cudaMalloc(&t->w,wb),"weight allocation")){dsv4_cuda_tensor_free(t);return 0;}t->own_w=1;if(!ok(cudaMemcpy(t->w,w,wb,cudaMemcpyHostToDevice),"weight upload")){dsv4_cuda_tensor_free(t);return 0;}
+    if(sb){if(!alloc_ok(cudaMalloc(&t->scale,sb),"scale allocation")){dsv4_cuda_tensor_free(t);return 0;}t->own_scale=1;if(!ok(cudaMemcpy(t->scale,sc,sb,cudaMemcpyHostToDevice),"scale upload")){dsv4_cuda_tensor_free(t);return 0;}}
 #ifdef COLI_DSV4_DEEPGEMM
-    if((fmt==8||fmt==9)&&O%128==0&&I%128==0){size_t db=(size_t)O*(I/128/4)*sizeof(int);if(!ok(cudaMalloc(&t->dg_scale,db),"dense DeepGEMM scale allocation")){dsv4_cuda_tensor_free(t);return 0;}t->own_dg_scale=1;
+    if((fmt==8||fmt==9)&&O%128==0&&I%128==0){size_t db=(size_t)O*(I/128/4)*sizeof(int);if(!alloc_ok(cudaMalloc(&t->dg_scale,db),"dense DeepGEMM scale allocation")){dsv4_cuda_tensor_free(t);return 0;}t->own_dg_scale=1;
         if(fmt==9){int groups=O/1024;dg_pack_batched_scale<<<(O*(I/128/4)+255)/256,256,0,c->stream>>>(t->dg_scale,t->scale,O/groups,I/128,groups);}
         else dg_pack_dense_scale<<<(O*(I/128/4)+255)/256,256,0,c->stream>>>(t->dg_scale,t->scale,O,I/128);
         if(!ok(cudaGetLastError(),"dense DeepGEMM scale packing")){dsv4_cuda_tensor_free(t);return 0;}t->bytes+=db;}
@@ -2380,24 +2407,20 @@ extern "C" int dsv4_cuda_route_moe_ids_batch(const Dsv4CudaActivation*input,cons
     size_t w1=(size_t)I*(H/2),s1=(size_t)I*(H/32),w2=(size_t)H*(I/2),s2=(size_t)H*(I/32);
     size_t rb=(size_t)routes*I*sizeof(float),pb=(size_t)routes*H*sizeof(float),wb=(size_t)routes*sizeof(float);
     if(!buf((void**)&c->p1,&c->p1cap,rb)||!buf((void**)&c->p2,&c->p2cap,rb)||!buf((void**)&c->p3,&c->p3cap,rb)||
-       !buf((void**)&c->p4,&c->p4cap,pb)||!buf((void**)&c->expert_weights,&c->expert_weightscap,wb)||
-       !buf((void**)&c->mvdesc,&c->mvdesccap,(size_t)routes*2*sizeof(MvDesc)))return 0;
+       !buf((void**)&c->p4,&c->p4cap,pb)||!buf((void**)&c->expert_weights,&c->expert_weightscap,wb))return 0;
     if(!ok(cudaMemcpyAsync(c->expert_weights,weights,wb,cudaMemcpyHostToDevice,c->stream),"generic MoE weight upload"))return 0;
-    std::vector<MvDesc> hd((size_t)routes*2);
-    for(int r=0;r<routes;r++){int e=ids[r],t=r/K;
-        const uint8_t*fc1=set->bank_fc1+(size_t)e*2*w1,*fc1s=set->bank_fc1_scale+(size_t)e*2*s1;
-        const float*x=input->data+(long long)t*H;
-        hd[2*r]={fc1,fc1s,x,c->p1+(long long)r*I};
-        hd[2*r+1]={fc1+w1,fc1s+s1,x,c->p2+(long long)r*I};}
     /* Default: stream each routed expert once per chunk (mv_fp4_expert_major,
      * bit-identical); DSV4_MOE_EXPERT_MAJOR=0 keeps one matvec per route.
      * DSV4_MOE_EXPERT_MAJOR_VERIFY=1 runs both and counts bit mismatches (the
-     * per-route results are used). DSV4_MOE_EM_TB=2|3|4|6 routes per pass. */
-    static int em_mode=-1,em_verify=-1,em_tb=4;static unsigned long long em_calls=0,em_bad1=0,em_bad2=0;
-    if(em_mode<0){const char*v=getenv("DSV4_MOE_EXPERT_MAJOR");em_mode=v?atoi(v)!=0:1;
-        v=getenv("DSV4_MOE_EM_TB");if(v)em_tb=atoi(v);
-        v=getenv("DSV4_MOE_EXPERT_MAJOR_VERIFY");em_verify=v?atoi(v)!=0:0;if(em_verify)em_mode=1;}
-    int nex=0;
+     * per-route results are kept, so it also runs over an explicit =0, which
+     * it says once). DSV4_MOE_EM_TB=2|3|4|6 routes per pass (default 4). */
+    static int em_mode=-1,em_mode_env=1,em_verify=0,em_tb=4;static unsigned long long em_calls=0,em_bad1=0,em_bad2=0;
+    if(em_mode<0){const char*v=getenv("DSV4_MOE_EXPERT_MAJOR");em_mode_env=v?atoi(v)!=0:1;em_mode=em_mode_env;
+        v=getenv("DSV4_MOE_EM_TB");if(v&&*v){em_tb=atoi(v);
+            if(em_tb!=2&&em_tb!=3&&em_tb!=4&&em_tb!=6){fprintf(stderr,"[DSV4 CUDA] DSV4_MOE_EM_TB=%s ignored (2, 3, 4 or 6): using 4\n",v);em_tb=4;}}
+        v=getenv("DSV4_MOE_EXPERT_MAJOR_VERIFY");em_verify=v&&atoi(v)!=0;
+        if(em_verify&&!em_mode){em_mode=1;fprintf(stderr,"[DSV4 CUDA] DSV4_MOE_EXPERT_MAJOR_VERIFY=1 overrides DSV4_MOE_EXPERT_MAJOR=0: the expert-major kernel runs beside the per-route one, whose results are kept\n");}}
+    int nex=0;const int*em_ex=nullptr,*em_off=nullptr,*em_rt=nullptr;
     if(em_mode){
         int cnt[256]={0},slot_of[256];for(int r=0;r<routes;r++)cnt[ids[r]]++;
         std::vector<int> hm((size_t)set->count+1+set->count+routes);int*hex=hm.data(),*hoff=hex+set->count,*hrt=hoff+set->count+1;
@@ -2408,11 +2431,24 @@ extern "C" int dsv4_cuda_route_moe_ids_batch(const Dsv4CudaActivation*input,cons
         std::copy(hrt,hrt+routes,packed.begin()+2*nex+1);
         if(!buf((void**)&c->emaj,&c->emajcap,packed.size()*sizeof(int))||
            !ok(cudaMemcpyAsync(c->emaj,packed.data(),packed.size()*sizeof(int),cudaMemcpyHostToDevice,c->stream),"expert-major route lists"))return 0;
+        em_ex=c->emaj;em_off=c->emaj+nex;em_rt=c->emaj+2*nex+1;
+        /* verify is a diagnostic: without memory for its buffers it switches
+         * itself off for good and DSV4_MOE_EXPERT_MAJOR's own setting applies
+         * again (an overridden 0 sends this call down the per-route path) */
         if(em_verify&&(!buf((void**)&c->emv1,&c->emv1cap,rb)||!buf((void**)&c->emv2,&c->emv2cap,rb)||!buf((void**)&c->emv4,&c->emv4cap,pb)||
-           (!c->emcount&&!ok(cudaMalloc(&c->emcount,2*sizeof(unsigned long long)),"expert-major verify counter"))))return 0;
+           (!c->emcount&&!alloc_ok(cudaMalloc(&c->emcount,2*sizeof(unsigned long long)),"expert-major verify counter")))){
+            em_verify=0;em_mode=em_mode_env;fprintf(stderr,"[DSV4 CUDA] DSV4_MOE_EXPERT_MAJOR_VERIFY off: no memory for its buffers\n");}
     }
-    const int*em_ex=c->emaj,*em_off=c->emaj+nex,*em_rt=c->emaj+2*nex+1;
-    if(!em_mode||em_verify){
+    /* the per-route kernel's descriptor tables: per-route mode and verify only */
+    const bool per_route=!em_mode||em_verify;std::vector<MvDesc> hd;
+    if(per_route){
+        if(!buf((void**)&c->mvdesc,&c->mvdesccap,(size_t)routes*2*sizeof(MvDesc)))return 0;
+        hd.resize((size_t)routes*2);
+        for(int r=0;r<routes;r++){int e=ids[r],t=r/K;
+            const uint8_t*fc1=set->bank_fc1+(size_t)e*2*w1,*fc1s=set->bank_fc1_scale+(size_t)e*2*s1;
+            const float*x=input->data+(long long)t*H;
+            hd[2*r]={fc1,fc1s,x,c->p1+(long long)r*I};
+            hd[2*r+1]={fc1+w1,fc1s+s1,x,c->p2+(long long)r*I};}
         if(!ok(cudaMemcpyAsync(c->mvdesc,hd.data(),(size_t)routes*2*sizeof(MvDesc),cudaMemcpyHostToDevice,c->stream),"generic MoE fc1 descriptors"))return 0;
         mv_fp4_grouped<4><<<dim3((I+3)/4,routes*2),256,0,c->stream>>>(c->mvdesc,routes*2,I,H);
     }
@@ -2428,11 +2464,11 @@ extern "C" int dsv4_cuda_route_moe_ids_batch(const Dsv4CudaActivation*input,cons
     }
     expert_act_grouped<<<((long long)routes*I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,c->expert_weights,limit,routes,I);
     fp8_sim<<<routes*((I+127)/128),128,0,c->stream>>>(c->p3,routes,I);
-    /* down: descriptors must not be overwritten while fc1 still reads them —
-     * the copy is stream-ordered after the launches above, so reuse is safe. */
-    for(int r=0;r<routes;r++){int e=ids[r];
-        hd[r]={set->bank_fc2+(size_t)e*w2,set->bank_fc2_scale+(size_t)e*s2,c->p3+(long long)r*I,c->p4+(long long)r*H};}
-    if(!em_mode||em_verify){
+    if(per_route){
+        /* down: descriptors must not be overwritten while fc1 still reads them —
+         * the copy is stream-ordered after the launches above, so reuse is safe. */
+        for(int r=0;r<routes;r++){int e=ids[r];
+            hd[r]={set->bank_fc2+(size_t)e*w2,set->bank_fc2_scale+(size_t)e*s2,c->p3+(long long)r*I,c->p4+(long long)r*H};}
         if(!ok(cudaMemcpyAsync(c->mvdesc,hd.data(),(size_t)routes*sizeof(MvDesc),cudaMemcpyHostToDevice,c->stream),"generic MoE down descriptors"))return 0;
         mv_fp4_grouped<4><<<dim3((H+3)/4,routes),256,0,c->stream>>>(c->mvdesc,routes,H,I);
     }

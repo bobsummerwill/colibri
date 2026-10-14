@@ -261,15 +261,18 @@ union) because the GPU top-6 kernel assumes 256 logits, and on generic
 (132 slots ≈ 1.6 GB instead of 3.2 GB). DeepGEMM builds keep a 256-slot bank.
 
 The generic kernels themselves got two bit-identical rewrites (same operands
-in the same order for every output; `_VERIFY=1` runs old and new side by side
-and counts mismatching bits):
+in the same order for every output; `_VERIFY=1` runs old and new side by side,
+keeps the old kernel's results and counts mismatching bits; it does that even
+when the switch below is `0`, and says so once at startup):
 
 - `DSV4_MOE_EXPERT_MAJOR` (1): the routed experts run expert-major — one warp
   per expert row walks every token of the chunk that picked that expert, so
   each expert's weights are read once per chunk instead of once per route.
 - `DSV4_MM_WARP` (auto): warp-per-row dense batch matmul for short rows
-  (I ≤ 1024, e.g. `attn.wq_b`); `1` forces it on every fp8 shape (measured
-  slower on the 2048/4096-row ones), `0` disables it.
+  (I ≤ 1024, e.g. `attn.wq_b`; unset, empty or `auto`); `1` forces it on every
+  fp8 shape, `0` disables it. Against the old kernel it also measured faster
+  for I = 2048 (~0.8× the time on the shared-expert w2, 4096×2048), but slower
+  for I = 4096 (~1.1×) and I = 8192 (~1.65×).
 
 Measured on 2× RTX 3090 (one used; sm_86, CUDA 12.0 `NO_TC=1`), Ryzen 9 9950X3D,
 62 GB RAM (`--ram 40`), one SN850X, REAP 150B, greedy, `--ctx 8192`, cold
@@ -447,9 +450,9 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_CUDA_PIN_HOST` (1, `.cu`) | page-lock expert-cache slabs for DMA uploads |
 | `DSV4_CUDA_MOE_GROUPED` (1, `.cu`) | expert-grouped MoE GEMM rows; `0` = legacy replicated |
 | `V4_MOE_BANK_FULL` (off) | `=N`: prefetch a whole layer's experts above N tokens (measured worse) |
-| `DSV4_MOE_EXPERT_MAJOR` (1, `.cu`) | generic batched MoE: expert-major fp4 kernel (weights read once per chunk); `0` = one matvec per route; `_VERIFY=1` compares both bit for bit |
-| `DSV4_MOE_EM_TB` (4, `.cu`) | routes per pass of the expert-major kernel (2, 3, 4, 6) |
-| `DSV4_MM_WARP` (auto, `.cu`) | generic dense batch matmul: warp-per-row kernel for I ≤ 1024; `1` = all fp8 shapes, `0` = off; `DSV4_MM_WARP_VERIFY=1` compares bit for bit |
+| `DSV4_MOE_EXPERT_MAJOR` (1, `.cu`) | generic batched MoE: expert-major fp4 kernel (weights read once per chunk); `0` = one matvec per route; `_VERIFY=1` compares both bit for bit (keeps the per-route results, also with `0`) |
+| `DSV4_MOE_EM_TB` (4, `.cu`) | routes per pass of the expert-major kernel (2, 3, 4, 6; anything else is ignored with a warning) |
+| `DSV4_MM_WARP` (auto, `.cu`) | generic dense batch matmul: warp-per-row kernel for I ≤ 1024 (unset, empty or `auto`); `1` = all fp8 shapes, `0` = off; `DSV4_MM_WARP_VERIFY=1` compares bit for bit (keeps the old kernel's results, also with `0`) |
 | `V4_MOE_BATCH_PROF` (0) | `1` = one `moebprof` line per chunk-layer: route / refill / compute ms |
 
 **Prefill / checkpoints**
