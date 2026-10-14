@@ -195,6 +195,9 @@ int dsv4_cuda_expert_bank_slots(int experts);
 /* Device bytes one slot of an expert bank of this geometry takes. */
 long long dsv4_cuda_expert_bank_slot_bytes(int hidden,int intermediate);
 int dsv4_cuda_peer_access(int a,int b);
+/* 1 when the decode MoE on device runs the experts mirrored on peer ON peer
+ * (DSV4_CUDA_PEER_COMPUTE), 0 when device reads them in place over P2P. */
+int dsv4_cuda_peer_compute(int device,int peer);
 Dsv4CudaExpertSet *dsv4_cuda_expert_bank_create(int count,int hidden,int intermediate,int device,
                                                  Dsv4CudaTensor *shared_gate,Dsv4CudaTensor *shared_up,
                                                  Dsv4CudaTensor *shared_down);

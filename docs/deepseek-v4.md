@@ -331,7 +331,10 @@ VRAM into a real tier:
   ON that GPU (`DSV4_CUDA_PEER_COMPUTE`, default 1): the token's input is
   copied over P2P, the same kernels run on local weights, and each expert's
   output row is written into the primary GPU's reduce buffer. Results are
-  bit-identical to computing every expert on one GPU.
+  bit-identical to computing every expert on one GPU. Peer compute needs both
+  GPUs at the same SM version (the same machine code); otherwise the primary
+  reads the pool's mirrors in place. The `v4_gpu peer-mirrors ... mode=` line
+  at startup says which (`compute` or `p2p-read`).
 
 Measured on the REAP 150B setup above (2× RTX 3090 with an NVLink bridge,
 `--ram 40`, six 300-token answers, greedy; answers identical in every run):
@@ -517,7 +520,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_MOE_BATCH_PROF` (0) | `1` = one `moebprof` line per chunk-layer: switch (layer change: prefetch-worker wait, bank swap) / route / refill / compute ms |
 | `V4_GPU_RESIDENT_FIRST` (0) | `1` = decode computes VRAM-mirrored experts without an expert-store lookup (VRAM adds to the RAM tier) |
 | `DSV4_CUDA_PEER_DEVICE` (unset) | second GPU for a decode mirror pool (peer access required) |
-| `DSV4_CUDA_PEER_COMPUTE` (1, `.cu`) | run the peer pool's experts on the peer GPU; `0` = read them in place over P2P |
+| `DSV4_CUDA_PEER_COMPUTE` (1, `.cu`) | run the peer pool's experts on the peer GPU (both GPUs at the same SM version; `mode=` in the `peer-mirrors` line); `0` = read them in place over P2P |
 | `DSV4_CUDA_PEER_MIRRORS` (4096) / `DSV4_CUDA_PEER_RESERVE_MB` (1024) | peer pool capacity / VRAM kept free on the peer |
 | `DSV4_CUDA_PIN_CAP_GB` (20, `.cu`) | cap on page-locked expert-slab bytes for uploads, in GiB; negative = 0 (nothing pinned), empty or unparsable = 20, at most 1 PiB (no cap) |
 | `V4_SERVE_STATS_LOG` (0) | `1` = per-turn decode stats and decode MoE timing on stderr |
