@@ -333,10 +333,10 @@ VRAM into a real tier:
   expert's output row is written into the primary GPU's reduce buffer.
   Results are bit-identical to computing every expert on one GPU. Mirrors
   are read in place over P2P from the other card only with
-  `DSV4_CUDA_PEER_COMPUTE=0`, with `DSV4_CUDA_BATCHED=0` (one launch per
-  expert; `DSV4_CUDA_PEER_COMPUTE` has no effect there), and when the fused
-  MoE cannot take the token (no GPU mirror of the shared expert, or a refused
-  call) and the expert-group fallback computes it.
+  `DSV4_CUDA_PEER_COMPUTE=0`, with `DSV4_CUDA_BATCHED=0` (kernels launched
+  expert by expert on the primary GPU; `DSV4_CUDA_PEER_COMPUTE` has no effect
+  there), and when the fused MoE cannot take the token (no GPU mirror of the
+  shared expert, or a refused call) and the expert-group fallback computes it.
 
 The peer card holds nothing but mirrors (no dense weights, no prefill bank),
 at the same 12.75 MiB each. After ~0.3 GiB of CUDA context and the 1024 MiB
@@ -349,18 +349,21 @@ Both levers act where the MoE runs one token at a time, i.e. the ordinary
 decode step. Decode batches of more than one token (the verification of
 speculative drafts, and the steps of a serve that decodes several
 conversations together, `KV_SLOTS`) go through the expert union and use
-neither. `DSV4_HYBRID=1` turns `V4_GPU_RESIDENT_FIRST` off and uploads its
-split's experts into the primary cache only, so the peer pool stays unused.
+neither (with the default `V4_EXPERT_UNION=1`; with `0` they run token by
+token and use both). `DSV4_HYBRID=1` turns `V4_GPU_RESIDENT_FIRST` off and
+uploads its split's experts into the primary cache only, so the peer pool
+stays unused.
 
 Measured on the REAP 150B setup above (2× RTX 3090 with an NVLink bridge,
 `--ram 40`, six 300-token answers, greedy), with `COLI_CUDA_MOE_BATCH=1` and
 `COLI_CUDA_MOE_DOUBLE=1` set on every row, so GPU0's mirror reserve also kept
 room for the second prefill bank. Every run gave the same answers (compared
-in full between the two peer-pool rows, on their first 200 characters for
-the other two). **To be re-measured:** these numbers come from intermediate
-builds of this branch (the `DSV4_CUDA_PEER_COMPUTE=0` row from one that
-always read the peer mirrors in place); they will be replaced by three
-samples per row on the final build.
+in full among the three `V4_GPU_RESIDENT_FIRST=1` rows; the one-GPU baseline
+kept only each answer's first 200 characters, which match).
+**To be re-measured:** these numbers come from intermediate builds of this
+branch (the `DSV4_CUDA_PEER_COMPUTE=0` row from one that always read the
+peer mirrors in place); they will be replaced by three samples per row on
+the final build.
 
 | configuration | decode tok/s (mean) |
 |---|---|
