@@ -324,8 +324,16 @@ cache only: every routed expert was still fetched from the RAM expert store
 VRAM into a real tier:
 
 - `V4_GPU_RESIDENT_FIRST=1`: an expert already mirrored in VRAM is computed
-  from the mirror without asking the store, so its RAM slot goes cold and the
-  RAM tier holds other experts.
+  from the mirror without asking the store. The store still records the
+  routing (the `.coli_usage` history, the dashboard's HITS and heat), and its
+  RAM pin ranking leaves mirrored experts out, so their RAM slots are no
+  longer pinned or refreshed, age out of the LRU, and the RAM tier holds
+  experts that are not in VRAM. A routing served from VRAM is not a store
+  request: the hit rate in `DONE`/`PROF` is then the RAM hit rate of the
+  experts the store was asked for. If a token cannot use the fused GPU path
+  after all (an upload failed), its mirrored experts are read from the store
+  through the loader lanes and the token runs on the CPU, as without the
+  switch.
 - `DSV4_CUDA_PEER_DEVICE=N`: a second mirror pool on GPU N (needs peer
   access, e.g. NVLink). The fused decode MoE runs the experts mirrored there
   ON that GPU (`DSV4_CUDA_PEER_COMPUTE`, default 1): the token's input is
@@ -515,7 +523,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_MOE_EM_TB` (auto, `.cu`) | routes per pass of the expert-major kernel: unset = 2 below 4 routes per routed expert in the chunk, else 4; `2`, `3`, `4` or `6` forces one (anything else is ignored with a warning) |
 | `DSV4_MM_WARP` (auto, `.cu`) | generic dense batch matmul: warp-per-row kernel for I ≤ 1024 (unset, empty or `auto`); `1` = all fp8 shapes, `0` = off; `DSV4_MM_WARP_VERIFY=1` compares bit for bit (keeps the old kernel's results, also with `0`) |
 | `V4_MOE_BATCH_PROF` (0) | `1` = one `moebprof` line per chunk-layer: switch (layer change: prefetch-worker wait, bank swap) / route / refill / compute ms |
-| `V4_GPU_RESIDENT_FIRST` (0) | `1` = decode computes VRAM-mirrored experts without an expert-store lookup (VRAM adds to the RAM tier) |
+| `V4_GPU_RESIDENT_FIRST` (0) | `1` = decode computes VRAM-mirrored experts without an expert-store lookup, and the RAM pins skip them (VRAM adds to the RAM tier) |
 | `DSV4_CUDA_PEER_DEVICE` (unset) | second GPU for a decode mirror pool (peer access required) |
 | `DSV4_CUDA_PEER_COMPUTE` (1, `.cu`) | run the peer pool's experts on the peer GPU; `0` = read them in place over P2P |
 | `DSV4_CUDA_PEER_MIRRORS` (4096) / `DSV4_CUDA_PEER_RESERVE_MB` (1024) | peer pool capacity / VRAM kept free on the peer |
