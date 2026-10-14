@@ -2226,10 +2226,16 @@ struct PinRegion{uintptr_t base;size_t size;};
 static std::vector<PinRegion> g_pin_regions,g_pin_failed;
 static size_t g_pin_bytes;
 static int g_pin_enabled=-1;
-/* DSV4_CUDA_PIN_CAP_GB (20): total page-locked expert-slab bytes. The RAM
- * expert cache can exceed 20 GB (--ram 40 -> ~32 GB of slabs); slabs past the
- * cap upload through pageable staging at roughly half the PCIe rate. */
-static size_t pin_cap_bytes(){const char*e=getenv("DSV4_CUDA_PIN_CAP_GB");double gb=e?atof(e):20.0;if(gb<0)gb=0;return (size_t)(gb*(double)(1ULL<<30));}
+/* DSV4_CUDA_PIN_CAP_GB (20): total page-locked expert-slab bytes, in GiB. The
+ * RAM expert cache can exceed 20 GB (--ram 40 -> ~32 GB of slabs); slabs past
+ * the cap upload through pageable staging at roughly half the PCIe rate.
+ * Unset, empty, unparsable or NaN: 20; negative: 0 (nothing pinned); inf or
+ * anything above 1 PiB: 1 PiB, i.e. no cap (the size_t conversion of a larger
+ * double is undefined). */
+static size_t pin_cap_bytes(){
+    const char*e=getenv("DSV4_CUDA_PIN_CAP_GB");char*end=nullptr;double gb=e&&*e?strtod(e,&end):20.0;
+    if(e&&*e&&(end==e||gb!=gb))gb=20.0;if(gb<0)gb=0;if(gb>1048576.0)gb=1048576.0;
+    return (size_t)(gb*(double)(1ULL<<30));}
 static bool host_pinned(const void*p,size_t len){
     if(g_pin_enabled<0){const char*e=getenv("DSV4_CUDA_PIN_HOST");g_pin_enabled=!(e&&*e=='0');}
     if(!g_pin_enabled||!p||!len)return false;
