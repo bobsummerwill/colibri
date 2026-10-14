@@ -347,7 +347,8 @@ VRAM into a real tier:
   `[DSV4 CUDA] peer device N failed in the decode MoE (...)` line. The token
   in flight is recomputed on the primary GPU, or on the CPU from host copies
   when the peer no longer answers, and the pool's mirrors count as misses from
-  then on. GPU N is checked before anything is set up on it (a visible device
+  then on. The pool's VRAM on that GPU is released only when the engine
+  closes. GPU N is checked before anything is set up on it (a visible device
   other than the primary, peer access both ways, and on both GPUs, the
   primary's first, an architecture and kernel image the build runs); when a
   check fails, GPU N is left untouched, decode runs without it, and the

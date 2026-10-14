@@ -2052,7 +2052,8 @@ extern "C" int dsv4_cuda_expert_fp8(Dsv4CudaTensor *gate,Dsv4CudaTensor *up,Dsv4
     return ok(cudaGetLastError(),"shared-expert launch")&&ok(cudaMemcpyAsync(y,c->dy,hb,cudaMemcpyDeviceToHost,c->stream),"shared-expert result download")&&ok(cudaStreamSynchronize(c->stream),"shared-expert sync");
 }
 /* Peer-compute failures. pstep keeps a peer step's first error; peer_fail
- * reports it once, with the device, as it latches the peer off. peer_drain
+ * drains the peer and peer_latch reports the error once, with the device, as
+ * it latches the peer off. peer_drain
  * waits out what was queued on the peer, so no peer kernel still writes this
  * device's p4 when it is reused, and clears the error the step left. */
 static bool pstep(cudaError_t e,const char*s,const char**why,cudaError_t*err){if(e==cudaSuccess)return true;if(!*why){*why=s;*err=e;}return false;}
@@ -2066,16 +2067,17 @@ static bool peer_fault(bool*lost){
     if(at<0){const char*e=getenv("DSV4_CUDA_PEER_FAULT");at=e&&*e?atol(e):0;gone=e&&strstr(e,":lost");}
     if(at<=0||++n!=at)return false;*lost=gone;
     fprintf(stderr,"[DSV4 CUDA] DSV4_CUDA_PEER_FAULT: peer-compute pass #%ld fails%s\n",at,gone?", device lost":"");return true;}
-/* Latch the peer off and drain it. -1: it still answers (an allocation or
- * launch failure), so its mirrors are readable and the caller computes their
- * experts here, reading them in place; 0: a sticky fault, its memory is not
- * read again and the caller must fall back to host copies. */
-static int peer_fail(Dev*pc,int home,const char*why,cudaError_t err,bool lost){
-    bool alive=peer_drain(pc,home)&&!lost;int d=pc->id;
+/* Latch the peer off; peer_latch is for a peer already drained (alive: it
+ * drained). -1: it still answers (an allocation or launch failure), so its
+ * mirrors are readable and the caller computes their experts here, reading
+ * them in place; 0: a sticky fault, its memory is not read again and the
+ * caller must fall back to host copies. */
+static int peer_latch(Dev*pc,int home,const char*why,cudaError_t err,bool alive){int d=pc->id;
     if(d>=0&&d<16&&!g_peer_lost[d]){g_peer_lost[d]=1;
         fprintf(stderr,"[DSV4 CUDA] peer device %d failed in the decode MoE (%s: %s); latched off, decode continues on device %d%s\n",
                 d,why?why:"peer step",cudaGetErrorString(err),home,alive?"":" (its memory is no longer read)");}
     return alive?-1:0;}
+static int peer_fail(Dev*pc,int home,const char*why,cudaError_t err,bool lost){return peer_latch(pc,home,why,err,peer_drain(pc,home)&&!lost);}
 /* One pass of dsv4_cuda_moe on c. With peer, experts mirrored on a device
  * peer_runs() accepts run there. 1 = done, 0 = failed, -1 = the peer failed
  * but still answers: run again without peer, which computes its experts here
@@ -2102,10 +2104,12 @@ static int moe_once(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *up,Dsv4Cu
         if(!buf((void**)&c->mvdesc,&c->mvdesccap,(size_t)2*count*sizeof(MvDesc))||!buf((void**)&c->expert_weights,&c->expert_weightscap,(size_t)count*sizeof(float))||
            !ok(cudaMemcpyAsync(c->expert_weights,weights,(size_t)count*sizeof(float),cudaMemcpyHostToDevice,c->stream),"MoE weights upload"))return 0;
         if(pc){
-            /* A stale error must not be blamed on the peer's launches below. */
+            /* A stale error must not be blamed on the peer's launches below.
+             * The fork is recorded on this device: its failure is ours. */
             cudaGetLastError();
+            if(!ok(cudaEventRecord(c->fork,c->stream),"MoE fork record"))return 0;
             MvDesc pd[32];int k=0;const char*why=nullptr;cudaError_t err=cudaSuccess;
-            bool fine=pstep(cudaEventRecord(c->fork,c->stream),"fork",&why,&err)&&pstep(cudaSetDevice(pdev),"device select",&why,&err)&&
+            bool fine=pstep(cudaSetDevice(pdev),"device select",&why,&err)&&
                pstep(buf((void**)&pc->dx,&pc->xcap,hb)&&buf((void**)&pc->p1,&pc->p1cap,ib)&&buf((void**)&pc->p2,&pc->p2cap,ib)&&buf((void**)&pc->p3,&pc->p3cap,ib)&&
                      buf((void**)&pc->mvdesc,&pc->mvdesccap,(size_t)2*count*sizeof(MvDesc))&&buf((void**)&pc->expert_weights,&pc->expert_weightscap,(size_t)count*sizeof(float))
                      ?cudaSuccess:cudaErrorMemoryAllocation,"buffer allocation",&why,&err)&&
@@ -2131,7 +2135,10 @@ static int moe_once(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *up,Dsv4Cu
         k=0;for(int e=0;e<count;e++)if(!on_peer[e])hd[k++]={(uint8_t*)down[e]->w,down[e]->scale,c->p3+(long long)e*I,c->p4+(long long)e*H};
         if(k){if(!ok(cudaMemcpyAsync(c->mvdesc,hd,(size_t)k*sizeof(*hd),cudaMemcpyHostToDevice,c->stream),"MoE down descriptors upload")){if(pc)peer_drain(pc,sg->device);return 0;}
             mv_fp4_grouped<4><<<dim3((H+3)/4,k),256,0,c->stream>>>(c->mvdesc,k,H,I);}
-        if(pc){cudaError_t e=cudaStreamWaitEvent(c->stream,pc->join,0);if(e!=cudaSuccess)return peer_fail(pc,sg->device,"join wait",e,false);}
+        /* The join wait is queued on this device: the peer is to blame only
+         * if it does not drain. */
+        if(pc){cudaError_t e=cudaStreamWaitEvent(c->stream,pc->join,0);
+            if(e!=cudaSuccess){if(!peer_drain(pc,sg->device))return peer_latch(pc,sg->device,"join wait",e,false);ok(e,"MoE join wait");return 0;}}
     }else for(int e=0;e<count;e++){run_mv<4>((uint8_t*)gate[e]->w,gate[e]->scale,c->dx,c->p1+(long long)e*I,I,H,1,c->stream);run_mv<4>((uint8_t*)up[e]->w,up[e]->scale,c->dx,c->p2+(long long)e*I,I,H,1,c->stream);expert_act<<<(I+255)/256,256,0,c->stream>>>(c->p3+(long long)e*I,c->p1+(long long)e*I,c->p2+(long long)e*I,weights[e],limit,I);fp8_sim<<<(I+127)/128,128,0,c->stream>>>(c->p3+(long long)e*I,1,I);run_mv<4>((uint8_t*)down[e]->w,down[e]->scale,c->p3+(long long)e*I,c->p4+(long long)e*H,H,I,1,c->stream);}
     expert_reduce<<<(H+255)/256,256,0,c->stream>>>(c->dy,c->p4,count,H);
     run_mv<8>((uint8_t*)sg->w,sg->scale,c->dx,c->p1,I,H,1,c->stream);run_mv<8>((uint8_t*)su->w,su->scale,c->dx,c->p2,I,H,1,c->stream);
@@ -2141,7 +2148,9 @@ static int moe_once(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *up,Dsv4Cu
     if(pc){
         /* This stream waited on the join, so the peer's work is done, unless
          * the peer faulted after it was queued: an asynchronous error there
-         * does not show on this device, and y could hold stale peer rows. */
+         * does not show on this device, and y could hold stale peer rows.
+         * Not covered: a faulted peer that never releases this stream's wait
+         * on the join leaves the MoE sync above blocked. */
         bool lost=false;cudaError_t e=cudaEventSynchronize(pc->join);
         if(e==cudaSuccess&&peer_fault(&lost))e=cudaErrorLaunchFailure;
         if(e!=cudaSuccess)return peer_fail(pc,sg->device,"join",e,lost);
