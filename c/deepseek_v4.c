@@ -5406,6 +5406,19 @@ static int v4_gpu_resident_first(void) {
 }
 
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
+/* Hand `key` to loader lane `slot`; its job reads -1 until the lane has run. */
+static int v4_lane_start(ExpertLoadJob *jobs, ExpertLoadHandle *loaders,
+                         int *loader_active, int slot, ColiExpertStore *store,
+                         ColiExpertKey key) {
+    memset(&jobs[slot], 0, sizeof(jobs[slot]));
+    jobs[slot].store = store;
+    jobs[slot].key = key;
+    jobs[slot].result = -1;
+    if (profiled_expert_load_start(&loaders[slot], &jobs[slot]) != 0) return -1;
+    loader_active[slot] = 1;
+    return 0;
+}
+
 /* Finish every lane still reading and give back what it leased. Every exit of
  * a fetch pass runs this, errors included: a lane left running would write
  * its result into the caller's jobs[] after that frame is gone. */
@@ -5570,15 +5583,12 @@ static int moe_token_pipeline(float *output,
         int preload = nfetch < dual_loader_lanes()
             ? nfetch : dual_loader_lanes();
         for (int f = 0; f < preload; f++) {
-            jobs[f].store = store;
-            jobs[f].key = (ColiExpertKey){weights->plan.layer, expert_ids[fetch[f]]};
-            jobs[f].result = -1;
-            if (profiled_expert_load_start(&loaders[f], &jobs[f]) != 0) {
+            if (v4_lane_start(jobs, loaders, loader_active, f, store,
+                              views[fetch[f]].key) != 0) {
                 result = moe_fail("layer %d: could not start reading expert %d",
                                   weights->plan.layer, expert_ids[fetch[f]]);
                 break;
             }
-            loader_active[f] = 1;
         }
     }
 #else
@@ -5655,41 +5665,60 @@ static int moe_token_pipeline(float *output,
 #endif
 
             int next = f + dual_loader_lanes();
-            if (next < nfetch) {
-                memset(&jobs[slot], 0, sizeof(jobs[slot]));
-                jobs[slot].store = store;
-                jobs[slot].key = (ColiExpertKey){weights->plan.layer,
-                                                expert_ids[fetch[next]]};
-                jobs[slot].result = -1;
-                if (profiled_expert_load_start(&loaders[slot],
-                                               &jobs[slot]) != 0)
-                    result = moe_fail("layer %d: could not start reading expert %d",
-                                      weights->plan.layer, expert_ids[fetch[next]]);
-                else
-                    loader_active[slot] = 1;
-            }
+            if (next < nfetch &&
+                v4_lane_start(jobs, loaders, loader_active, slot, store,
+                              views[fetch[next]].key) != 0)
+                result = moe_fail("layer %d: could not start reading expert %d",
+                                  weights->plan.layer, expert_ids[fetch[next]]);
         }
     }
     v4_lanes_finish(store, jobs, loaders, loader_active);
 #ifdef COLI_V4_GPU_TIER
     /* A mirror-only view has no host data. If the token cannot take the fused
      * GPU path after all (an attach failed), fetch those experts from the
-     * store now so every path below sees complete views. */
+     * store now, through the loader lanes like the misses above, so every
+     * path below sees complete views. */
     if (!result && !gpu_compute) {
-        for (int i = 0; !result && i < selected; i++) {
-            if (leased[i]) continue;
-            ColiExpertView host;
-            memset(&host, 0, sizeof(host));
-            if (v4_lookup_waited(store, views[i].key, &host) != 0) {
-                result = moe_fail("layer %d: reading expert %d from the expert store failed",
-                                  weights->plan.layer, views[i].key.expert);
+        int lanes = dual_loader_lanes(), nlazy = 0;
+        for (int i = 0; i < selected; i++)
+            if (!leased[i]) fetch[nlazy++] = i;
+        for (int f = 0; f < nlazy && f < lanes; f++)
+            if (v4_lane_start(jobs, loaders, loader_active, f, store,
+                              views[fetch[f]].key) != 0) {
+                result = moe_fail("layer %d: could not start reading expert %d",
+                                  weights->plan.layer, views[fetch[f]].key.expert);
                 break;
             }
-            void *g = views[i].gate.gpu, *u = views[i].up.gpu, *dn = views[i].down.gpu;
-            views[i] = host;
-            views[i].gate.gpu = g; views[i].up.gpu = u; views[i].down.gpu = dn;
-            leased[i] = 1;
+        for (int f = 0; !result && f < nlazy; f++) {
+            int current = fetch[f];
+            int slot = f % lanes;
+            if (!loader_active[slot] ||
+                profiled_expert_load_finish(&loaders[slot]) != 0) {
+                result = moe_fail("layer %d: the read of expert %d did not complete",
+                                  weights->plan.layer, jobs[slot].key.expert);
+                break;
+            }
+            loader_active[slot] = 0;
+            if (jobs[slot].result) {
+                result = moe_fail("layer %d: reading expert %d from the expert store failed",
+                                  weights->plan.layer, jobs[slot].key.expert);
+                break;
+            }
+            /* the host data, the mirror kept */
+            void *g = views[current].gate.gpu, *u = views[current].up.gpu;
+            void *dn = views[current].down.gpu;
+            views[current] = jobs[slot].view;
+            views[current].gate.gpu = g; views[current].up.gpu = u;
+            views[current].down.gpu = dn;
+            leased[current] = 1;
+            int next = f + lanes;
+            if (next < nlazy &&
+                v4_lane_start(jobs, loaders, loader_active, slot, store,
+                              views[fetch[next]].key) != 0)
+                result = moe_fail("layer %d: could not start reading expert %d",
+                                  weights->plan.layer, views[fetch[next]].key.expert);
         }
+        v4_lanes_finish(store, jobs, loaders, loader_active);
     }
     int hybrid_gpu_count = 0;
     int hybrid_pending_drain = 0;   /* async DMA enqueued, not yet drained */
