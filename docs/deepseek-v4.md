@@ -450,7 +450,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_MOE_EXPERT_MAJOR` (1, `.cu`) | generic batched MoE: expert-major fp4 kernel (weights read once per chunk); `0` = one matvec per route; `_VERIFY=1` compares both bit for bit |
 | `DSV4_MOE_EM_TB` (4, `.cu`) | routes per pass of the expert-major kernel (2, 3, 4, 6) |
 | `DSV4_MM_WARP` (auto, `.cu`) | generic dense batch matmul: warp-per-row kernel for I ≤ 1024; `1` = all fp8 shapes, `0` = off; `DSV4_MM_WARP_VERIFY=1` compares bit for bit |
-| `V4_MOE_BATCH_PROF` (0) | `1` = one `moebprof` line per chunk-layer: route / refill / compute ms |
+| `V4_MOE_BATCH_PROF` (0) | `1` = one `moebprof` line per chunk-layer: switch (layer change: prefetch-worker wait, bank swap) / route / refill / compute ms |
 
 **Prefill / checkpoints**
 | var | meaning |
