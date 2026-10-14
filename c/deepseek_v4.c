@@ -10922,7 +10922,7 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     /* The cache grows only while the VRAM reserve stays free (growth guard
      * in v4_gpu_expert_attach_cached), so the capacity is an upper bound
      * that free VRAM sizes at run time; a generous default lets bigger cards
-     * fill up. ~8 MB per mirror measured. */
+     * fill up. A mirror is 12.75 MiB (gate, up, down: fp4 + UE8M0 scales). */
     mirror_suggested = 4096;
     if (engine->experts && !engine->experts->gpu)
         engine->experts->gpu =
@@ -11670,16 +11670,18 @@ int coli_v4_gpu_dspark_mirrors_ensure(ColiV4Engine *engine) {
  * The routed experts dominate prefill wall time on CPU (0.7-0.9 s/token
  * measured on DeepSeek-V4-Flash). dsv4_cuda_route_moe_batch runs a whole
  * 64-token chunk's MoE on the GPU — batch routing, expert-bank grouped
- * GEMMs, shared expert — but needs the layer's full 256-expert bank in
- * VRAM. The bank (~2.2 GiB) is a single streaming buffer: target_batch's
- * chunk loop sits INSIDE the layer loop, so one bank upload per layer
- * serves every chunk of that layer, and the shared/gate mirrors rebind for
- * free (they are the layer's resident fp8 mirrors).
+ * GEMMs, shared expert — but needs the layer's full expert bank in VRAM
+ * (dsv4_cuda_expert_bank_slots slots of 12.75 MiB, 13.5 MiB on DeepGEMM
+ * builds: 3.2 / 3.4 GiB for 256). The bank is a single streaming buffer:
+ * target_batch's chunk loop sits INSIDE the layer loop, so one bank upload
+ * per layer serves every chunk of that layer, and the shared/gate mirrors
+ * rebind for free (they are the layer's resident fp8 mirrors).
  *
  * Opt-in via COLI_CUDA_MOE_BATCH=1: the bank competes for VRAM with the
- * decode-path expert mirror cache (engine open clamps that cache when this
- * is enabled). Any failure — allocation, missing mirror, backend stub —
- * falls back to the CPU union for the whole generation. */
+ * decode-path expert mirror cache (whose growth guard keeps the bank's room
+ * free, v4_gpu_mirror_reserve_mb). Any failure — allocation, missing
+ * mirror, backend stub — falls back to the CPU union for the whole
+ * generation. */
 int coli_v4_gpu_moe_batch_wanted(void) {
     static int wanted = -1;
     if (wanted < 0) {
@@ -11703,12 +11705,12 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
                        const int *forced_indices, int experts, int dimension,
                        int topk, float route_scale);
 
-/* The expert bank exists only while a large prefill runs: it is ~2.2 GiB of
- * VRAM that decode never touches, and holding it clamps the decode expert
- * mirror cache into the slow zone (~0.8 tok/s vs 1.2+). generate() releases
- * it when the prefill loop finishes; the next large prefill re-creates and
- * re-fills it (per-layer refill cost only, on prompts that already run tens
- * of seconds). */
+/* The expert bank exists only while a large prefill runs: it is up to
+ * 3.4 GiB of VRAM that decode never touches, and holding it clamps the
+ * decode expert mirror cache into the slow zone (~0.8 tok/s vs 1.2+).
+ * generate() releases it when the prefill loop finishes; the next large
+ * prefill re-creates and re-fills it (per-layer refill cost only, on prompts
+ * that already run tens of seconds). */
 static Dsv4CudaExpertSet *v4_moe_bank;
 static int v4_moe_bank_layer = -1;
 static int v4_moe_bank_hash_layer = -1;
@@ -11910,9 +11912,10 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
     if (!outputs || !weights || !config || !store || !inputs || !tokens ||
         batch < 1 || batch > 128) V4_MOE_BATCH_REFUSE("bad arguments");
     /* The backend batch kernels are hardwired to this geometry. Expert-pruned
-     * checkpoints (REAP: fewer than 256 routed experts) still fit the
-     * 256-slot bank; only the GPU router needs exactly 256, so they route on
-     * the CPU below. */
+     * checkpoints (REAP: fewer than 256 routed experts) take a bank of
+     * dsv4_cuda_expert_bank_slots slots (their own count on generic builds,
+     * 256 on DeepGEMM); only the GPU router needs exactly 256, so they route
+     * on the CPU below. */
     if (config->n_routed_experts < 1 || config->n_routed_experts > 256 ||
         config->hidden_size != 4096 || config->num_experts_per_tok != 6)
         V4_MOE_BATCH_REFUSE("unsupported model geometry");
@@ -11936,7 +11939,7 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
             device, sg, su, sd);
         if (!bank) {
             /* Out of VRAM, or shared-mirror shapes off: remember instead of
-             * retrying a 2 GiB allocation on every chunk. */
+             * retrying a multi-GiB allocation on every chunk. */
             fprintf(stderr, "v4_gpu moe-batch=off (bank allocation failed; "
                             "CPU union stays)\n");
             bank_failed = 1;
@@ -15268,9 +15271,9 @@ int coli_v4_session_generate(ColiV4Session *session,
         !v4_ckpt_have(session->prompt_ids, prompt_count))
         v4_ckpt_store(session, prompt_count, 1);
 #ifdef COLI_V4_GPU_TIER
-    /* Decode never touches the expert bank; free its ~2.2 GiB so the decode
-     * expert mirrors get the VRAM instead (bank re-creates on the next large
-     * prefill). */
+    /* Decode never touches the expert bank; free it (up to 3.4 GiB) so the
+     * decode expert mirrors get the VRAM instead (bank re-creates on the next
+     * large prefill). */
     coli_v4_gpu_moe_batch_release();
 #endif
     session->state = state;
