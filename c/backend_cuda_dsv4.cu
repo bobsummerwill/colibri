@@ -1466,20 +1466,21 @@ extern "C" int dsv4_cuda_upload_fp4(Dsv4CudaTensor **t,const uint8_t*w,const uin
 /* In-place refill of an existing fp4 mirror with a same-shape expert: no
  * cudaFree/cudaMalloc churn, DMA from page-locked slabs when possible. The
  * copies are stream-ordered; sync=1 drains before returning (needed when the
- * host slab may be released before the next stream sync). */
+ * host slab may be released before the next stream sync, and before a reader
+ * on another stream: a peer mirror read in place). */
 static bool host_pinned(const void*p,size_t len);
 extern "C" int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t,const uint8_t*w,const uint8_t*s,int O,int I,int sync){
     if(!t||!w||!s||t->fmt!=4||t->O!=O||t->I!=I||!t->own_w||!t->own_scale||!t->w||!t->scale)return 0;
     Dev*c=ctx(t->device);if(!c||!ok(cudaSetDevice(t->device),"select refill device"))return 0;
     size_t wb=(size_t)O*I/2,sb=(size_t)O*I/32;
-    if(host_pinned(w,wb)&&host_pinned(s,sb)){
-        if(!ok(cudaMemcpyAsync(t->w,w,wb,cudaMemcpyHostToDevice,c->stream),"refill weight upload")||
-           !ok(cudaMemcpyAsync(t->scale,s,sb,cudaMemcpyHostToDevice,c->stream),"refill scale upload"))return 0;
-        if(sync&&!ok(cudaStreamSynchronize(c->stream),"refill drain"))return 0;
-    }else{
-        if(!ok(cudaMemcpy(t->w,w,wb,cudaMemcpyHostToDevice),"refill weight upload")||
-           !ok(cudaMemcpy(t->scale,s,sb,cudaMemcpyHostToDevice),"refill scale upload"))return 0;
-    }
+    /* host_pinned page-locks the slabs (up to the pin cap) so the DMA reads
+     * them directly; a pageable source is staged by the driver instead. Both
+     * go on the device stream: a legacy-stream cudaMemcpy would be ordered
+     * neither with the gate/up copies queued there nor by the drain below. */
+    if(host_pinned(w,wb))host_pinned(s,sb);
+    if(!ok(cudaMemcpyAsync(t->w,w,wb,cudaMemcpyHostToDevice,c->stream),"refill weight upload")||
+       !ok(cudaMemcpyAsync(t->scale,s,sb,cudaMemcpyHostToDevice,c->stream),"refill scale upload"))return 0;
+    if(sync&&!ok(cudaStreamSynchronize(c->stream),"refill drain"))return 0;
     return 1;
 }
 extern "C" int dsv4_cuda_upload_bf16(Dsv4CudaTensor **t,const uint16_t*w,int O,int I,int d){return upload(t,w,(size_t)O*I*2,nullptr,0,O,I,d,16);}
