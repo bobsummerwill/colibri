@@ -1411,7 +1411,8 @@ static bool peer_runs(int a,int b){
 extern "C" int dsv4_cuda_peer_compute(int device,int peer){return peer_runs(device,peer);}
 /* Asked BEFORE dsv4_cuda_init (DSV4_CUDA_PEER_DEVICE), so a peer that is
  * refused is never initialised: both ordinals visible, distinct and < 16 (the
- * size of g_peer), a compute capability this build accepts for each
+ * size of g_peer), a peer not latched off by an earlier failure
+ * (dsv4_cuda_peer_healthy), a compute capability this build accepts for each
  * (dsv4_cuda_backend_arch_ok), peer access in both directions, and a kernel
  * image in this binary for each (cudaFuncGetAttributes: "no kernel image" or
  * "invalid device function" otherwise -- the only errors the reason pairs
@@ -1429,6 +1430,7 @@ extern "C" int dsv4_cuda_peer_probe(int device,int peer,char *why,int why_size){
     for(int k=0;k<2;k++){int d=k?peer:device;
         if(d<0||d>=count){snprintf(why,why_size,"device %d is not a visible CUDA device (%d visible)",d,count);return 0;}
         if(d>=16){snprintf(why,why_size,"device %d: peer access is tracked for devices 0-15 only",d);return 0;}}
+    if(dev_lost(peer)){snprintf(why,why_size,"peer device %d failed in the decode MoE earlier in this process and stays latched off",peer);return 0;}
     cudaDeviceProp p[2]{};const char *role[2]={"primary","peer"};
     for(int k=0;k<2;k++){int d=k?peer:device;
         if((e=cudaGetDeviceProperties(&p[k],d))!=cudaSuccess){cudaGetLastError();snprintf(why,why_size,"%s device %d: %s",role[k],d,cudaGetErrorString(e));return 0;}

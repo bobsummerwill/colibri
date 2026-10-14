@@ -196,9 +196,10 @@ int dsv4_cuda_expert_bank_slots(int experts);
 long long dsv4_cuda_expert_bank_slot_bytes(int hidden,int intermediate);
 int dsv4_cuda_peer_access(int a,int b);
 /* Before dsv4_cuda_init: can `peer` carry `device`'s peer mirror pool (both
- * visible and distinct, both of an architecture and with a kernel image this
- * build runs -- the primary checked first --, peer access both ways)? 1 = yes;
- * 0 = no, the reason in why (truncated to why_size). A refused peer is left
+ * visible and distinct, the peer not latched off by dsv4_cuda_peer_healthy,
+ * both of an architecture and with a kernel image this build runs -- the
+ * primary checked first --, peer access both ways)? 1 = yes; 0 = no, the
+ * reason in why (truncated to why_size). A refused peer is left
  * uninitialised. */
 int dsv4_cuda_peer_probe(int device,int peer,char *why,int why_size);
 /* 1 when the decode MoE on device runs the experts mirrored on peer ON peer

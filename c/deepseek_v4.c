@@ -11122,7 +11122,9 @@ typedef struct V4GpuExpertMirrorCache V4GpuExpertMirrorCache;
  * The fused MoE runs its experts on that GPU (peer compute) or reads them in
  * place over P2P/NVLink (dsv4_cuda_peer_compute says which). */
 static V4GpuExpertMirrorCache *g_v4_peer_mirrors;
-static V4GpuExpertMirrorCache *v4_peer_mirrors_create(int device, int primary);
+static int v4_peer_mirrors_capacity(void);
+static V4GpuExpertMirrorCache *v4_peer_mirrors_create(int device, int primary,
+                                                      int capacity);
 static void v4_gpu_expert_vram_held(ColiExpertStore *store, int layer,
                                     unsigned char *held, int experts);
 static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_capacity(
@@ -11146,13 +11148,16 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     int peer = peer_setting && *peer_setting ? atoi(peer_setting) : -1;
     int devices[2] = {device, peer};
     int ndevices = 1;
+    int peer_capacity = 0;
     if (peer >= 0) {
         /* Settle the peer pool BEFORE any init: a peer that gets no pool is
          * never initialised (no context, streams or buffers held on it for
          * the whole run). DSV4_HYBRID=1 attaches its misses asynchronously
          * into the primary cache only and keeps V4_GPU_RESIDENT_FIRST off,
          * so a peer pool would never fill there (a peer that is the primary
-         * itself gets the probe's own reason instead). */
+         * itself gets the probe's own reason instead); a
+         * DSV4_CUDA_PEER_MIRRORS below V4_MIRROR_RECYCLE_MIN leaves the pool
+         * off too. */
         char why[320];
         if (peer != device && coli_v4_hybrid_enabled()) {
             static int hybrid_said;
@@ -11164,6 +11169,8 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
                                 "device %d would stay empty; device %d left unused\n",
                         device, peer, peer);
             }
+        } else if (!(peer_capacity = v4_peer_mirrors_capacity())) {
+            /* v4_peer_mirrors_capacity said why */
         } else if (!dsv4_cuda_peer_probe(device, peer, why, (int)sizeof why)) {
             fprintf(stderr, "v4_gpu warning=peer mirror pool off: %s\n", why);
         } else {
@@ -11220,12 +11227,13 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
         coli_v4_expert_store_vram_held = v4_gpu_expert_vram_held;
     if (ndevices == 2 && engine->experts && engine->experts->gpu && !g_v4_peer_mirrors) {
         /* The probe checked access both ways; this is what init enabled. A
-         * pool refused from here on (no primary cache, an allocation, a
-         * capacity v4_peer_mirrors_create rejects) leaves the peer
-         * initialised for the run: what can be settled from the
-         * environment belongs with the DSV4_HYBRID check, before the probe. */
+         * pool refused from here on (no primary cache, an allocation) leaves
+         * the peer initialised for the run: what can be settled from the
+         * environment (DSV4_HYBRID, the capacity) is settled before the
+         * probe. */
         if (dsv4_cuda_peer_access(device, peer)) {
-            g_v4_peer_mirrors = v4_peer_mirrors_create(peer, device);
+            g_v4_peer_mirrors =
+                v4_peer_mirrors_create(peer, device, peer_capacity);
         } else {
             fprintf(stderr, "v4_gpu warning=no peer access %d<->%d; peer mirror "
                             "pool off\n", device, peer);
@@ -11758,12 +11766,12 @@ static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_capacity(
     return cache;
 }
 
-/* The peer pool: DSV4_CUDA_PEER_MIRRORS capacity (4096), its own VRAM
- * reserve DSV4_CUDA_PEER_RESERVE_MB (1024: no dense weights or prefill bank
- * live on the peer card). A capacity below V4_MIRROR_RECYCLE_MIN could never
- * recycle and would only take misses from the primary cache, so the pool
- * stays off instead. */
-static V4GpuExpertMirrorCache *v4_peer_mirrors_create(int device, int primary) {
+/* The peer pool's capacity, DSV4_CUDA_PEER_MIRRORS (4096), asked by engine
+ * open before the peer is initialised. A capacity below V4_MIRROR_RECYCLE_MIN
+ * could never recycle and would only take misses from the primary cache, so
+ * it (or a value that is not a number) leaves the pool off: 0, with one
+ * warning line. */
+static int v4_peer_mirrors_capacity(void) {
     const char *cap = getenv("DSV4_CUDA_PEER_MIRRORS");
     long long capacity = 4096;
     if (cap && *cap) {
@@ -11773,11 +11781,20 @@ static V4GpuExpertMirrorCache *v4_peer_mirrors_create(int device, int primary) {
             fprintf(stderr, "v4_gpu warning=DSV4_CUDA_PEER_MIRRORS=%s is not a "
                             "capacity of %d or more; peer mirror pool off\n",
                     cap, V4_MIRROR_RECYCLE_MIN);
-            return NULL;
+            return 0;
         }
     }
+    return (int)capacity;
+}
+
+/* The peer pool: `capacity` mirrors (v4_peer_mirrors_capacity), its own VRAM
+ * reserve DSV4_CUDA_PEER_RESERVE_MB (1024: no dense weights or prefill bank
+ * live on the peer card). */
+static V4GpuExpertMirrorCache *v4_peer_mirrors_create(int device, int primary,
+                                                      int capacity) {
+    if (capacity < V4_MIRROR_RECYCLE_MIN) return NULL;
     V4GpuExpertMirrorCache *cache =
-        v4_gpu_expert_mirrors_create_capacity(device, (int)capacity);
+        v4_gpu_expert_mirrors_create_capacity(device, capacity);
     if (!cache) return NULL;
     cache->reserve_env = "DSV4_CUDA_PEER_RESERVE_MB";
     const char *res = getenv("DSV4_CUDA_PEER_RESERVE_MB");

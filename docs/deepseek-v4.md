@@ -357,24 +357,26 @@ VRAM into a real tier:
   the expert-group fallback computes it. The `v4_gpu peer-mirrors ... mode=`
   line at startup says which (`compute` or `p2p-read`).
 
-GPU N is checked before anything is set up on it (a visible device other than
-the primary, peer access both ways, and on both GPUs, the primary's first, an
-architecture and kernel image the build runs); when a check fails, GPU N is
-left untouched, decode runs without it, and the `peer mirror pool off:`
-warning gives the reason and, for a missing kernel image, the `CUDA_ARCH` to
-rebuild with (a GPU that is full or taken by an exclusive-process job is
-reported as such). If the two-GPU init fails after the checks passed, GPU N's
-context is dropped again and decode retries on the primary alone. A miss
-grows the primary cache, then the pool, and once neither can grow recycles
-the older of the two LRU mirrors; a cache with fewer than 8 live mirrors (a
-nearly full card, `DSV4_CUDA_PEER_RESERVE_MB` above its free VRAM) is never
-recycled, so a starved pool only adds mirrors and never sends an expert to
-the CPU that the primary cache would have taken. A CUDA failure on the peer
-during decode latches it off for the rest of the run, with one
-`[DSV4 CUDA] peer device N failed in the decode MoE (...)` line. The token in
-flight is recomputed on the primary GPU, or on the CPU from host copies when
-the peer no longer answers, and the pool's mirrors count as misses from then
-on. The pool's VRAM on that GPU is released only when the engine closes.
+GPU N is checked before anything is set up on it (a `DSV4_CUDA_PEER_MIRRORS`
+of 8 or more, a visible device other than the primary that no earlier peer
+failure in the process has latched off, peer access both ways, and on both
+GPUs, the primary's first, an architecture and kernel image the build runs);
+when a check fails, GPU N is left untouched, decode runs without it, and the
+`peer mirror pool off:` warning gives the reason and, for a missing kernel
+image, the `CUDA_ARCH` to rebuild with (a GPU that is full or taken by an
+exclusive-process job is reported as such). If the two-GPU init fails after
+the checks passed, GPU N's context is dropped again and decode retries on the
+primary alone. A miss grows the primary cache, then the pool, and once
+neither can grow recycles the older of the two LRU mirrors; a cache with
+fewer than 8 live mirrors (a nearly full card, `DSV4_CUDA_PEER_RESERVE_MB`
+above its free VRAM) is never recycled, so a starved pool only adds mirrors
+and never sends an expert to the CPU that the primary cache would have taken.
+A CUDA failure on the peer during decode latches it off for the rest of the
+run, with one `[DSV4 CUDA] peer device N failed in the decode MoE (...)`
+line. The token in flight is recomputed on the primary GPU, or on the CPU
+from host copies when the peer no longer answers, and the pool's mirrors
+count as misses from then on. The pool's VRAM on that GPU is released only
+when the engine closes.
 
 The peer card holds nothing but mirrors (no dense weights, no prefill bank),
 at the same 12.75 MiB each. After ~0.3 GiB of CUDA context and the 1024 MiB
