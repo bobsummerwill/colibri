@@ -10988,9 +10988,10 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
          * never initialised (no context, streams or buffers held on it for
          * the whole run). DSV4_HYBRID=1 attaches its misses asynchronously
          * into the primary cache only and keeps V4_GPU_RESIDENT_FIRST off,
-         * so a peer pool would never fill there. */
+         * so a peer pool would never fill there (a peer that is the primary
+         * itself gets the probe's own reason instead). */
         char why[320];
-        if (coli_v4_hybrid_enabled()) {
+        if (peer != device && coli_v4_hybrid_enabled()) {
             static int hybrid_said;
             if (!hybrid_said) {
                 hybrid_said = 1;
