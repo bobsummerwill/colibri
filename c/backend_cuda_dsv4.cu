@@ -1395,9 +1395,10 @@ extern "C" int dsv4_cuda_peer_access(int a,int b){return a!=b&&dev_ok(a,b)&&dev_
  * size of g_peer), a compute capability this build accepts for each
  * (dsv4_cuda_backend_arch_ok), peer access in both directions, and a kernel
  * image in this binary for each (cudaFuncGetAttributes: "no kernel image" or
- * "invalid device function" otherwise). The primary is checked first: one the
- * build cannot run fails its own init anyway, and its peer must not be left
- * holding a context for a CPU-only run. Only the kernel-image check makes a
+ * "invalid device function" otherwise -- the only errors the reason pairs
+ * with a rebuild hint). The primary is checked first: one the build cannot
+ * run fails its own init anyway, and its peer must not be left holding a
+ * context for a CPU-only run. Only the kernel-image check makes a
  * context: the primary's is the one its init creates; the peer's is destroyed
  * again on refusal unless the backend already holds a device. 1 = usable;
  * 0 = refused, the reason in why. */
@@ -1422,10 +1423,14 @@ extern "C" int dsv4_cuda_peer_probe(int device,int peer,char *why,int why_size){
     int ab=0,ba=0;
     if((e=cudaDeviceCanAccessPeer(&ab,device,peer))!=cudaSuccess||(e=cudaDeviceCanAccessPeer(&ba,peer,device))!=cudaSuccess){cudaGetLastError();snprintf(why,why_size,"peer query %d<->%d: %s",device,peer,cudaGetErrorString(e));return 0;}
     if(!ab||!ba){snprintf(why,why_size,"no peer access %d%s%d (P2P needs NVLink or a P2P-capable PCIe path; nvidia-smi topo -p2p r shows it)",ab?peer:device,!ab&&!ba?"<->":"->",ab?device:peer);return 0;}
-    for(int k=0;k<2;k++){int d=k?peer:device;
-        if((e=cudaSetDevice(d))==cudaSuccess){cudaFuncAttributes fa;e=cudaFuncGetAttributes(&fa,(const void*)mv_fp4_grouped<4>);}
+    for(int k=0;k<2;k++){int d=k?peer:device,set=(e=cudaSetDevice(d))==cudaSuccess;
+        if(set){cudaFuncAttributes fa;e=cudaFuncGetAttributes(&fa,(const void*)mv_fp4_grouped<4>);}
         if(e==cudaSuccess)continue;
         cudaGetLastError();if(k&&!ng&&cudaSetDevice(peer)==cudaSuccess)cudaDeviceReset();cudaGetLastError();
+        /* only these two mean "no code for this device"; a GPU that is full,
+         * held by an exclusive-process job or faulting gets no rebuild advice */
+        if(e!=cudaErrorNoKernelImageForDevice&&e!=cudaErrorInvalidDeviceFunction){
+            snprintf(why,why_size,"%s device %d (%s, sm_%d%d): cannot be used: %s: %s",role[k],d,p[k].name,p[k].major,p[k].minor,set?"kernel-image check":"cudaSetDevice",cudaGetErrorString(e));return 0;}
 #ifdef COLI_DSV4_DEEPGEMM
         snprintf(why,why_size,"%s device %d (%s, sm_%d%d): %s (this %s build carries sm_120a code only; pair other cards with the generic build: no DEEPGEMM)",role[k],d,p[k].name,p[k].major,p[k].minor,cudaGetErrorString(e),dsv4_cuda_backend_name());
 #else
