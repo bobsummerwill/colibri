@@ -10959,14 +10959,16 @@ static int v4_gpu_wanted(void) {
 }
 
 typedef struct V4GpuExpertMirrorCache V4GpuExpertMirrorCache;
-static V4GpuExpertMirrorCache *g_v4_peer_mirrors;   /* defined with the cache below */
+/* Peer mirror pool (DSV4_CUDA_PEER_DEVICE): a second cache on another GPU;
+ * the fused decode MoE runs its experts on that GPU (or reads them over
+ * P2P). */
+static V4GpuExpertMirrorCache *g_v4_peer_mirrors;
 static V4GpuExpertMirrorCache *v4_peer_mirrors_create(int device);
 static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_capacity(
     int device, int capacity);
 static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create(int device,
                                                             int suggested);
 static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache);
-int v4_bank_double_on(void);
 static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                                           ColiExpertView *view, int sync);
 static void v4_gpu_mirror_reserve_size(const ColiDeepSeekV4Config *config);
@@ -11489,7 +11491,6 @@ struct V4GpuExpertMirrorCache {
     V4GpuExpertMirror *entries;
     int capacity;
     int count;
-    uint64_t clock;
     int device;
     pthread_mutex_t mutex;
     /* growth guard state, per cache (a peer pool on another card has its own
@@ -11517,9 +11518,6 @@ static uint64_t g_v4_mirror_clock;
 static uint64_t v4_mirror_tick(void) {
     return __atomic_add_fetch(&g_v4_mirror_clock, 1, __ATOMIC_RELAXED);
 }
-/* Peer mirror pool (DSV4_CUDA_PEER_DEVICE): a second cache on another GPU
- * whose mirrors the fused MoE reads in place over P2P/NVLink. */
-static V4GpuExpertMirrorCache *g_v4_peer_mirrors;
 
 static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_capacity(
     int device, int capacity) {
@@ -12051,7 +12049,7 @@ static int v4_bank2_alloc_failed;    /* this prefill only; release() clears */
 static unsigned long long v4_bank2_swaps, v4_bank2_prefetched;
 static struct { ColiExpertStore *store; int layer; int experts; } v4_bank2_job;
 
-int v4_bank_double_on(void) {
+static int v4_bank_double_on(void) {
     static int on = -1;
     if (on < 0) {
         const char *setting = getenv("COLI_CUDA_MOE_DOUBLE");
