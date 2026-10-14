@@ -231,14 +231,15 @@ more VRAM.
 The default reserve is 600 MiB without the bank. With `COLI_CUDA_MOE_BATCH=1`
 it is sized from the model's bank at engine open, so the next large prefill
 still finds room for it after decode has filled the card: 600 MiB + the bank
-(two banks with `COLI_CUDA_MOE_DOUBLE=1`, back to one once the second has
-failed to allocate) + 64 mirrors, because free VRAM is re-read only every 64
-misses. That is 4681 MiB for 256 experts on generic builds, 4873 on DeepGEMM
-and 3100 for a 132-expert checkpoint (7945, 8329 and 4783 with the second
-bank); the engine logs it as `v4_gpu mirror-reserve=`. Below 32 live mirrors
-the default keeps only 600 MiB free, so a card too small for the bank still
-decodes from a working mirror set (the bank then falls back to the CPU
-union). An explicit `DSV4_CUDA_VRAM_RESERVE_MB` is used as given.
+(two banks with `COLI_CUDA_MOE_DOUBLE=1`, back to one once its prefetch has
+turned itself off; a second bank that did not fit is retried by the next
+prefill, so its room stays reserved) + 64 mirrors, because free VRAM is
+re-read only every 64 misses. That is 4681 MiB for 256 experts on generic
+builds, 4873 on DeepGEMM and 3100 for a 132-expert checkpoint (7945, 8329 and
+4783 with the second bank); the engine logs it as `v4_gpu mirror-reserve=`.
+Below 32 live mirrors the default keeps only 600 MiB free, so a card too small
+for the bank still decodes from a working mirror set (the bank then falls back
+to the CPU union). An explicit `DSV4_CUDA_VRAM_RESERVE_MB` is used as given.
 
 | VRAM | dense mirrors | prefill bank | recommended env | expected |
 |---|---|---|---|---|
@@ -312,8 +313,8 @@ Answers were identical to the CPU union in every run. Decode is unchanged
 reserve also covers the prefetch bank (one more bank: +1683 MiB for this
 132-expert model, +3264 MiB for 256 experts), so it still allocates after
 decode has grown its mirror cache; the mirrors that room holds back cost some
-decode speed, and the reserve drops back to one bank once a second bank has
-failed to allocate.
+decode speed, and the reserve drops back to one bank once the prefetch has
+turned itself off (`moe-double=off`).
 
 ## Prefill: segments, chunks, checkpoints
 

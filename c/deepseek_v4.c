@@ -11809,7 +11809,7 @@ static void v4_gpu_mirror_reserve_size(const ColiDeepSeekV4Config *config) {
  * (the growth guard in v4_gpu_expert_attach_cached_ex): the explicit
  * DSV4_CUDA_VRAM_RESERVE_MB as given, else the bank-sized default
  * (deepseek_v4_bank_pair.h), whose second bank drops out once
- * COLI_CUDA_MOE_DOUBLE has latched off. */
+ * COLI_CUDA_MOE_DOUBLE has latched off (v4_bank_double_usable). */
 static long long v4_gpu_mirror_reserve_mb(int live) {
     static long long explicit_mb = -2;
     if (explicit_mb == -2) {

@@ -55,8 +55,9 @@ static inline int coli_v4_bank_pair_prefetch_target(int double_on,
  * reserve, and the next large prefill allocates its bank(s) from what is
  * left, so the default reserve is sized from the bank itself: attention/work
  * headroom (the whole reserve without the bank), plus `banks` x
- * `bank_bytes` (two with COLI_CUDA_MOE_DOUBLE until the second one has
- * failed to allocate), plus COLI_V4_MIRROR_PROBE_EVERY mirrors of
+ * `bank_bytes` (two with COLI_CUDA_MOE_DOUBLE until its prefetch has
+ * latched off; a second bank that did not fit is retried by the next
+ * prefill, so it stays reserved), plus COLI_V4_MIRROR_PROBE_EVERY mirrors of
  * `mirror_bytes`: the guard re-reads free VRAM only every that many misses,
  * so the cache can grow that far past the reserve before it notices. A card
  * too small for that after the dense mirrors (two 256-slot banks alone are
