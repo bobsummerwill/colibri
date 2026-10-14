@@ -268,6 +268,8 @@ when the switch below is `0`, and says so once at startup):
 - `DSV4_MOE_EXPERT_MAJOR` (1): the routed experts run expert-major — one warp
   per expert row walks every token of the chunk that picked that expert, so
   each expert's weights are read once per chunk instead of once per route.
+  It takes 2 routes per pass while the chunk averages fewer than 4 routes per
+  routed expert (small prompts, tail chunks) and 4 otherwise.
 - `DSV4_MM_WARP` (auto): warp-per-row dense batch matmul for short rows
   (I ≤ 1024, e.g. `attn.wq_b`; unset, empty or `auto`); `1` forces it on every
   fp8 shape, `0` disables it. Against the old kernel it also measured faster
@@ -451,7 +453,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_CUDA_MOE_GROUPED` (1, `.cu`) | expert-grouped MoE GEMM rows; `0` = legacy replicated |
 | `V4_MOE_BANK_FULL` (off) | `=N`: prefetch a whole layer's experts above N tokens (measured worse) |
 | `DSV4_MOE_EXPERT_MAJOR` (1, `.cu`) | generic batched MoE: expert-major fp4 kernel (weights read once per chunk); `0` = one matvec per route; `_VERIFY=1` compares both bit for bit (keeps the per-route results, also with `0`) |
-| `DSV4_MOE_EM_TB` (4, `.cu`) | routes per pass of the expert-major kernel (2, 3, 4, 6; anything else is ignored with a warning) |
+| `DSV4_MOE_EM_TB` (auto, `.cu`) | routes per pass of the expert-major kernel: unset = 2 below 4 routes per routed expert in the chunk, else 4; `2`, `3`, `4` or `6` forces one (anything else is ignored with a warning) |
 | `DSV4_MM_WARP` (auto, `.cu`) | generic dense batch matmul: warp-per-row kernel for I ≤ 1024 (unset, empty or `auto`); `1` = all fp8 shapes, `0` = off; `DSV4_MM_WARP_VERIFY=1` compares bit for bit (keeps the old kernel's results, also with `0`) |
 | `V4_MOE_BATCH_PROF` (0) | `1` = one `moebprof` line per chunk-layer: route / refill / compute ms |
 

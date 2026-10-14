@@ -2413,11 +2413,15 @@ extern "C" int dsv4_cuda_route_moe_ids_batch(const Dsv4CudaActivation*input,cons
      * bit-identical); DSV4_MOE_EXPERT_MAJOR=0 keeps one matvec per route.
      * DSV4_MOE_EXPERT_MAJOR_VERIFY=1 runs both and counts bit mismatches (the
      * per-route results are kept, so it also runs over an explicit =0, which
-     * it says once). DSV4_MOE_EM_TB=2|3|4|6 routes per pass (default 4). */
-    static int em_mode=-1,em_mode_env=1,em_verify=0,em_tb=4;static unsigned long long em_calls=0,em_bad1=0,em_bad2=0;
+     * it says once). Routes per pass (TB): 2 while the chunk averages fewer
+     * than 4 routes per routed expert (small prompts, tail chunks), else 4.
+     * On sm_86 TB=4 took ~1.4x TB=2's time at 1-2 routes per expert and
+     * pulled ahead from ~3-4.5 (more skewed routing = later); every TB is
+     * bit-identical. DSV4_MOE_EM_TB=2|3|4|6 forces one. */
+    static int em_mode=-1,em_mode_env=1,em_verify=0,em_tb=0;static unsigned long long em_calls=0,em_bad1=0,em_bad2=0;
     if(em_mode<0){const char*v=getenv("DSV4_MOE_EXPERT_MAJOR");em_mode_env=v?atoi(v)!=0:1;em_mode=em_mode_env;
         v=getenv("DSV4_MOE_EM_TB");if(v&&*v){em_tb=atoi(v);
-            if(em_tb!=2&&em_tb!=3&&em_tb!=4&&em_tb!=6){fprintf(stderr,"[DSV4 CUDA] DSV4_MOE_EM_TB=%s ignored (2, 3, 4 or 6): using 4\n",v);em_tb=4;}}
+            if(em_tb!=2&&em_tb!=3&&em_tb!=4&&em_tb!=6){fprintf(stderr,"[DSV4 CUDA] DSV4_MOE_EM_TB=%s ignored (2, 3, 4 or 6): TB by route density\n",v);em_tb=0;}}
         v=getenv("DSV4_MOE_EXPERT_MAJOR_VERIFY");em_verify=v&&atoi(v)!=0;
         if(em_verify&&!em_mode){em_mode=1;fprintf(stderr,"[DSV4 CUDA] DSV4_MOE_EXPERT_MAJOR_VERIFY=1 overrides DSV4_MOE_EXPERT_MAJOR=0: the expert-major kernel runs beside the per-route one, whose results are kept\n");}}
     int nex=0;const int*em_ex=nullptr,*em_off=nullptr,*em_rt=nullptr;
@@ -2439,6 +2443,7 @@ extern "C" int dsv4_cuda_route_moe_ids_batch(const Dsv4CudaActivation*input,cons
            (!c->emcount&&!alloc_ok(cudaMalloc(&c->emcount,2*sizeof(unsigned long long)),"expert-major verify counter")))){
             em_verify=0;em_mode=em_mode_env;fprintf(stderr,"[DSV4 CUDA] DSV4_MOE_EXPERT_MAJOR_VERIFY off: no memory for its buffers\n");}
     }
+    const int tb=em_tb?em_tb:routes<4*nex?2:4;
     /* the per-route kernel's descriptor tables: per-route mode and verify only */
     const bool per_route=!em_mode||em_verify;std::vector<MvDesc> hd;
     if(per_route){
@@ -2454,7 +2459,7 @@ extern "C" int dsv4_cuda_route_moe_ids_batch(const Dsv4CudaActivation*input,cons
     }
     if(em_mode){
         float*y0=em_verify?c->emv1:c->p1,*y1=em_verify?c->emv2:c->p2;
-        run_fp4_expert_major(em_tb,set->bank_fc1,set->bank_fc1_scale,2*w1,2*s1,
+        run_fp4_expert_major(tb,set->bank_fc1,set->bank_fc1_scale,2*w1,2*s1,
             em_ex,em_off,em_rt,nex,input->data,H,K,y0,y1,I,I,2*I,H,c->stream);
         if(em_verify){
             if(!ok(cudaMemsetAsync(c->emcount,0,2*sizeof(unsigned long long),c->stream),"verify clear"))return 0;
@@ -2474,7 +2479,7 @@ extern "C" int dsv4_cuda_route_moe_ids_batch(const Dsv4CudaActivation*input,cons
     }
     if(em_mode){
         float*y=em_verify?c->emv4:c->p4;
-        run_fp4_expert_major(em_tb,set->bank_fc2,set->bank_fc2_scale,w2,s2,
+        run_fp4_expert_major(tb,set->bank_fc2,set->bank_fc2_scale,w2,s2,
             em_ex,em_off,em_rt,nex,c->p3,I,1,y,y,H,H,H,I,c->stream);
         if(em_verify){
             count_bit_mismatch<<<((long long)routes*H+255)/256,256,0,c->stream>>>(c->p4,c->emv4,(long long)routes*H,c->emcount+1);
