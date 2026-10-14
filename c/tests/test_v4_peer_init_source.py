@@ -10,8 +10,8 @@ pins the shape that a CPU-only CI host can see:
   the single-device retry (on Windows the loader's shutdown unloads the DLL);
 - with the peer unset the engine still makes exactly PR #1's single init;
 - every failure inside dsv4_cuda_init goes through init_fail, which releases
-  what was set up and clears the last error, and shutdown shares that
-  teardown;
+  what was set up, drops the contexts of every device but the first and
+  clears the last error, and shutdown shares that teardown;
 - the probe's rebuild hint follows a missing kernel image only.
 """
 import re
@@ -68,7 +68,13 @@ class V4PeerInitSourceTest(unittest.TestCase):
         # the slot's device is known before its first resource is created
         self.assertLess(init.index("g[i].id=dev[i];"), init.index("cudaStreamCreateWithFlags"))
         fail = function_body(self.backend, "static int init_fail(", "return 0;}")
-        self.assertIn("dev_release(touched);cudaGetLastError();", fail)
+        # release, then drop every context but dev[0]'s (the retry's), then
+        # clear the last error the release and the resets may have set
+        release_at = fail.index("dev_release(touched);")
+        reset_at = fail.index("for(int i=1;i<n;i++)if(dev[i]!=dev[0]&&cudaSetDevice(dev[i])==cudaSuccess)cudaDeviceReset();")
+        self.assertLess(release_at, reset_at)
+        self.assertLess(reset_at, fail.index("cudaGetLastError();"))
+        self.assertEqual(init.count("return init_fail(dev,n,"), init.count("return init_fail("))
         self.assertIn('extern "C" void dsv4_cuda_shutdown(void){dev_release(ng);}', self.backend)
         release = function_body(self.backend, "static void dev_release(int n){",
                                 "memset(g_peer,0,sizeof g_peer);}")
