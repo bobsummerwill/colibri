@@ -10970,7 +10970,7 @@ int v4_bank_double_on(void);
 static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                                           ColiExpertView *view, int sync);
 static void v4_gpu_mirror_reserve_size(const ColiDeepSeekV4Config *config);
-static long long v4_gpu_mirror_reserve_mb(int live);
+static long long v4_gpu_mirror_reserve_mb(int live, long long *margin_mb);
 
 int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     if (!engine) return -1;
@@ -11483,6 +11483,8 @@ typedef struct {
     uint64_t clock;
 } V4GpuExpertMirror;
 
+/* Every entry in [0, count) holds a live mirror (gate, up and down): a
+ * failed upload rolls its slot back instead of leaving a dead entry. */
 struct V4GpuExpertMirrorCache {
     V4GpuExpertMirror *entries;
     int capacity;
@@ -11492,12 +11494,23 @@ struct V4GpuExpertMirrorCache {
     pthread_mutex_t mutex;
     /* growth guard state, per cache (a peer pool on another card has its own
      * free VRAM and its own, smaller reserve). reserve_mb < 0 = the bank-sized
-     * default of the primary card (v4_gpu_mirror_reserve_mb, per miss). */
+     * default of the primary card (v4_gpu_mirror_reserve_mb, per miss).
+     * last_free_mb is the last free-VRAM probe, grown_bytes the mirrors this
+     * cache has uploaded since. */
     long long reserve_mb;
     long long last_free_mb;
+    long long grown_bytes;
     unsigned probes;
     int unified;
+    const char *reserve_env;   /* the variable that sets reserve_mb */
+    int frozen_warned;
 };
+/* A layer attaches its 6 routed experts before computing them, and a slot is
+ * recycled in place: a cache with fewer live mirrors than this would recycle
+ * one an earlier view of the same token still references (measured:
+ * DSV4_CUDA_EXPERT_MIRRORS=1 produces garbage, #1538). Below it a cache only
+ * grows, and the tiered attach never picks it as the victim. */
+#define V4_MIRROR_RECYCLE_MIN 8
 /* One LRU clock for every mirror cache, so the peer pool and the primary
  * cache can compare their victims' ages. */
 static uint64_t g_v4_mirror_clock;
@@ -11522,18 +11535,33 @@ static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_capacity(
     cache->reserve_mb = -1;
     cache->last_free_mb = -1;
     cache->unified = -1;
+    cache->reserve_env = "DSV4_CUDA_VRAM_RESERVE_MB";
     pthread_mutex_init(&cache->mutex, NULL);
     return cache;
 }
 
 /* The peer pool: DSV4_CUDA_PEER_MIRRORS capacity (4096), its own VRAM
  * reserve DSV4_CUDA_PEER_RESERVE_MB (1024: no dense weights or prefill bank
- * live on the peer card). */
+ * live on the peer card). A capacity below V4_MIRROR_RECYCLE_MIN could never
+ * recycle and would only take misses from the primary cache, so the pool
+ * stays off instead. */
 static V4GpuExpertMirrorCache *v4_peer_mirrors_create(int device) {
     const char *cap = getenv("DSV4_CUDA_PEER_MIRRORS");
+    long long capacity = 4096;
+    if (cap && *cap) {
+        char *end = NULL;
+        capacity = strtoll(cap, &end, 10);
+        if (*end || capacity < V4_MIRROR_RECYCLE_MIN || capacity > INT_MAX) {
+            fprintf(stderr, "v4_gpu warning=DSV4_CUDA_PEER_MIRRORS=%s is not a "
+                            "capacity of %d or more; peer mirror pool off\n",
+                    cap, V4_MIRROR_RECYCLE_MIN);
+            return NULL;
+        }
+    }
     V4GpuExpertMirrorCache *cache =
-        v4_gpu_expert_mirrors_create_capacity(device, cap ? atoi(cap) : 4096);
+        v4_gpu_expert_mirrors_create_capacity(device, (int)capacity);
     if (!cache) return NULL;
+    cache->reserve_env = "DSV4_CUDA_PEER_RESERVE_MB";
     const char *res = getenv("DSV4_CUDA_PEER_RESERVE_MB");
     cache->reserve_mb = res ? atoll(res) : 1024;
     if (cache->reserve_mb < 256) cache->reserve_mb = 256;
@@ -11566,8 +11594,23 @@ static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache) {
     free(cache);
 }
 
+/* Once per cache: it cannot grow and holds too few live mirrors to recycle
+ * one, named by its card and the variable that sets its reserve. */
+static void v4_mirror_warn_frozen(V4GpuExpertMirrorCache *cache,
+                                  long long reserve_mb) {
+    if (cache->frozen_warned) return;
+    cache->frozen_warned = 1;
+    fprintf(stderr, "v4_gpu mirror-cache: device %d frozen below its %lld MiB "
+                    "VRAM reserve with %d live entries; a layer attaches up to "
+                    "%d before computing, so this cache takes no new experts "
+                    "until it can grow (free VRAM on device %d or lower %s)\n",
+            cache->device, reserve_mb, cache->count, V4_MIRROR_RECYCLE_MIN,
+            cache->device, cache->reserve_env);
+}
+
 /* grow_only: return -2 instead of recycling an entry when this cache cannot
- * grow (the tiered attach then tries the next cache). */
+ * grow (the tiered attach then tries the next cache), also when the upload
+ * of a new mirror failed. -1 = this cache cannot take the expert at all. */
 static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
                                             ColiExpertView *view, int sync,
                                             int grow_only);
@@ -11582,19 +11625,28 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
     if (view->gate.block_rows != 1 || view->up.block_rows != 1 ||
         view->down.block_rows != 1)
         return -1;
-    /* A layer attaches its 6 routed experts before computing them; a cache
-     * smaller than that would recycle a slot still referenced by an earlier
-     * view of the same token (measured: DSV4_CUDA_EXPERT_MIRRORS=1 produces
-     * garbage). Below 8 entries, stay on the CPU. */
-    if (cache->capacity < 8) return -1;
+    /* Below V4_MIRROR_RECYCLE_MIN entries, stay on the CPU. */
+    if (cache->capacity < V4_MIRROR_RECYCLE_MIN) return -1;
     pthread_mutex_lock(&cache->mutex);
     int found = -1;
     for (int i = 0; i < cache->count; i++) {
         if (cache->entries[i].layer == view->key.layer &&
-            cache->entries[i].expert == view->key.expert) {
+            cache->entries[i].expert == view->key.expert &&
+            cache->entries[i].gate && cache->entries[i].up &&
+            cache->entries[i].down) {
             found = i;
             break;
         }
+    }
+    if (found < 0 &&
+        (!view->gate.data || !view->gate.scales || view->gate.rows < 1 ||
+         view->gate.columns < 1 || !view->up.data || !view->up.scales ||
+         view->up.rows < 1 || view->up.columns < 1 || !view->down.data ||
+         !view->down.scales || view->down.rows < 1 || view->down.columns < 1)) {
+        /* no host copy to upload: neither a reason to recycle a victim nor a
+         * sign of a full card */
+        pthread_mutex_unlock(&cache->mutex);
+        return -1;
     }
     if (found < 0) {
         /* Growth guard: new mirrors may only claim VRAM while a reserve
@@ -11603,6 +11655,11 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
          * slot instead of growing — decode keeps its hottest experts and
          * the next large prefill still fits. */
         int grow = cache->count < cache->capacity;
+        /* fp4 nibbles plus one UE8M0 scale per 32, as uploaded */
+        long long elements = (long long)(view->gate.rows * view->gate.columns +
+                                         view->up.rows * view->up.columns +
+                                         view->down.rows * view->down.columns);
+        long long mirror_bytes = elements / 2 + elements / 32;
         /* The primary cache's default reserve is sized from the model's bank
          * at engine open, covers the COLI_CUDA_MOE_DOUBLE second bank while
          * that is on, and is only the attention headroom until the cache
@@ -11610,13 +11667,24 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
          * per miss); DSV4_CUDA_VRAM_RESERVE_MB overrides. A cache with its
          * own reserve (the peer pool: no dense weights or prefill bank live
          * on that card) keeps it in reserve_mb instead. */
+        long long margin_mb = 0;
         long long reserve_mb = cache->reserve_mb >= 0
             ? cache->reserve_mb
-            : v4_gpu_mirror_reserve_mb(cache->count);
+            : v4_gpu_mirror_reserve_mb(cache->count, &margin_mb);
         /* cudaMemGetInfo is a driver round trip; with a large capacity the
          * guard is consulted on every miss (hundreds per token), so re-check
-         * free VRAM only every 64 misses and reuse the last answer between
-         * (the default reserve carries that many mirrors of margin). */
+         * free VRAM only every 64 misses and reuse the last answer between.
+         * The last answer must clear the reserve, and the last answer less
+         * the mirrors grown since (this one included) must clear the reserve
+         * less its probe margin. The bank-sized default carries 64 mirrors of
+         * margin, also below 32 live mirrors where it is only the headroom,
+         * so the second test never binds for it (on a card too small for the
+         * bank its first 32 mirrors may still overshoot the headroom); an
+         * explicit reserve, the default without a bank and the peer pool's
+         * carry none, and without the second test were overshot by up to 64
+         * mirrors (816 MiB), past the card's free VRAM. A failed upload
+         * counts as a full card until the next probe (the guard then covers
+         * an empty cache too). */
         /* On unified memory (GB10, Jetson) cudaMemGetInfo's free is the
          * system's MemFree, which the page cache holding the model keeps
          * near zero; measured against a VRAM reserve it froze this cache at
@@ -11631,38 +11699,36 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
                                 "card's); capacity %d bounds the cache\n",
                         cache->capacity);
         }
-        if (grow && cache->count > 0 && !cache->unified) {
+        if (grow && !cache->unified &&
+            (cache->count > 0 || cache->last_free_mb >= 0)) {
             if (cache->last_free_mb < 0 ||
-                (cache->probes++ % COLI_V4_MIRROR_PROBE_EVERY) == 0)
+                (cache->probes++ % COLI_V4_MIRROR_PROBE_EVERY) == 0) {
                 cache->last_free_mb = dsv4_cuda_mem_free_mb(cache->device);
-            if (cache->last_free_mb >= 0 && cache->last_free_mb < reserve_mb) grow = 0;
+                cache->grown_bytes = 0;
+            }
+            long long grown_mb =
+                (cache->grown_bytes + mirror_bytes + (1LL << 20) - 1) >> 20;
+            if (cache->last_free_mb >= 0 &&
+                (cache->last_free_mb < reserve_mb ||
+                 cache->last_free_mb - grown_mb < reserve_mb - margin_mb))
+                grow = 0;
         }
-        if (grow_only && (!grow || cache->count >= cache->capacity)) {
+        /* The V4_MIRROR_RECYCLE_MIN rule above is about LIVE entries, not
+         * the configured capacity: a cache frozen by the reserve with two or
+         * three mirrors would recycle in place a slot the current token's
+         * earlier view still references, and the output is garbage with no
+         * error (#1538). Leave this expert to the CPU (or the other cache)
+         * until this one can grow. */
+        if (!grow && cache->count < V4_MIRROR_RECYCLE_MIN) {
+            v4_mirror_warn_frozen(cache, reserve_mb);
+            pthread_mutex_unlock(&cache->mutex);
+            return grow_only ? -2 : -1;
+        }
+        if (grow_only && !grow) {
             pthread_mutex_unlock(&cache->mutex);
             return -2;
         }
-        if (!grow && cache->count == 0) {
-            pthread_mutex_unlock(&cache->mutex);
-            return -1;
-        }
-        /* The "fewer than 8" rule above is about LIVE entries, not the
-         * configured capacity: a cache frozen by the reserve with two or
-         * three mirrors would recycle in place a slot the current token's
-         * earlier view still references, and the output is garbage with no
-         * error (#1538). Stay on the CPU for this expert until it can grow. */
-        if (!grow && cache->count < 8) {
-            static int warned;
-            if (!warned) {
-                warned = 1;
-                fprintf(stderr, "v4_gpu mirror-cache: frozen below the VRAM reserve "
-                                "with %d live entries; a layer attaches up to 8 "
-                                "before computing, so experts stay on the CPU until "
-                                "the cache can grow (raise capacity or lower "
-                                "DSV4_CUDA_VRAM_RESERVE_MB)\n", cache->count);
-            }
-            pthread_mutex_unlock(&cache->mutex);
-            return -1;
-        }
+        int appended = 0;
         if (!grow || cache->count >= cache->capacity) {
             found = 0;
             for (int i = 1; i < cache->count; i++)
@@ -11707,6 +11773,7 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
                 dsv4_cuda_tensor_free(cache->entries[found].down);
         } else {
             found = cache->count++;
+            appended = 1;
         }
         cache->entries[found].layer = view->key.layer;
         cache->entries[found].expert = view->key.expert;
@@ -11740,12 +11807,23 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
             if (gate) dsv4_cuda_tensor_free(gate);
             if (up) dsv4_cuda_tensor_free(up);
             if (down) dsv4_cuda_tensor_free(down);
+            /* Roll the slot back so no entry is left without tensors: a dead
+             * entry would match its expert with NULL mirrors, look like the
+             * oldest LRU victim (clock 0) and need a fresh cudaMalloc on
+             * every recycle. An appended slot is dropped; a recycled one
+             * (its old mirror already freed) takes the last entry. Until the
+             * next probe the card counts as full. */
+            if (appended) cache->count--;
+            else cache->entries[found] = cache->entries[--cache->count];
+            cache->last_free_mb = 0;
+            cache->grown_bytes = 0;
             pthread_mutex_unlock(&cache->mutex);
-            return -1;
+            return grow_only ? -2 : -1;
         }
         cache->entries[found].gate = gate;
         cache->entries[found].up = up;
         cache->entries[found].down = down;
+        if (appended) cache->grown_bytes += mirror_bytes;
     }
     cache->entries[found].clock = v4_mirror_tick();
     view->gate.gpu = cache->entries[found].gate;
@@ -11775,30 +11853,49 @@ static int v4_mirror_peek_cache(V4GpuExpertMirrorCache *cache, ColiExpertView *v
     pthread_mutex_unlock(&cache->mutex);
     return -1;
 }
+/* The LRU stamp of the mirror a recycle in this cache would replace, or
+ * UINT64_MAX when the cache cannot recycle: fewer than V4_MIRROR_RECYCLE_MIN
+ * live mirrors (frozen small by its reserve, or a small capacity). */
 static uint64_t v4_mirror_lru_clock(V4GpuExpertMirrorCache *cache) {
     uint64_t oldest = UINT64_MAX;
+    int live = 0;
     pthread_mutex_lock(&cache->mutex);
-    for (int i = 0; i < cache->count; i++)
+    for (int i = 0; i < cache->count; i++) {
+        if (!cache->entries[i].gate || !cache->entries[i].up ||
+            !cache->entries[i].down)
+            continue;
+        live++;
         if (cache->entries[i].clock < oldest) oldest = cache->entries[i].clock;
+    }
     pthread_mutex_unlock(&cache->mutex);
-    return oldest;
+    return live >= V4_MIRROR_RECYCLE_MIN ? oldest : UINT64_MAX;
 }
 /* With a peer pool: an expert mirrored in either cache is used in place;
- * otherwise grow the primary cache, then the peer pool, and once both are
- * full recycle whichever cache holds the older LRU entry. */
+ * otherwise grow the primary cache, then the peer pool, and once neither can
+ * grow recycle whichever cache holds the older LRU entry, then the other one
+ * if that fails. A cache that cannot recycle, or that refused this expert
+ * outright (-1 from its grow_only attach), is never the victim, so a small,
+ * VRAM-starved or failing pool cannot send to the CPU an expert the primary
+ * cache alone would have taken. */
 static int v4_gpu_expert_attach_tiered(V4GpuExpertMirrorCache *primary,
                                        ColiExpertView *view, int sync) {
-    V4GpuExpertMirrorCache *peer = g_v4_peer_mirrors;
+    V4GpuExpertMirrorCache *peer = g_v4_peer_mirrors;   /* the only read here */
     if (!peer || !primary) return v4_gpu_expert_attach_cached_ex(primary, view, sync);
     if (v4_mirror_peek_cache(primary, view) == 0 ||
         v4_mirror_peek_cache(peer, view) == 0) return 0;
-    int r = v4_gpu_expert_attach_cached_mode(primary, view, sync, 1);
-    if (r != -2) return r;
-    r = v4_gpu_expert_attach_cached_mode(peer, view, sync, 1);
-    if (r != -2) return r;
-    V4GpuExpertMirrorCache *victim =
-        v4_mirror_lru_clock(peer) < v4_mirror_lru_clock(primary) ? peer : primary;
-    return v4_gpu_expert_attach_cached_ex(victim, view, sync);
+    int primary_r = v4_gpu_expert_attach_cached_mode(primary, view, sync, 1);
+    if (primary_r == 0) return 0;
+    int r = v4_gpu_expert_attach_cached_mode(peer, view, sync, 1);
+    if (r == 0) return 0;
+    /* the LRU scans only once neither cache could grow */
+    uint64_t primary_lru =
+        primary_r == -2 ? v4_mirror_lru_clock(primary) : UINT64_MAX;
+    uint64_t peer_lru = r == -2 ? v4_mirror_lru_clock(peer) : UINT64_MAX;
+    if (primary_lru == UINT64_MAX && peer_lru == UINT64_MAX) return -1;
+    int peer_first = peer_lru < primary_lru;
+    r = v4_gpu_expert_attach_cached_ex(peer_first ? peer : primary, view, sync);
+    if (r == 0 || (peer_first ? primary_lru : peer_lru) == UINT64_MAX) return r;
+    return v4_gpu_expert_attach_cached_ex(peer_first ? primary : peer, view, sync);
 }
 
 int coli_v4_gpu_expert_attach(ColiExpertStore *store, ColiExpertView *view) {
@@ -11830,29 +11927,14 @@ int coli_v4_gpu_expert_drain(ColiExpertStore *store) {
  * mirrored, touching its LRU stamp, but NEVER uploading on a miss. The
  * hybrid decode split peeks the whole token first and decides its uploads
  * afterwards with the q* policy, instead of paying a blocking PCIe copy per
- * miss the moment it is discovered. */
+ * miss the moment it is discovered. The primary cache is scanned once; the
+ * peer pool only on a primary miss. */
 int coli_v4_gpu_expert_peek(ColiExpertStore *store, ColiExpertView *view) {
+    V4GpuExpertMirrorCache *peer = g_v4_peer_mirrors;   /* the only read here */
     if (!store || !view || !store->gpu) return -1;
-    if (g_v4_peer_mirrors && v4_mirror_peek_cache(
-            (V4GpuExpertMirrorCache *)store->gpu, view) != 0)
-        return v4_mirror_peek_cache(g_v4_peer_mirrors, view);
-    V4GpuExpertMirrorCache *cache = (V4GpuExpertMirrorCache *)store->gpu;
-    pthread_mutex_lock(&cache->mutex);
-    for (int i = 0; i < cache->count; i++) {
-        if (cache->entries[i].layer == view->key.layer &&
-            cache->entries[i].expert == view->key.expert &&
-            cache->entries[i].gate && cache->entries[i].up &&
-            cache->entries[i].down) {
-            cache->entries[i].clock = v4_mirror_tick();
-            view->gate.gpu = cache->entries[i].gate;
-            view->up.gpu = cache->entries[i].up;
-            view->down.gpu = cache->entries[i].down;
-            pthread_mutex_unlock(&cache->mutex);
-            return 0;
-        }
-    }
-    pthread_mutex_unlock(&cache->mutex);
-    return -1;
+    if (v4_mirror_peek_cache((V4GpuExpertMirrorCache *)store->gpu, view) == 0)
+        return 0;
+    return v4_mirror_peek_cache(peer, view);
 }
 
 int coli_v4_gpu_dspark_expert_attach(void *cache, ColiExpertView *view) {
@@ -12006,7 +12088,7 @@ static void v4_gpu_mirror_reserve_size(const ColiDeepSeekV4Config *config) {
         fprintf(stderr, "v4_gpu mirror-reserve=%lldMiB (%d-slot bank %.0fMiB "
                         "x%d + %dMiB headroom + %d mirrors; "
                         "DSV4_CUDA_VRAM_RESERVE_MB overrides)\n",
-                v4_gpu_mirror_reserve_mb(COLI_V4_MIRROR_MIN_LIVE), slots,
+                v4_gpu_mirror_reserve_mb(COLI_V4_MIRROR_MIN_LIVE, NULL), slots,
                 v4_reserve_bank_bytes / 1048576.0,
                 v4_bank_double_usable() ? 2 : 1, COLI_V4_RESERVE_HEADROOM_MB,
                 COLI_V4_MIRROR_PROBE_EVERY);
@@ -12016,19 +12098,30 @@ static void v4_gpu_mirror_reserve_size(const ColiDeepSeekV4Config *config) {
  * (the growth guard in v4_gpu_expert_attach_cached_ex): the explicit
  * DSV4_CUDA_VRAM_RESERVE_MB as given, else the bank-sized default
  * (deepseek_v4_bank_pair.h), whose second bank drops out once
- * COLI_CUDA_MOE_DOUBLE has latched off (v4_bank_double_usable). */
-static long long v4_gpu_mirror_reserve_mb(int live) {
+ * COLI_CUDA_MOE_DOUBLE has latched off (v4_bank_double_usable). *margin_mb
+ * (when not NULL) receives how far the cache may grow past it between two
+ * free-VRAM probes: COLI_V4_MIRROR_PROBE_EVERY mirrors (rounded up) for the
+ * bank-sized default, in both of its phases — from COLI_V4_MIRROR_MIN_LIVE
+ * live mirrors on the reserve includes them, and below that the cache must
+ * still reach a working set on a card too small for the bank — none
+ * otherwise. */
+static long long v4_gpu_mirror_reserve_mb(int live, long long *margin_mb) {
     static long long explicit_mb = -2;
+    if (margin_mb) *margin_mb = 0;
     if (explicit_mb == -2) {
         const char *env = getenv("DSV4_CUDA_VRAM_RESERVE_MB");
         explicit_mb = env ? atoll(env) : -1;
         if (env && explicit_mb < 256) explicit_mb = 256;
     }
     if (explicit_mb >= 0) return explicit_mb;
-    return coli_v4_mirror_reserve_mb(
+    long long reserve_mb = coli_v4_mirror_reserve_mb(
         v4_reserve_bank_bytes,
         v4_bank_double_usable() ? 2 : 1,
         v4_reserve_mirror_bytes, live);
+    if (margin_mb && v4_reserve_bank_bytes > 0)
+        *margin_mb = (COLI_V4_MIRROR_PROBE_EVERY * v4_reserve_mirror_bytes +
+                      (1LL << 20) - 1) >> 20;
+    return reserve_mb;
 }
 
 static void *v4_bank2_worker(void *argument) {
