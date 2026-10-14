@@ -11740,7 +11740,7 @@ static pthread_t v4_bank2_thread;
 static int v4_bank2_running;
 static int v4_bank2_disabled;
 static unsigned long long v4_bank2_swaps, v4_bank2_prefetched;
-static struct { ColiExpertStore *store; int layer; } v4_bank2_job;
+static struct { ColiExpertStore *store; int layer; int experts; } v4_bank2_job;
 
 int v4_bank_double_on(void) {
     static int on = -1;
@@ -11755,9 +11755,10 @@ static void *v4_bank2_worker(void *argument) {
     (void)argument;
     ColiExpertStore *store = v4_bank2_job.store;
     int layer = v4_bank2_job.layer;
+    int experts = v4_bank2_job.experts;   /* the model's routed experts, <= 256 */
     memset(v4_bank2_valid, 0, sizeof(v4_bank2_valid));
     int loaded = 0;
-    for (int expert = 0; expert < 256; expert++) {
+    for (int expert = 0; expert < experts; expert++) {
         ColiExpertView view;
         memset(&view, 0, sizeof(view));
         if (coli_expert_lookup(store, (ColiExpertKey){layer, expert},
@@ -11952,6 +11953,7 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
                 if (v4_moe_bank2) {
                     v4_bank2_job.store = store;
                     v4_bank2_job.layer = next;
+                    v4_bank2_job.experts = config->n_routed_experts;
                     if (pthread_create(&v4_bank2_thread, NULL,
                                        v4_bank2_worker, NULL) == 0)
                         v4_bank2_running = 1;
