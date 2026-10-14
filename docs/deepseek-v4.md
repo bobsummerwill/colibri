@@ -256,7 +256,8 @@ computes, falling back to the single bank when VRAM is short.
 Expert-pruned checkpoints such as `puwaer/DeepSeek-V4-Flash-0731-reap-150b`
 (132 routed experts instead of 256) use the batched prefill MoE path too: the
 CPU router picks their experts (tokens in parallel, bit-identical to the CPU
-union) because the GPU top-6 kernel assumes 256 logits, and on generic
+union; Vulkan builds take the chunk's gate logits from one device call, as the
+union does) because the GPU top-6 kernel assumes 256 logits, and on generic
 (non-DeepGEMM) builds the bank is sized to the model's expert count
 (132 slots ≈ 1.6 GB instead of 3.2 GB). DeepGEMM builds keep a 256-slot bank.
 
