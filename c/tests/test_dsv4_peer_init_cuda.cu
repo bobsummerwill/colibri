@@ -13,8 +13,11 @@
  * A missing kernel image is injected per device the same way (the probe's
  * cudaFuncGetAttributes asked about a null function): a primary the build
  * cannot run must leave the peer untouched, a refused peer must lose the
- * context its check made. A build with no image for these GPUs (say
- * CUDA_ARCH=sm_89 on 3090s) checks the real refusal and skips the init parts.
+ * context its check made; only a missing image gets the rebuild hint, not a
+ * GPU that is full or held by an exclusive-process job (cudaSetDevice's error
+ * is faked for that: a real one needs such a GPU). A build with no image for
+ * these GPUs (say CUDA_ARCH=sm_89 on 3090s) checks the real refusal and skips
+ * the init parts.
  * About one CUDA context per GPU (~0.3 GiB each) plus a few KiB. */
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -36,7 +39,8 @@
 #endif
 
 static int live_streams, live_events, live_allocs;
-static int stream_calls, alloc_calls, fail_stream, fail_alloc, fail_peer_enable, fail_image_dev=-1;
+static int stream_calls, alloc_calls, fail_stream, fail_alloc, fail_peer_enable, fail_image_dev=-1, fail_set_dev=-1;
+static cudaError_t fail_image_err=cudaSuccess, fail_set_err=cudaSuccess;
 static cudaError_t test_stream_create(cudaStream_t *s,unsigned flags){
     if(++stream_calls==fail_stream)return cudaStreamCreateWithFlags(s,0xdeadu); /* invalid flags */
     cudaError_t e=cudaStreamCreateWithFlags(s,flags);if(e==cudaSuccess)live_streams++;return e;}
@@ -50,9 +54,14 @@ static cudaError_t test_free(void *p){cudaError_t e=cudaFree(p);if(e==cudaSucces
 /* the contexts outlive shutdown, so a real enable answers "already enabled"
  * from the second init on: fail it through another real runtime error */
 static cudaError_t test_enable_peer(int peer,unsigned flags){return fail_peer_enable?cudaSetDevice(-1):cudaDeviceEnablePeerAccess(peer,flags);}
-/* "no code for this device", as the probe sees it on the current device */
+/* "no code for this device", as the probe sees it on the current device, or
+ * fail_image_err (what a runtime that makes the context lazily, here, says
+ * for a full GPU) */
 template<class T> static cudaError_t test_func_attrs(cudaFuncAttributes *fa,T *f){
-    int d=-1;cudaGetDevice(&d);return d==fail_image_dev?cudaFuncGetAttributes(fa,(const void*)nullptr):cudaFuncGetAttributes(fa,f);}
+    int d=-1;cudaGetDevice(&d);if(d!=fail_image_dev)return cudaFuncGetAttributes(fa,f);
+    return fail_image_err!=cudaSuccess?fail_image_err:cudaFuncGetAttributes(fa,(const void*)nullptr);}
+/* a GPU whose context cannot be made: full, or exclusive-process and taken */
+static cudaError_t test_set_device(int d){return d==fail_set_dev?fail_set_err:cudaSetDevice(d);}
 #define cudaStreamCreateWithFlags test_stream_create
 #define cudaStreamDestroy test_stream_destroy
 #define cudaEventCreateWithFlags test_event_create
@@ -61,6 +70,7 @@ template<class T> static cudaError_t test_func_attrs(cudaFuncAttributes *fa,T *f
 #define cudaFree test_free
 #define cudaDeviceEnablePeerAccess test_enable_peer
 #define cudaFuncGetAttributes test_func_attrs
+#define cudaSetDevice test_set_device
 #include "../backend_cuda_dsv4.cu"
 #undef cudaStreamCreateWithFlags
 #undef cudaStreamDestroy
@@ -70,6 +80,7 @@ template<class T> static cudaError_t test_func_attrs(cudaFuncAttributes *fa,T *f
 #undef cudaFree
 #undef cudaDeviceEnablePeerAccess
 #undef cudaFuncGetAttributes
+#undef cudaSetDevice
 
 static int failures;
 #define CHECK(cond,...) do{if(!(cond)){fprintf(stdout,"FAIL %s:%d: ",__FILE__,__LINE__);fprintf(stdout,__VA_ARGS__);fputc('\n',stdout);failures++;}}while(0)
@@ -79,6 +90,8 @@ static int has_context(int d){
     CUdevice cd;unsigned flags=0;int active=0;
     if(cuInit(0)!=CUDA_SUCCESS||cuDeviceGet(&cd,d)!=CUDA_SUCCESS||cuDevicePrimaryCtxGetState(cd,&flags,&active)!=CUDA_SUCCESS)return -1;
     return active;}
+/* the reason carries the rebuild advice (either build flavour) */
+static int rebuild_hint(const char *why){return strstr(why,"CUDA_ARCH")||strstr(why,"no DEEPGEMM");}
 static int kernel_image(int d){
     cudaFuncAttributes fa;int ok=cudaSetDevice(d)==cudaSuccess&&cudaFuncGetAttributes(&fa,(const void*)mv_fp4_grouped<4>)==cudaSuccess;
     cudaGetLastError();return ok;}
@@ -127,12 +140,23 @@ int main(void){
         CHECK(has_context(1)==0,"the peer got a context although the primary has no kernel image (%s)",why);
         /* the primary's image check made the context its init makes; the cheaper refusals make none */
         CHECK(has_context(0)==images,"primary context %d after a probe that %s the kernel images",has_context(0),images?"reached":"stopped before");
-        if(images)CHECK(strstr(why,"primary device 0"),"refusal does not name the primary: \"%s\"",why);
+        if(images)CHECK(strstr(why,"primary device 0")&&rebuild_hint(why),"refusal does not name the primary or the rebuild: \"%s\"",why);
         int image0=kernel_image(0);
         /* a refused peer loses the context its kernel-image check made */
         if(images&&image0){fail_image_dev=1;usable=dsv4_cuda_peer_probe(0,1,why,sizeof why);fail_image_dev=-1;
-            CHECK(!usable&&strstr(why,"peer device 1"),"no image for the peer: %d \"%s\"",usable,why);
+            CHECK(!usable&&strstr(why,"peer device 1")&&rebuild_hint(why),"no image for the peer: %d \"%s\"",usable,why);
             CHECK(has_context(1)==0,"the refused peer kept the context of its kernel-image check");}
+        /* a GPU that is full or taken is no build problem: refused with the
+         * runtime's error and no rebuild advice, the peer left without a context */
+        if(images&&image0){const cudaError_t busy[2]={cudaErrorMemoryAllocation,cudaErrorDevicesUnavailable};
+            for(int b=0;b<2;b++)for(int k=0;k<2;k++){
+                fail_set_dev=k;fail_set_err=busy[b];usable=dsv4_cuda_peer_probe(0,1,why,sizeof why);fail_set_dev=-1;
+                CHECK(!usable&&strstr(why,k?"peer device 1":"primary device 0")&&strstr(why,"cudaSetDevice")&&strstr(why,cudaGetErrorString(busy[b]))&&!rebuild_hint(why)&&!strstr(why,"build"),
+                      "%s device: %s: \"%s\"",k?"peer":"primary",cudaGetErrorName(busy[b]),why);
+                CHECK(has_context(1)==0,"device 1 has a context after its %s probe refusal (%s)",k?"own":"primary's",cudaGetErrorName(busy[b]));}
+            fail_image_dev=1;fail_image_err=cudaErrorMemoryAllocation;usable=dsv4_cuda_peer_probe(0,1,why,sizeof why);fail_image_dev=-1;fail_image_err=cudaSuccess;
+            CHECK(!usable&&strstr(why,"peer device 1")&&strstr(why,"kernel-image check")&&strstr(why,cudaGetErrorString(cudaErrorMemoryAllocation))&&!rebuild_hint(why),"kernel query out of memory: \"%s\"",why);
+            CHECK(has_context(1)==0,"the refused peer kept the context of its failed kernel-image check");}
         usable=dsv4_cuda_peer_probe(0,1,why,sizeof why);
         printf("probe 0 -> 1: %s%s\n",usable?"usable":"refused: ",why);
         /* accepted: the kernel-image check made the peer's context (and shows has_context sees one) */
@@ -140,7 +164,7 @@ int main(void){
         if(!images)CHECK(!usable,"accepted without peer access both ways / a supported arch");
         else{int image1=kernel_image(1);   /* only now: it creates a context on device 1 */
             CHECK(usable==(image0&&image1),"probe %d but kernel images %d/%d for devices 0/1 (%s)",usable,image0,image1,why);
-            if(!usable)CHECK(strstr(why,image0?"peer device 1":"primary device 0")&&(strstr(why,"kernel image")||strstr(why,"invalid device function")),"refusal does not say why: \"%s\"",why);}
+            if(!usable)CHECK(strstr(why,image0?"peer device 1":"primary device 0")&&(strstr(why,"kernel image")||strstr(why,"invalid device function"))&&rebuild_hint(why),"refusal does not say why: \"%s\"",why);}
         cudaGetLastError();
     }else puts("SKIP: one GPU, no peer probe");
 

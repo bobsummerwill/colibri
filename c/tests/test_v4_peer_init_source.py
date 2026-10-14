@@ -11,7 +11,8 @@ pins the shape that a CPU-only CI host can see:
 - with the peer unset the engine still makes exactly PR #1's single init;
 - every failure inside dsv4_cuda_init goes through init_fail, which releases
   what was set up and clears the last error, and shutdown shares that
-  teardown.
+  teardown;
+- the probe's rebuild hint follows a missing kernel image only.
 """
 import re
 import unittest
@@ -86,12 +87,19 @@ class V4PeerInitSourceTest(unittest.TestCase):
         self.assertEqual(order, sorted(order))
         # architecture and kernel image for both devices, the primary first, so
         # a primary the build cannot run never gets its peer touched
-        self.assertEqual(probe.count("for(int k=0;k<2;k++){int d=k?peer:device;"), 3)
+        self.assertEqual(probe.count("for(int k=0;k<2;k++){int d=k?peer:device"), 3)
         self.assertIn('const char *role[2]={"primary","peer"};', probe)
         # the kernel-image check is the only one that makes a context: the
         # peer's is undone on refusal (the primary's is the one its init makes)
         self.assertEqual(len(re.findall(r"cudaSetDevice\(", probe)), 2)
         self.assertIn("if(k&&!ng&&cudaSetDevice(peer)==cudaSuccess)cudaDeviceReset();", probe)
+        # the rebuild hint follows only a missing image; any other error (a
+        # full or exclusive-process GPU) is reported without it, and before it
+        other = probe.index("if(e!=cudaErrorNoKernelImageForDevice&&e!=cudaErrorInvalidDeviceFunction){")
+        self.assertLess(probe.index("cudaDeviceReset();"), other)
+        self.assertLess(other, probe.index("CUDA_ARCH"))
+        self.assertLess(other, probe.index("sm_120a code only"))
+        self.assertNotIn("CUDA_ARCH", probe[other:probe.index("return 0;}", other)])
 
 
 if __name__ == "__main__":

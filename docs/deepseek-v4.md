@@ -337,8 +337,9 @@ VRAM into a real tier:
   and kernel image the build runs); when a check fails, GPU N is left
   untouched, decode runs without it, and the `peer mirror pool off:` warning
   gives the reason and, for a missing kernel image, the `CUDA_ARCH` to
-  rebuild with. With `DSV4_HYBRID=1` there is no peer pool: hybrid decode
-  uploads only into the primary GPU's mirrors.
+  rebuild with (a GPU that is full or taken by an exclusive-process job is
+  reported as such). With `DSV4_HYBRID=1` there is no peer pool: hybrid
+  decode uploads only into the primary GPU's mirrors.
 
 Measured on the REAP 150B setup above (2× RTX 3090 with an NVLink bridge,
 `--ram 40`, six 300-token answers, greedy; answers identical in every run):
