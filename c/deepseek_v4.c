@@ -11996,14 +11996,20 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
     int topk = config->num_experts_per_tok;
     int ids[128 * 6];
     float route_weights[128 * 6];
-    if (weights->plan.uses_hash_router || config->n_routed_experts != 256) {
+    const int hashed = weights->plan.uses_hash_router;
+    char name[COLI_V4_MAX_TENSOR_NAME];
+    snprintf(name, sizeof(name), "layers.%d.ffn.gate.bias",
+             weights->plan.layer);
+    const float *raw_bias = coli_v4_layer_data(weights, name, NULL);
+    /* The GPU router reads the bias from its mirror: a layer that has a bias
+     * but no mirror of it (its upload failed) routes on the CPU, as decode
+     * does (coli_v4_gpu_route), instead of routing without the bias. */
+    if (hashed || config->n_routed_experts != 256 || (raw_bias && !bias)) {
         /* Hash layers route on the CPU: ids from the token table, weights
          * from the bf16 gate logits — identical to the CPU union. Pruned
          * expert counts take the same CPU router (score top-k, no table):
          * the GPU top-6 kernel assumes 256 logits per token. */
-        const int hashed = weights->plan.uses_hash_router;
         const ColiDeepSeekV4TensorSpec *spec = NULL;
-        char name[COLI_V4_MAX_TENSOR_NAME];
         snprintf(name, sizeof(name), "layers.%d.ffn.gate.tid2eid",
                  weights->plan.layer);
         const int64_t *table = hashed ?
@@ -12011,9 +12017,6 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
         snprintf(name, sizeof(name), "layers.%d.ffn.gate.weight",
                  weights->plan.layer);
         const uint16_t *raw_gate = coli_v4_layer_data(weights, name, NULL);
-        snprintf(name, sizeof(name), "layers.%d.ffn.gate.bias",
-                 weights->plan.layer);
-        const float *raw_bias = coli_v4_layer_data(weights, name, NULL);
         if (!raw_gate) return -1;
         if (hashed && (!table || !spec || spec->rank != 2 ||
                        spec->shape[1] != topk))
