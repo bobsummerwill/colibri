@@ -11008,9 +11008,10 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
             ndevices = 2;
         }
     }
-    /* A failed two-device init released everything it set up and named the
-     * device that failed. Never dsv4_cuda_shutdown() before the retry: on
-     * Windows the loader's shutdown unloads the DLL. */
+    /* A failed two-device init released everything it set up, dropped the
+     * peer's context and named the device that failed. Never
+     * dsv4_cuda_shutdown() before the retry: on Windows the loader's
+     * shutdown unloads the DLL. */
     if (ndevices == 2 && !dsv4_cuda_init(devices, 2)) {
         fprintf(stderr, "v4_gpu warning=two-device init failed; peer mirror pool "
                         "off, retrying device %d alone\n", device);

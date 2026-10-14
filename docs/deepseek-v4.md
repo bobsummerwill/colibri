@@ -346,8 +346,10 @@ VRAM into a real tier:
   untouched, decode runs without it, and the `peer mirror pool off:` warning
   gives the reason and, for a missing kernel image, the `CUDA_ARCH` to
   rebuild with (a GPU that is full or taken by an exclusive-process job is
-  reported as such). With `DSV4_HYBRID=1` there is no peer pool: hybrid
-  decode uploads only into the primary GPU's mirrors.
+  reported as such). If the two-GPU init fails after the checks passed, GPU
+  N's context is dropped again and decode retries on the primary alone.
+  With `DSV4_HYBRID=1` there is no peer pool: hybrid decode uploads only
+  into the primary GPU's mirrors.
   A miss grows the primary cache, then the pool, and once neither can grow
   recycles the older of the two LRU mirrors; a cache with fewer than 8 live
   mirrors (a nearly full card, `DSV4_CUDA_PEER_RESERVE_MB` above its free

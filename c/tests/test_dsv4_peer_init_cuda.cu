@@ -4,7 +4,9 @@
  * the runtime's last error, so the engine's single-device retry starts clean
  * (it used to leak the first attempt, and the first decode_state_set after
  * the retry failed with the stale "invalid device ordinal"), and with several
- * devices the line names the one that failed.
+ * devices the line names the one that failed and every GPU but the first
+ * loses its context (the probe's or the init's own), since the run goes on
+ * without it.
  *
  * The backend is included with counting shims around stream, event and
  * device-allocation lifetimes; failures are injected as REAL runtime errors
@@ -39,7 +41,7 @@
 #endif
 
 static int live_streams, live_events, live_allocs;
-static int stream_calls, alloc_calls, fail_stream, fail_alloc, fail_peer_enable, fail_image_dev=-1, fail_set_dev=-1;
+static int stream_calls, alloc_calls, enable_calls, fail_stream, fail_alloc, fail_peer_enable, fail_image_dev=-1, fail_set_dev=-1;
 static cudaError_t fail_image_err=cudaSuccess, fail_set_err=cudaSuccess;
 static cudaError_t test_stream_create(cudaStream_t *s,unsigned flags){
     if(++stream_calls==fail_stream)return cudaStreamCreateWithFlags(s,0xdeadu); /* invalid flags */
@@ -52,8 +54,8 @@ template<class T> static cudaError_t test_malloc(T **p,size_t n){
     cudaError_t e=cudaMalloc((void**)p,n);if(e==cudaSuccess)live_allocs++;return e;}
 static cudaError_t test_free(void *p){cudaError_t e=cudaFree(p);if(e==cudaSuccess&&p)live_allocs--;return e;}
 /* the contexts outlive shutdown, so a real enable answers "already enabled"
- * from the second init on: fail it through another real runtime error */
-static cudaError_t test_enable_peer(int peer,unsigned flags){return fail_peer_enable?cudaSetDevice(-1):cudaDeviceEnablePeerAccess(peer,flags);}
+ * from the second init on: fail the n-th through another real runtime error */
+static cudaError_t test_enable_peer(int peer,unsigned flags){return ++enable_calls==fail_peer_enable?cudaSetDevice(-1):cudaDeviceEnablePeerAccess(peer,flags);}
 /* "no code for this device", as the probe sees it on the current device, or
  * fail_image_err (what a runtime that makes the context lazily, here, says
  * for a full GPU) */
@@ -104,6 +106,15 @@ static void check_released(const char *what){
     CHECK(!ng,"%s: %d devices still registered",what,ng);
     for(int i=0;i<16;i++)CHECK(!memcmp(&g[i],&zero,sizeof zero),"%s: device slot %d not zeroed",what,i);
     for(int a=0;a<16;a++)for(int b=0;b<16;b++)CHECK(!g_peer[a][b],"%s: peer record %d->%d kept",what,a,b);}
+/* the engine's order, when the probe accepts the peer: the probe (which makes
+ * the peer's context), then a two-device init that fails; the peer must not
+ * keep that context for the single-device or CPU-only run that follows */
+static int peer_usable;
+static void probe_first(int n){if(n<2||!peer_usable)return;char why[320];
+    CHECK(dsv4_cuda_peer_probe(0,1,why,sizeof why)&&has_context(1)==1,"probe before a failing init: \"%s\"",why);}
+static void check_peer_dropped(int n,const char *what){if(n>=2)CHECK(has_context(1)==0,"%s: device 1 kept its context",what);}
+/* device 0 reads device 1's memory directly: peer access really works */
+__global__ void peer_read(int *dst,const int *src){*dst=*src;}
 
 /* stderr of one failing init, to check which device it names */
 #ifndef _WIN32
@@ -165,7 +176,7 @@ int main(void){
         else{int image1=kernel_image(1);   /* only now: it creates a context on device 1 */
             CHECK(usable==(image0&&image1),"probe %d but kernel images %d/%d for devices 0/1 (%s)",usable,image0,image1,why);
             if(!usable)CHECK(strstr(why,image0?"peer device 1":"primary device 0")&&(strstr(why,"kernel image")||strstr(why,"invalid device function"))&&rebuild_hint(why),"refusal does not say why: \"%s\"",why);}
-        cudaGetLastError();
+        peer_usable=usable;cudaGetLastError();
     }else puts("SKIP: one GPU, no peer probe");
 
     if(!kernel_image(0)){printf("SKIP: this build has no kernel image for device 0; init parts not run\n");return failures?1:0;}
@@ -187,20 +198,25 @@ int main(void){
     int allocs=alloc_calls;dsv4_cuda_shutdown();check_released("baseline shutdown");
     for(fail_stream=1;fail_stream<=streams;fail_stream++){
         stream_calls=0;char what[64];snprintf(what,sizeof what,"stream %d of %d failed",fail_stream,streams);
-        CHECK(!dsv4_cuda_init(ids,n),"%s: init succeeded",what);check_released(what);}
+        probe_first(n);CHECK(!dsv4_cuda_init(ids,n),"%s: init succeeded",what);check_released(what);check_peer_dropped(n,what);}
     fail_stream=0;
     for(fail_alloc=1;fail_alloc<=allocs;fail_alloc++){
         alloc_calls=0;char what[64];snprintf(what,sizeof what,"allocation %d of %d failed",fail_alloc,allocs);
-        CHECK(!dsv4_cuda_init(ids,n),"%s: init succeeded",what);check_released(what);}
+        probe_first(n);CHECK(!dsv4_cuda_init(ids,n),"%s: init succeeded",what);check_released(what);check_peer_dropped(n,what);}
     fail_alloc=0;
 #ifndef _WIN32
     if(n==2){stream_calls=0;fail_stream=1;   /* device 0's first stream */
-        CHECK(init_says(ids,2,"device 0 did not initialise")==1,"failure line does not name device 0");
-        fail_stream=0;check_released("device 0 failed");}
+        probe_first(n);CHECK(init_says(ids,2,"device 0 did not initialise")==1,"failure line does not name device 0");
+        fail_stream=0;check_released("device 0 failed");check_peer_dropped(n,"device 0 failed");}
 #endif
+    /* the first enable (0 -> 1), and with access both ways the second (1 -> 0,
+     * the peer dropped while device 0 still maps it) */
     if(n==2){int ab=0,ba=0;cudaDeviceCanAccessPeer(&ab,0,1);cudaDeviceCanAccessPeer(&ba,1,0);cudaGetLastError();
-        if(ab||ba){fail_peer_enable=1;CHECK(!dsv4_cuda_init(ids,2),"init succeeded with peer access failing");
-            fail_peer_enable=0;check_released("enable peer access failed");}}
+        for(fail_peer_enable=1;fail_peer_enable<=(ab&&ba?2:ab||ba?1:0);fail_peer_enable++){
+            enable_calls=0;char what[64];snprintf(what,sizeof what,"peer enable %d failed",fail_peer_enable);
+            probe_first(n);CHECK(!dsv4_cuda_init(ids,2),"%s: init succeeded",what);
+            check_released(what);check_peer_dropped(n,what);}
+        fail_peer_enable=0;}
 
     /* 4. the engine's retry: one device, from the state a failed init left */
     CHECK(!dsv4_cuda_init(bad_second,2),"init with an invalid second device succeeded");
@@ -213,6 +229,15 @@ int main(void){
     if(count>=2&&dsv4_cuda_peer_probe(0,1,why,sizeof why)){
         CHECK(dsv4_cuda_init(pair,2),"two-device init failed");
         CHECK(dsv4_cuda_peer_access(0,1)&&dsv4_cuda_peer_access(1,0),"peer access not recorded");
+        /* after the peer's context was dropped above, access is real again
+         * (a pageable cudaMemcpy may return before its DMA lands: sync) */
+        int *src=nullptr,*dst=nullptr,got=0,want=0x5eed;
+        if(cudaSetDevice(1)==cudaSuccess&&cudaMalloc(&src,sizeof(int))==cudaSuccess&&cudaMemcpy(src,&want,sizeof want,cudaMemcpyHostToDevice)==cudaSuccess&&cudaDeviceSynchronize()==cudaSuccess&&
+           cudaSetDevice(0)==cudaSuccess&&cudaMalloc(&dst,sizeof(int))==cudaSuccess&&cudaMemset(dst,0,sizeof(int))==cudaSuccess){
+            peer_read<<<1,1>>>(dst,src);cudaError_t e=cudaGetLastError();if(e==cudaSuccess)e=cudaDeviceSynchronize();
+            CHECK(e==cudaSuccess&&cudaMemcpy(&got,dst,sizeof got,cudaMemcpyDeviceToHost)==cudaSuccess&&got==want,"device 0 reading device 1: %s, %#x",cudaGetErrorString(e),got);}
+        else CHECK(0,"peer read setup: %s",cudaGetErrorString(cudaGetLastError()));
+        cudaSetDevice(0);cudaFree(dst);cudaSetDevice(1);cudaFree(src);cudaGetLastError();
         dsv4_cuda_shutdown();
         CHECK(!dsv4_cuda_peer_access(0,1),"peer access outlived shutdown");
         check_released("two-device shutdown");
