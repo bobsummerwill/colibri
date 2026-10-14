@@ -10988,9 +10988,21 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     if (peer >= 0) {
         /* Settle the peer pool BEFORE any init: a peer that gets no pool is
          * never initialised (no context, streams or buffers held on it for
-         * the whole run). */
+         * the whole run). DSV4_HYBRID=1 attaches its misses asynchronously
+         * into the primary cache only and keeps V4_GPU_RESIDENT_FIRST off,
+         * so a peer pool would never fill there. */
         char why[320];
-        if (!dsv4_cuda_peer_probe(device, peer, why, (int)sizeof why)) {
+        if (coli_v4_hybrid_enabled()) {
+            static int hybrid_said;
+            if (!hybrid_said) {
+                hybrid_said = 1;
+                fprintf(stderr, "v4_gpu warning=peer mirror pool off: DSV4_HYBRID=1 "
+                                "uploads decode misses into device %d's mirrors only "
+                                "(and keeps V4_GPU_RESIDENT_FIRST off), so a pool on "
+                                "device %d would stay empty; device %d left unused\n",
+                        device, peer, peer);
+            }
+        } else if (!dsv4_cuda_peer_probe(device, peer, why, (int)sizeof why)) {
             fprintf(stderr, "v4_gpu warning=peer mirror pool off: %s\n", why);
         } else {
             ndevices = 2;

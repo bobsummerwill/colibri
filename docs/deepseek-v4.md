@@ -344,7 +344,8 @@ VRAM into a real tier:
   access both ways, an architecture and kernel image the build runs); when it
   fails, it is left untouched, decode runs on the primary alone, and the
   `peer mirror pool off:` warning gives the reason and, for a missing kernel
-  image, the `CUDA_ARCH` to rebuild with.
+  image, the `CUDA_ARCH` to rebuild with. With `DSV4_HYBRID=1` there is no
+  peer pool: hybrid decode uploads only into the primary GPU's mirrors.
   A miss grows the primary cache, then the pool, and once neither can grow
   recycles the older of the two LRU mirrors; a cache with fewer than 8 live
   mirrors (a nearly full card, `DSV4_CUDA_PEER_RESERVE_MB` above its free
