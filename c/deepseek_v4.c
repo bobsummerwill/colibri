@@ -11750,6 +11750,9 @@ static int v4_moe_bank_failed;
  * up only the holes). Every failure path — second-bank allocation, an aux
  * upload API that an older Windows DLL does not export, a fully failed
  * layer — degrades to today's single-bank behaviour and says so once.
+ * Only the structural failures (nothing a prefetch uploads lands) stay off
+ * for the process; a second bank that did not fit is retried by the next
+ * prefill, since the VRAM it lacked may have been transient.
  * The worker holds at most ONE store lease at a time (the expert cache's
  * pin slots are bounded), and layer L+1's lookups live in L+1's own store
  * partition, so the prefetch does not evict the computing layer. */
@@ -11758,7 +11761,8 @@ static int v4_bank2_layer = -1;      /* prefetched layer; read only post-join */
 static unsigned char v4_bank2_valid[256];
 static pthread_t v4_bank2_thread;
 static int v4_bank2_running;
-static int v4_bank2_disabled;
+static int v4_bank2_disabled;        /* structural: prefetch produced nothing */
+static int v4_bank2_alloc_failed;    /* this prefill only; release() clears */
 static unsigned long long v4_bank2_swaps, v4_bank2_prefetched;
 static struct { ColiExpertStore *store; int layer; } v4_bank2_job;
 
@@ -11769,6 +11773,13 @@ int v4_bank_double_on(void) {
         on = setting && atoi(setting) != 0;
     }
     return on;
+}
+
+/* COLI_CUDA_MOE_DOUBLE is on and the second bank is not off for good: the
+ * next prefill will try to allocate it, so this (not v4_bank_double_on) is
+ * whether VRAM should be kept free for it. */
+static int v4_bank_double_usable(void) {
+    return v4_bank_double_on() && !v4_bank2_disabled;
 }
 
 static void *v4_bank2_worker(void *argument) {
@@ -11836,6 +11847,7 @@ void coli_v4_gpu_moe_batch_release(void) {
     /* A create failure is retried after every release: the freed VRAM is
      * exactly what the next attempt needs. */
     v4_moe_bank_failed = 0;
+    v4_bank2_alloc_failed = 0;
     v4_bank2_join();
     if (v4_bank2_swaps || v4_bank2_prefetched)
         fprintf(stderr, "v4_gpu moe-double swaps=%llu prefetched=%llu\n",
@@ -11936,7 +11948,7 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
      * expert-major sweeps (measured ~4-6x the layer's expert bytes). */
     if (bank_layer != weights->plan.layer) {
         v4_bank2_join();
-        int double_on = v4_bank_double_on() && !v4_bank2_disabled;
+        int double_on = v4_bank_double_usable() && !v4_bank2_alloc_failed;
         if (coli_v4_bank_pair_decide(double_on, v4_bank2_layer,
                                      weights->plan.layer) == V4_BANK_SWAP) {
             /* The prefetched bank becomes the active one; its valid map
@@ -11963,11 +11975,14 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
                         4096, 2048, device, sg, su, sd);
                     if (!v4_moe_bank2) {
                         /* Not enough VRAM for two full banks: stay on the
-                         * proven single-bank path, permanently and loudly. */
-                        v4_bank2_disabled = 1;
+                         * proven single-bank path for the rest of this
+                         * prefill, loudly; release() lets the next one try
+                         * again. */
+                        v4_bank2_alloc_failed = 1;
                         fprintf(stderr,
                                 "v4_gpu moe-double=off (second bank "
-                                "allocation failed; single-bank stays)\n");
+                                "allocation failed; single-bank this "
+                                "prefill)\n");
                     } else {
                         fprintf(stderr, "v4_gpu moe-double=on\n");
                     }
