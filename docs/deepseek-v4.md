@@ -217,24 +217,44 @@ DLL loads (`DSV4_CUDA=0` disables it).
 
 What the tier keeps in VRAM (measured on a 16 GB RTX 5080): dense/attention
 mirrors **6.3 GB** (needed for GPU attention and the GPU dense matvecs in
-decode), the transient prefill expert bank **2.2 GB** (`COLI_CUDA_MOE_BATCH`,
-freed when decode starts), attention/KV/work buffers **~0.5 GB**, and the
-rest as decode expert mirrors at **~8 MB each**. `DSV4_CUDA_EXPERT_MIRRORS`
-is only an upper bound (default 4096): the cache grows while at least
-`DSV4_CUDA_VRAM_RESERVE_MB` (default 2800 with the bank enabled, 600
-without) stays free, so free VRAM sizes it at run time — you normally do not
-need to set it. Decode is disk-bound, so more mirrors help in proportion to
-the hit rate they add (~11 000 experts total; 600 mirrors ≈ 5 %); more RAM
-(`--ram`) buys more than more VRAM.
+decode), the transient prefill expert bank (`COLI_CUDA_MOE_BATCH`, freed when
+decode starts; 12.75 MiB per slot, 13.5 MiB on DeepGEMM builds: **3.2 GiB**
+for 256 experts, 3.4 GiB on DeepGEMM), attention/KV/work buffers **~0.5 GB**,
+and the rest as decode expert mirrors at **12.75 MiB each**.
+`DSV4_CUDA_EXPERT_MIRRORS` is only an upper bound (default 4096): the cache
+grows while at least `DSV4_CUDA_VRAM_RESERVE_MB` stays free, so free VRAM
+sizes it at run time — you normally do not need to set it. Decode is
+disk-bound, so more mirrors help in proportion to the hit rate they add
+(~11 000 experts total; 600 mirrors ≈ 5 %); more RAM (`--ram`) buys more than
+more VRAM.
+
+The default reserve is 600 MiB without the bank. With `COLI_CUDA_MOE_BATCH=1`
+it is sized from the model's bank at engine open, so the next large prefill
+still finds room for it after decode has filled the card: 600 MiB + the bank
+(two banks with `COLI_CUDA_MOE_DOUBLE=1`, back to one once the second has
+failed to allocate) + 64 mirrors, because free VRAM is re-read only every 64
+misses. That is 4681 MiB for 256 experts on generic builds, 4873 on DeepGEMM
+and 3100 for a 132-expert checkpoint (7945, 8329 and 4783 with the second
+bank); the engine logs it as `v4_gpu mirror-reserve=`. Below 32 live mirrors
+the default keeps only 600 MiB free, so a card too small for the bank still
+decodes from a working mirror set (the bank then falls back to the CPU
+union). An explicit `DSV4_CUDA_VRAM_RESERVE_MB` is used as given.
 
 | VRAM | dense mirrors | prefill bank | recommended env | expected |
 |---|---|---|---|---|
-| 6 GB | no (6.3 GB does not fit) | yes (2.2 GB) | `CUDA_DENSE=0 COLI_CUDA_MOE_BATCH=1 COLI_CUDA_ATTN_BATCH=0` | GPU MoE prefill (generic kernels on non-RTX50), CPU attention/decode; ~150 mirrors between prefills |
-| 8 GB | yes | no (1.7 GB left) | `CUDA_DENSE=1 COLI_CUDA_ATTN_BATCH=1 COLI_CUDA_MOE_BATCH=0` | GPU attention + GPU decode dense; MoE prefill on the CPU union; ~100 mirrors |
-| 10–12 GB | yes | yes (tight) | `CUDA_DENSE=1 COLI_CUDA_ATTN_BATCH=1 COLI_CUDA_MOE_BATCH=1 DSV4_CUDA_VRAM_RESERVE_MB=2500` | full GPU prefill; 100–350 decode mirrors after the bank is released |
-| 16 GB (this box) | yes | yes | the canonical line above (mirror cap can be left unset) | ~600 mirrors, the numbers in this document |
-| 24 GB | yes | yes | canonical | ~1 700 mirrors (~15 %); decode +10–15 % vs 16 GB |
-| 32 GB | yes | yes | canonical | ~2 700 mirrors (~25 %); decode +25–35 %; raise `--ram` first if RAM allows |
+| 6 GB | no (6.3 GB does not fit) | yes (3.2 GiB) | `CUDA_DENSE=0 COLI_CUDA_MOE_BATCH=1 COLI_CUDA_ATTN_BATCH=0` | GPU MoE prefill (generic kernels on non-RTX50), CPU attention/decode; ~90 mirrors between prefills |
+| 8 GB | yes | no (~1 GiB left) | `CUDA_DENSE=1 COLI_CUDA_ATTN_BATCH=1 COLI_CUDA_MOE_BATCH=0` | GPU attention + GPU decode dense; MoE prefill on the CPU union; ~30 mirrors |
+| 10–12 GB | yes | 12 GB: yes (tight); 10 GB: only a pruned checkpoint's smaller bank on generic builds | `CUDA_DENSE=1 COLI_CUDA_ATTN_BATCH=1 COLI_CUDA_MOE_BATCH=1` | full GPU prefill; 12 GB: the 32-mirror minimum beside a 256-expert bank's reserve (~350 mirrors with `COLI_CUDA_MOE_BATCH=0`), ~150 beside a 132-expert one; 10 GB: the 32-mirror minimum beside a 132-expert bank (256 experts: `COLI_CUDA_MOE_BATCH=0`, ~190 mirrors) |
+| 16 GB (this box) | yes | yes | the canonical line above (mirror cap can be left unset) | ~330 mirrors; the numbers in this document predate the bank-sized reserve (the fixed 2800 MiB default left more mirrors, but too little room for the bank once decode had filled the card) |
+| 24 GB | yes | yes | canonical | ~1 000 mirrors (~9 %) |
+| 32 GB | yes | yes | canonical | ~1 600 mirrors (~15 %); raise `--ram` first if RAM allows |
+
+Mirror counts are estimates for a 256-expert model unless noted (DeepGEMM
+bank on RTX 50, generic elsewhere): free VRAM after the dense mirrors (6.3 GiB;
+none in the 6 GB row) and ~0.8 GiB of CUDA context and attention/KV buffers
+(~0.3 GiB with CPU attention), minus the default reserve, divided by
+12.75 MiB. `COLI_CUDA_MOE_DOUBLE=1` reserves one more bank (~260 mirrors fewer
+for 256 experts).
 
 On non-Blackwell cards the generic DLL is selected automatically (fp32
 kernels): same settings, prefill roughly 2–3× slower than the DeepGEMM
@@ -259,7 +279,8 @@ CPU router picks their experts (tokens in parallel, bit-identical to the CPU
 union; Vulkan builds take the chunk's gate logits from one device call, as the
 union does) because the GPU top-6 kernel assumes 256 logits, and on generic
 (non-DeepGEMM) builds the bank is sized to the model's expert count
-(132 slots ≈ 1.6 GB instead of 3.2 GB). DeepGEMM builds keep a 256-slot bank.
+(132 slots, 1683 MiB, instead of 256 slots, 3264 MiB). DeepGEMM builds keep a
+256-slot bank.
 
 The generic kernels themselves got two bit-identical rewrites (same operands
 in the same order for every output; `_VERIFY=1` runs old and new side by side,
@@ -288,8 +309,11 @@ server per run:
 
 Answers were identical to the CPU union in every run. Decode is unchanged
 (2.2–2.9 tok/s, disk-bound). With `COLI_CUDA_MOE_DOUBLE=1` the default VRAM
-reserve now also covers the prefetch bank (+3.3 GB), so it allocates after
-decode has grown its mirror cache; that costs a few percent of decode speed.
+reserve also covers the prefetch bank (one more bank: +1683 MiB for this
+132-expert model, +3264 MiB for 256 experts), so it still allocates after
+decode has grown its mirror cache; the mirrors that room holds back cost some
+decode speed, and the reserve drops back to one bank once a second bank has
+failed to allocate.
 
 ## Prefill: segments, chunks, checkpoints
 
@@ -447,8 +471,8 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `COLI_CUDA_ATTN_BATCH` (0) | `1` = GPU batched prefill attention block + GPU decode attention/indexer |
 | `COLI_CUDA_MOE_BATCH` (0) | `1` = prefill MoE on the transient VRAM expert bank |
 | `COLI_CUDA_MOE_BATCH_MIN` (256) | min fresh tokens to engage the bank |
-| `DSV4_CUDA_EXPERT_MIRRORS` (4096) | upper bound on decode VRAM expert mirrors (~8 MB each); free VRAM sizes the cache at run time |
-| `DSV4_CUDA_VRAM_RESERVE_MB` (2800 with the bank, +3300 with `COLI_CUDA_MOE_DOUBLE=1`, else 600) | VRAM kept free while mirrors grow (bank + attention buffers) |
+| `DSV4_CUDA_EXPERT_MIRRORS` (4096) | upper bound on decode VRAM expert mirrors (12.75 MiB each); free VRAM sizes the cache at run time |
+| `DSV4_CUDA_VRAM_RESERVE_MB` (600; with the bank 600 + the bank, ×2 with `COLI_CUDA_MOE_DOUBLE=1`, + 64 mirrors, logged as `v4_gpu mirror-reserve=`) | VRAM kept free while mirrors grow (bank + attention buffers; the default only from 32 live mirrors on, see [VRAM budget](#vram-budget-and-per-card-settings)); an explicit value is used as given |
 | `V4_MTP_GPU_MIRRORS` (16) | separate mirror cache for the MTP drafter |
 | `DSV4_CUDA_PIN_HOST` (1, `.cu`) | page-lock expert-cache slabs for DMA uploads |
 | `DSV4_CUDA_MOE_GROUPED` (1, `.cu`) | expert-grouped MoE GEMM rows; `0` = legacy replicated |
