@@ -11672,12 +11672,16 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
         /* cudaMemGetInfo is a driver round trip; with a large capacity the
          * guard is consulted on every miss (hundreds per token), so re-check
          * free VRAM only every 64 misses and reuse the last answer between.
-         * The last answer must clear the reserve, and the last answer less
-         * the mirrors grown since (this one included) must clear the reserve
-         * less its probe margin. The bank-sized default carries 64 mirrors of
-         * margin, also below 32 live mirrors where it is only the headroom,
-         * so the second test never binds for it (on a card too small for the
-         * bank its first 32 mirrors may still overshoot the headroom); an
+         * The last answer must clear the reserve and, from
+         * V4_MIRROR_RECYCLE_MIN live mirrors on, the last answer less the
+         * mirrors grown since (this one included) must clear the reserve
+         * less its probe margin. Below that the cache may overshoot the
+         * reserve by a few mirrors (~100 MiB), so a reserve just under the
+         * card's free VRAM still leaves it a set it can recycle instead of
+         * freezing it. The bank-sized default carries 64 mirrors of margin,
+         * also below 32 live mirrors where it is only the headroom, so the
+         * second test never binds for it (on a card too small for the bank
+         * its first 32 mirrors may still overshoot the headroom); an
          * explicit reserve, the default without a bank and the peer pool's
          * carry none, and without the second test were overshot by up to 64
          * mirrors (816 MiB), past the card's free VRAM. A failed upload
@@ -11708,7 +11712,8 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
                 (cache->grown_bytes + mirror_bytes + (1LL << 20) - 1) >> 20;
             if (cache->last_free_mb >= 0 &&
                 (cache->last_free_mb < reserve_mb ||
-                 cache->last_free_mb - grown_mb < reserve_mb - margin_mb))
+                 (cache->count >= V4_MIRROR_RECYCLE_MIN &&
+                  cache->last_free_mb - grown_mb < reserve_mb - margin_mb)))
                 grow = 0;
         }
         /* The V4_MIRROR_RECYCLE_MIN rule above is about LIVE entries, not
