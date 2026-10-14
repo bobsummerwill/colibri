@@ -11497,7 +11497,8 @@ struct V4GpuExpertMirrorCache {
      * free VRAM and its own, smaller reserve). reserve_mb < 0 = the bank-sized
      * default of the primary card (v4_gpu_mirror_reserve_mb, per miss).
      * last_free_mb is the last free-VRAM probe, grown_bytes the mirrors this
-     * cache has uploaded since. */
+     * cache has uploaded since; upload_failed: last_free_mb is the 0 a
+     * failed upload left, not a probe's answer. */
     long long reserve_mb;
     long long last_free_mb;
     long long grown_bytes;
@@ -11505,6 +11506,7 @@ struct V4GpuExpertMirrorCache {
     int unified;
     const char *reserve_env;   /* the variable that sets reserve_mb */
     int frozen_warned;
+    int upload_failed;
 };
 /* A layer attaches its 6 routed experts before computing them, and a slot is
  * recycled in place: a cache with fewer live mirrors than this would recycle
@@ -11707,6 +11709,7 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
                 (cache->probes++ % COLI_V4_MIRROR_PROBE_EVERY) == 0) {
                 cache->last_free_mb = dsv4_cuda_mem_free_mb(cache->device);
                 cache->grown_bytes = 0;
+                cache->upload_failed = 0;
             }
             long long grown_mb =
                 (cache->grown_bytes + mirror_bytes + (1LL << 20) - 1) >> 20;
@@ -11721,9 +11724,11 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
          * three mirrors would recycle in place a slot the current token's
          * earlier view still references, and the output is garbage with no
          * error (#1538). Leave this expert to the CPU (or the other cache)
-         * until this one can grow. */
+         * until this one can grow. After a failed upload (the backend
+         * reports the CUDA error) the reserve is not the cause, so only a
+         * probe below the reserve warns. */
         if (!grow && cache->count < V4_MIRROR_RECYCLE_MIN) {
-            v4_mirror_warn_frozen(cache, reserve_mb);
+            if (!cache->upload_failed) v4_mirror_warn_frozen(cache, reserve_mb);
             pthread_mutex_unlock(&cache->mutex);
             return grow_only ? -2 : -1;
         }
@@ -11820,6 +11825,7 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
             else cache->entries[found] = cache->entries[--cache->count];
             cache->last_free_mb = 0;
             cache->grown_bytes = 0;
+            cache->upload_failed = 1;
             pthread_mutex_unlock(&cache->mutex);
             return grow_only ? -2 : -1;
         }
