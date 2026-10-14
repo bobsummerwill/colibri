@@ -339,7 +339,8 @@ VRAM into a real tier:
   `[DSV4 CUDA] peer device N failed in the decode MoE (...)` line. The token
   in flight is recomputed on the primary GPU, or on the CPU from host copies
   when the peer no longer answers, and the pool's mirrors count as misses from
-  then on.
+  then on. The pool's VRAM on that GPU is released only when the engine
+  closes.
 
 Measured on the REAP 150B setup above (2× RTX 3090 with an NVLink bridge,
 `--ram 40`, six 300-token answers, greedy; answers identical in every run):

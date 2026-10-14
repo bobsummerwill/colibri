@@ -11542,7 +11542,11 @@ static uint64_t v4_mirror_tick(void) {
 static V4GpuExpertMirrorCache *g_v4_peer_mirrors;
 /* The peer pool while its device is healthy. Once a peer-side CUDA failure
  * has latched the device off (dsv4_cuda_peer_healthy) the pool counts as
- * absent: its mirrors are misses and decode goes on with the primary. */
+ * absent: its mirrors are misses and decode goes on with the primary. The
+ * pool itself, and its VRAM on that GPU, stays allocated until
+ * coli_v4_gpu_engine_close: freeing it here would pull mirrors out from
+ * under views and lookups still holding them, and on a lost device the
+ * frees fail anyway. */
 static V4GpuExpertMirrorCache *v4_peer_pool(void) {
     V4GpuExpertMirrorCache *peer = g_v4_peer_mirrors;
     return peer && dsv4_cuda_peer_healthy(peer->device) ? peer : NULL;
