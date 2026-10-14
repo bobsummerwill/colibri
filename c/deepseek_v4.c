@@ -11051,7 +11051,11 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
         engine->experts->gpu =
             v4_gpu_expert_mirrors_create(device, mirror_suggested);
     if (ndevices == 2 && engine->experts && engine->experts->gpu && !g_v4_peer_mirrors) {
-        /* the probe checked access both ways; this is what init enabled */
+        /* The probe checked access both ways; this is what init enabled. A
+         * pool refused from here on (no primary cache, an allocation, a
+         * capacity v4_peer_mirrors_create rejects) leaves the peer
+         * initialised for the run: what can be settled from the
+         * environment belongs with the DSV4_HYBRID check, before the probe. */
         if (dsv4_cuda_peer_access(device, peer)) {
             g_v4_peer_mirrors = v4_peer_mirrors_create(peer);
         } else {
