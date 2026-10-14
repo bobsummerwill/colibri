@@ -2107,6 +2107,10 @@ struct PinRegion{uintptr_t base;size_t size;};
 static std::vector<PinRegion> g_pin_regions,g_pin_failed;
 static size_t g_pin_bytes;
 static int g_pin_enabled=-1;
+/* DSV4_CUDA_PIN_CAP_GB (20): total page-locked expert-slab bytes. The RAM
+ * expert cache can exceed 20 GB (--ram 40 -> ~32 GB of slabs); slabs past the
+ * cap upload through pageable staging at roughly half the PCIe rate. */
+static size_t pin_cap_bytes(){const char*e=getenv("DSV4_CUDA_PIN_CAP_GB");double gb=e?atof(e):20.0;if(gb<0)gb=0;return (size_t)(gb*(double)(1ULL<<30));}
 static bool host_pinned(const void*p,size_t len){
     if(g_pin_enabled<0){const char*e=getenv("DSV4_CUDA_PIN_HOST");g_pin_enabled=!(e&&*e=='0');}
     if(!g_pin_enabled||!p||!len)return false;
@@ -2118,7 +2122,7 @@ static bool host_pinned(const void*p,size_t len){
     if(!VirtualQuery(p,&mbi,sizeof mbi)||mbi.State!=MEM_COMMIT)return false;
     uintptr_t base=(uintptr_t)mbi.BaseAddress;size_t size=mbi.RegionSize;
     if(a<base||a+len>base+size)return false;
-    static const size_t cap=(size_t)20<<30;
+    static const size_t cap=pin_cap_bytes();
     if(g_pin_bytes+size>cap){g_pin_failed.push_back({base,size});return false;}
     cudaError_t err=cudaHostRegister((void*)base,size,cudaHostRegisterPortable);
     if(err==cudaErrorHostMemoryAlreadyRegistered){cudaGetLastError();g_pin_regions.push_back({base,size});return true;}
@@ -2138,7 +2142,7 @@ static bool host_pinned(const void*p,size_t len){
     long page=sysconf(_SC_PAGESIZE);if(page<=0)page=4096;
     uintptr_t base=a&~((uintptr_t)page-1);
     size_t size=((a+len+page-1)&~((uintptr_t)page-1))-base;
-    static const size_t cap=(size_t)20<<30;
+    static const size_t cap=pin_cap_bytes();
     if(g_pin_bytes+size>cap){g_pin_failed.push_back({base,size});return false;}
     cudaError_t err=cudaHostRegister((void*)base,size,cudaHostRegisterPortable);
     if(err==cudaErrorHostMemoryAlreadyRegistered){cudaGetLastError();g_pin_regions.push_back({base,size});return true;}
