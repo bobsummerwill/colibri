@@ -54,7 +54,7 @@ struct Dsv4CudaExpertSet { ExpertPtr *table;int64_t *hash;Dsv4CudaTensor *sg,*su
 #if COLI_DSV4_TC
 struct TcPlan {int O,I,ok;cublasLtMatmulDesc_t op;cublasLtMatrixLayout_t a,b,c,d;cublasLtMatmulHeuristicResult_t algo;};
 #endif
-struct Dev { int id,sms; cudaStream_t stream,aux; cudaEvent_t ready,fork,join;float *dx,*dy,*p1,*p2,*p3,*p4,*aux1,*aux2,*aux3; size_t xcap,ycap,p1cap,p2cap,p3cap,p4cap,aux1cap,aux2cap,aux3cap; float *hx,*hy;
+struct Dev { int id,sms,sm; cudaStream_t stream,aux; cudaEvent_t ready,fork,join;float *dx,*dy,*p1,*p2,*p3,*p4,*aux1,*aux2,*aux3; size_t xcap,ycap,p1cap,p2cap,p3cap,p4cap,aux1cap,aux2cap,aux3cap; float *hx,*hy;
 #ifdef COLI_DSV4_NCCL
     ncclComm_t ep_comm;
 #endif
@@ -1390,6 +1390,19 @@ static int tc_dev_init(Dev*c){return bok(cublasLtCreate(&c->lt),"cuBLASLt create
 static int tc_dev_init(Dev*){return 1;}
 #endif
 extern "C" int dsv4_cuda_peer_access(int a,int b){return a!=b&&dev_ok(a,b)&&dev_ok(b,a);}
+/* DSV4_CUDA_BATCHED (1): the fused decode MoE runs its routed experts as
+ * grouped launches; 0 = one launch chain per expert, no peer compute. */
+static bool moe_batched(){static int on=-1;if(on<0){const char*v=getenv("DSV4_CUDA_BATCHED");on=v?atoi(v)!=0:1;}return on;}
+/* Peer compute (DSV4_CUDA_PEER_COMPUTE, default 1, batched kernels only):
+ * the fused decode MoE on device a runs the experts mirrored on device b ON
+ * b. b must be another initialised device, each must reach the other's
+ * memory (b's down-projection writes a's reduce buffer), and both must be
+ * the same SM version, so the two run the same machine code and the result
+ * stays bit-identical. Otherwise a reads b's mirrors in place. */
+static bool peer_runs(int a,int b){
+    static int on=-1;if(on<0){const char*v=getenv("DSV4_CUDA_PEER_COMPUTE");on=v?atoi(v)!=0:1;}
+    Dev*p=ctx(a),*q=ctx(b);return on&&moe_batched()&&a!=b&&p&&q&&p->sm==q->sm&&dev_ok(a,b)&&dev_ok(b,a);}
+extern "C" int dsv4_cuda_peer_compute(int device,int peer){return peer_runs(device,peer);}
 /* Asked BEFORE dsv4_cuda_init (DSV4_CUDA_PEER_DEVICE), so a peer that is
  * refused is never initialised: both ordinals visible, distinct and < 16 (the
  * size of g_peer), a compute capability this build accepts for each
@@ -1479,7 +1492,7 @@ static int init_fail(const int *dev,int n,int touched,int a,int b){
     dev_release(touched);
     for(int i=1;i<n;i++)if(dev[i]!=dev[0]&&cudaSetDevice(dev[i])==cudaSuccess)cudaDeviceReset();
     cudaGetLastError();return 0;}
-extern "C" int dsv4_cuda_init(const int *dev,int n){if(n<1||n>16)return 0;float scale[256];for(int b=0;b<256;b++)scale[b]=b?ldexpf(1.f,b-127):ldexpf(1.f,-127);ng=0;for(int i=0;i<n;i++){cudaDeviceProp p{};g[i].id=dev[i];if(!ok(cudaSetDevice(dev[i]),"select device")||!ok(cudaMemcpyToSymbol(e8_table,scale,sizeof(scale)),"scale table upload")||!ok(cudaGetDeviceProperties(&p,dev[i]),"device properties")||!ok(cudaStreamCreateWithFlags(&g[i].stream,cudaStreamNonBlocking),"stream")||!ok(cudaStreamCreateWithFlags(&g[i].aux,cudaStreamNonBlocking),"aux stream")||!ok(cudaEventCreateWithFlags(&g[i].ready,cudaEventDisableTiming),"device event")||!ok(cudaEventCreateWithFlags(&g[i].fork,cudaEventDisableTiming),"fork event")||!ok(cudaEventCreateWithFlags(&g[i].join,cudaEventDisableTiming),"join event")||!tc_dev_init(&g[i])||!ok(cudaMalloc(&g[i].decode_state,2*sizeof(int)),"decode state allocation"))return init_fail(dev,n,i+1,dev[i],-1);g[i].sms=p.multiProcessorCount;ng++;fprintf(stderr,"[DSV4 CUDA] device %d: %s %.1f GB sm_%d%d\n",dev[i],p.name,p.totalGlobalMem/1e9,p.major,p.minor);}for(int i=0;i<n;i++)for(int j=0;j<n;j++)if(i!=j){int can=0;if(!ok(cudaDeviceCanAccessPeer(&can,dev[i],dev[j]),"peer query"))return init_fail(dev,n,n,dev[i],dev[j]);if(can){if(!ok(cudaSetDevice(dev[i]),"select peer device"))return init_fail(dev,n,n,dev[i],dev[j]);cudaError_t e=cudaDeviceEnablePeerAccess(dev[j],0);if(e!=cudaSuccess&&e!=cudaErrorPeerAccessAlreadyEnabled){ok(e,"enable peer access");return init_fail(dev,n,n,dev[i],dev[j]);}if(e==cudaErrorPeerAccessAlreadyEnabled)cudaGetLastError();if(dev[i]>=0&&dev[i]<16&&dev[j]>=0&&dev[j]<16)g_peer[dev[i]][dev[j]]=1;}}
+extern "C" int dsv4_cuda_init(const int *dev,int n){if(n<1||n>16)return 0;float scale[256];for(int b=0;b<256;b++)scale[b]=b?ldexpf(1.f,b-127):ldexpf(1.f,-127);ng=0;for(int i=0;i<n;i++){cudaDeviceProp p{};g[i].id=dev[i];if(!ok(cudaSetDevice(dev[i]),"select device")||!ok(cudaMemcpyToSymbol(e8_table,scale,sizeof(scale)),"scale table upload")||!ok(cudaGetDeviceProperties(&p,dev[i]),"device properties")||!ok(cudaStreamCreateWithFlags(&g[i].stream,cudaStreamNonBlocking),"stream")||!ok(cudaStreamCreateWithFlags(&g[i].aux,cudaStreamNonBlocking),"aux stream")||!ok(cudaEventCreateWithFlags(&g[i].ready,cudaEventDisableTiming),"device event")||!ok(cudaEventCreateWithFlags(&g[i].fork,cudaEventDisableTiming),"fork event")||!ok(cudaEventCreateWithFlags(&g[i].join,cudaEventDisableTiming),"join event")||!tc_dev_init(&g[i])||!ok(cudaMalloc(&g[i].decode_state,2*sizeof(int)),"decode state allocation"))return init_fail(dev,n,i+1,dev[i],-1);g[i].sms=p.multiProcessorCount;g[i].sm=p.major*10+p.minor;ng++;fprintf(stderr,"[DSV4 CUDA] device %d: %s %.1f GB sm_%d%d\n",dev[i],p.name,p.totalGlobalMem/1e9,p.major,p.minor);}for(int i=0;i<n;i++)for(int j=0;j<n;j++)if(i!=j){int can=0;if(!ok(cudaDeviceCanAccessPeer(&can,dev[i],dev[j]),"peer query"))return init_fail(dev,n,n,dev[i],dev[j]);if(can){if(!ok(cudaSetDevice(dev[i]),"select peer device"))return init_fail(dev,n,n,dev[i],dev[j]);cudaError_t e=cudaDeviceEnablePeerAccess(dev[j],0);if(e!=cudaSuccess&&e!=cudaErrorPeerAccessAlreadyEnabled){ok(e,"enable peer access");return init_fail(dev,n,n,dev[i],dev[j]);}if(e==cudaErrorPeerAccessAlreadyEnabled)cudaGetLastError();if(dev[i]>=0&&dev[i]<16&&dev[j]>=0&&dev[j]<16)g_peer[dev[i]][dev[j]]=1;}}
 #ifdef COLI_DSV4_NCCL
     if(n==6)for(int pair=0;pair<3;pair++){int ids[2]={dev[2*pair],dev[2*pair+1]};ncclComm_t comm[2];if(!nok(ncclCommInitAll(comm,2,ids),"EP2 communicator init"))return init_fail(dev,n,n,-1,-1);g[2*pair].ep_comm=comm[0];g[2*pair+1].ep_comm=comm[1];}
 #endif
@@ -2031,8 +2044,10 @@ extern "C" int dsv4_cuda_expert_fp8(Dsv4CudaTensor *gate,Dsv4CudaTensor *up,Dsv4
 }
 extern "C" int dsv4_cuda_moe(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *up,Dsv4CudaTensor *const *down,
         const float *weights,int count,Dsv4CudaTensor *sg,Dsv4CudaTensor *su,Dsv4CudaTensor *sd,float limit,float *y,const float *x){
-    /* Runs on the shared expert's device; routed experts may live on a peer
-     * device (peer mirror pool) and are read in place over P2P/NVLink. */
+    /* Runs on the shared expert's device. Routed experts may live on a peer
+     * device (peer mirror pool): they run there (peer_runs), or this device
+     * reads them in place over P2P/NVLink with DSV4_CUDA_PEER_COMPUTE=0,
+     * DSV4_CUDA_BATCHED=0, or a peer of another SM version. */
     if(count<1||count>16||!gate||!up||!down||!sg||!su||!sd)return 0;Dsv4CudaTensor*t=gate[0];Dev*c=ctx(sg->device);
     if(!c||!t||t->fmt!=4||su->device!=sg->device||sd->device!=sg->device||sg->fmt!=8||su->fmt!=8||sd->fmt!=8||!ok(cudaSetDevice(sg->device),"select MoE device"))return 0;
     int H=t->I,I=t->O;if(sg->I!=H||sg->O!=I||su->I!=H||su->O!=I||sd->I!=I||sd->O!=H)return 0;
@@ -2041,19 +2056,16 @@ extern "C" int dsv4_cuda_moe(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *
     if(!buf((void**)&c->dx,&c->xcap,hb)||!buf((void**)&c->dy,&c->ycap,hb)||!buf((void**)&c->p1,&c->p1cap,ib)||
        !buf((void**)&c->p2,&c->p2cap,ib)||!buf((void**)&c->p3,&c->p3cap,ib)||!buf((void**)&c->p4,&c->p4cap,parts)||
        !ok(cudaMemcpyAsync(c->dx,x,hb,cudaMemcpyHostToDevice,c->stream),"MoE activation upload"))return 0;
-    static int batched=-1;if(batched<0)batched=getenv("DSV4_CUDA_BATCHED")?atoi(getenv("DSV4_CUDA_BATCHED")):1;
-    if(batched){
-        /* Peer compute (DSV4_CUDA_PEER_COMPUTE, default 1): routed experts
-         * whose mirrors live on a peer device run THERE on local weights,
-         * concurrently with this device's experts. The token's input goes
-         * over P2P and each expert's down-projection row lands straight in
-         * this device's p4 slot, so the reduce below is unchanged. Same
-         * kernels, same slots, same order: bit-identical to computing every
-         * expert here (=0 reads the peer mirrors in place instead). */
-        static int peer_compute=-1;if(peer_compute<0){const char*v=getenv("DSV4_CUDA_PEER_COMPUTE");peer_compute=v?atoi(v)!=0:1;}
+    if(moe_batched()){
+        /* Peer compute (peer_runs): routed experts whose mirrors live on a
+         * peer device run THERE on local weights, concurrently with this
+         * device's experts. The token's input goes over P2P and each
+         * expert's down-projection row lands straight in this device's p4
+         * slot, so the reduce below is unchanged. Same kernels, same slots,
+         * same order: bit-identical to computing every expert here. */
         int pdev=-1;unsigned char on_peer[16]={0};
         for(int e=0;e<count;e++){int d=gate[e]->device;
-            if(peer_compute&&d!=sg->device&&up[e]->device==d&&down[e]->device==d&&(pdev<0||pdev==d)&&ctx(d)){pdev=d;on_peer[e]=1;}}
+            if(d!=sg->device&&up[e]->device==d&&down[e]->device==d&&(pdev<0||pdev==d)&&peer_runs(sg->device,d)){pdev=d;on_peer[e]=1;}}
         Dev*pc=pdev>=0?ctx(pdev):nullptr;
         if(!buf((void**)&c->mvdesc,&c->mvdesccap,(size_t)2*count*sizeof(MvDesc))||!buf((void**)&c->expert_weights,&c->expert_weightscap,(size_t)count*sizeof(float))||
            !ok(cudaMemcpyAsync(c->expert_weights,weights,(size_t)count*sizeof(float),cudaMemcpyHostToDevice,c->stream),"MoE weights upload"))return 0;

@@ -10959,11 +10959,11 @@ static int v4_gpu_wanted(void) {
 }
 
 typedef struct V4GpuExpertMirrorCache V4GpuExpertMirrorCache;
-/* Peer mirror pool (DSV4_CUDA_PEER_DEVICE): a second cache on another GPU;
- * the fused decode MoE runs its experts on that GPU (or reads them over
- * P2P). */
+/* Peer mirror pool (DSV4_CUDA_PEER_DEVICE): a second cache on another GPU.
+ * The fused MoE runs its experts on that GPU (peer compute) or reads them in
+ * place over P2P/NVLink (dsv4_cuda_peer_compute says which). */
 static V4GpuExpertMirrorCache *g_v4_peer_mirrors;
-static V4GpuExpertMirrorCache *v4_peer_mirrors_create(int device);
+static V4GpuExpertMirrorCache *v4_peer_mirrors_create(int device, int primary);
 static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_capacity(
     int device, int capacity);
 static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create(int device,
@@ -11059,7 +11059,7 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
          * initialised for the run: what can be settled from the
          * environment belongs with the DSV4_HYBRID check, before the probe. */
         if (dsv4_cuda_peer_access(device, peer)) {
-            g_v4_peer_mirrors = v4_peer_mirrors_create(peer);
+            g_v4_peer_mirrors = v4_peer_mirrors_create(peer, device);
         } else {
             fprintf(stderr, "v4_gpu warning=no peer access %d<->%d; peer mirror "
                             "pool off\n", device, peer);
@@ -11578,7 +11578,7 @@ static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_capacity(
  * live on the peer card). A capacity below V4_MIRROR_RECYCLE_MIN could never
  * recycle and would only take misses from the primary cache, so the pool
  * stays off instead. */
-static V4GpuExpertMirrorCache *v4_peer_mirrors_create(int device) {
+static V4GpuExpertMirrorCache *v4_peer_mirrors_create(int device, int primary) {
     const char *cap = getenv("DSV4_CUDA_PEER_MIRRORS");
     long long capacity = 4096;
     if (cap && *cap) {
@@ -11598,9 +11598,17 @@ static V4GpuExpertMirrorCache *v4_peer_mirrors_create(int device) {
     const char *res = getenv("DSV4_CUDA_PEER_RESERVE_MB");
     cache->reserve_mb = res ? atoll(res) : 1024;
     if (cache->reserve_mb < 256) cache->reserve_mb = 256;
-    fprintf(stderr, "v4_gpu peer-mirrors device=%d reserve=%lldMB "
-                    "(routed experts read in place over P2P)\n",
-            device, cache->reserve_mb);
+    /* mode=compute: the fused MoE runs the pool's experts on the peer GPU;
+     * p2p-read: the primary reads them in place (DSV4_CUDA_PEER_COMPUTE=0,
+     * DSV4_CUDA_BATCHED=0, or GPUs of different SM versions). */
+    if (dsv4_cuda_peer_compute(primary, device))
+        fprintf(stderr, "v4_gpu peer-mirrors device=%d reserve=%lldMB mode=compute "
+                        "(the decode MoE runs these experts on device %d)\n",
+                device, cache->reserve_mb, device);
+    else
+        fprintf(stderr, "v4_gpu peer-mirrors device=%d reserve=%lldMB mode=p2p-read "
+                        "(device %d reads these experts in place over P2P)\n",
+                device, cache->reserve_mb, primary);
     return cache;
 }
 
