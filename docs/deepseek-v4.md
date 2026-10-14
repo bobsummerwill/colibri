@@ -240,6 +240,12 @@ builds, 4873 on DeepGEMM and 3100 for a 132-expert checkpoint (7945, 8329 and
 Below 32 live mirrors the default keeps only 600 MiB free, so a card too small
 for the bank still decodes from a working mirror set (the bank then falls back
 to the CPU union). An explicit `DSV4_CUDA_VRAM_RESERVE_MB` is used as given.
+It and the 600 MiB default without the bank carry no probe margin, so between
+two reads of free VRAM the cache counts the mirrors it has added against the
+last read and stops at the reserve instead of overshooting it by up to 64
+mirrors. The bank-sized default, below 32 live mirrors included, keeps the
+64-mirror margin. A failed mirror upload counts as a full card until the next
+read.
 
 | VRAM | dense mirrors | prefill bank | recommended env | expected |
 |---|---|---|---|---|
@@ -331,7 +337,12 @@ VRAM into a real tier:
   ON that GPU (`DSV4_CUDA_PEER_COMPUTE`, default 1): the token's input is
   copied over P2P, the same kernels run on local weights, and each expert's
   output row is written into the primary GPU's reduce buffer. Results are
-  bit-identical to computing every expert on one GPU.
+  bit-identical to computing every expert on one GPU. A miss grows the
+  primary cache, then the pool, and once neither can grow recycles the older
+  of the two LRU mirrors; a cache with fewer than 8 live mirrors (a nearly
+  full card, `DSV4_CUDA_PEER_RESERVE_MB` above its free VRAM) is never
+  recycled, so a starved pool only adds mirrors and never sends an expert to
+  the CPU that the primary cache would have taken.
 
 Measured on the REAP 150B setup above (2× RTX 3090 with an NVLink bridge,
 `--ram 40`, six 300-token answers, greedy; answers identical in every run):
@@ -505,8 +516,8 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `COLI_CUDA_ATTN_BATCH` (0) | `1` = GPU batched prefill attention block + GPU decode attention/indexer |
 | `COLI_CUDA_MOE_BATCH` (0) | `1` = prefill MoE on the transient VRAM expert bank |
 | `COLI_CUDA_MOE_BATCH_MIN` (256) | min fresh tokens to engage the bank |
-| `DSV4_CUDA_EXPERT_MIRRORS` (4096) | upper bound on decode VRAM expert mirrors (12.75 MiB each); free VRAM sizes the cache at run time |
-| `DSV4_CUDA_VRAM_RESERVE_MB` (600; with the bank 600 + the bank, ×2 with `COLI_CUDA_MOE_DOUBLE=1`, + 64 mirrors, logged as `v4_gpu mirror-reserve=`) | VRAM kept free while mirrors grow (bank + attention buffers; the default only from 32 live mirrors on, see [VRAM budget](#vram-budget-and-per-card-settings)); an explicit value is used as given |
+| `DSV4_CUDA_EXPERT_MIRRORS` (4096) | upper bound on decode VRAM expert mirrors (12.75 MiB each); free VRAM sizes the cache at run time; minimum 8 (a smaller cache mirrors nothing) |
+| `DSV4_CUDA_VRAM_RESERVE_MB` (600; with the bank 600 + the bank, ×2 with `COLI_CUDA_MOE_DOUBLE=1`, + 64 mirrors, logged as `v4_gpu mirror-reserve=`) | VRAM kept free while mirrors grow (bank + attention buffers; the default only from 32 live mirrors on, see [VRAM budget](#vram-budget-and-per-card-settings)); an explicit value is used as given and kept free between free-VRAM probes |
 | `V4_MTP_GPU_MIRRORS` (16) | separate mirror cache for the MTP drafter |
 | `DSV4_CUDA_PIN_HOST` (1, `.cu`) | page-lock expert-cache slabs for DMA uploads |
 | `DSV4_CUDA_MOE_GROUPED` (1, `.cu`) | expert-grouped MoE GEMM rows; `0` = legacy replicated |
@@ -518,7 +529,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_GPU_RESIDENT_FIRST` (0) | `1` = decode computes VRAM-mirrored experts without an expert-store lookup (VRAM adds to the RAM tier) |
 | `DSV4_CUDA_PEER_DEVICE` (unset) | second GPU for a decode mirror pool (peer access required) |
 | `DSV4_CUDA_PEER_COMPUTE` (1, `.cu`) | run the peer pool's experts on the peer GPU; `0` = read them in place over P2P |
-| `DSV4_CUDA_PEER_MIRRORS` (4096) / `DSV4_CUDA_PEER_RESERVE_MB` (1024) | peer pool capacity / VRAM kept free on the peer |
+| `DSV4_CUDA_PEER_MIRRORS` (4096) / `DSV4_CUDA_PEER_RESERVE_MB` (1024) | peer pool capacity, minimum 8 (a smaller or non-numeric value leaves the pool off) / VRAM kept free on the peer |
 | `DSV4_CUDA_PIN_CAP_GB` (20, `.cu`) | cap on page-locked expert-slab bytes for uploads |
 | `V4_SERVE_STATS_LOG` (0) | `1` = per-turn decode stats and decode MoE timing on stderr |
 
