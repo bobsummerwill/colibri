@@ -206,8 +206,8 @@ int dsv4_cuda_peer_probe(int device,int peer,char *why,int why_size);
  * (DSV4_CUDA_PEER_COMPUTE), 0 when device reads them in place over P2P. */
 int dsv4_cuda_peer_compute(int device,int peer);
 /* 0 once a peer-side CUDA failure in the decode MoE has latched this device
- * off for the rest of the process (no kernel reads its memory from another
- * device again), else 1. */
+ * off for the rest of the process (after the call that latched it, no kernel
+ * reads its memory from another device again), else 1. */
 int dsv4_cuda_peer_healthy(int device);
 Dsv4CudaExpertSet *dsv4_cuda_expert_bank_create(int count,int hidden,int intermediate,int device,
                                                  Dsv4CudaTensor *shared_gate,Dsv4CudaTensor *shared_up,

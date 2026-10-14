@@ -5410,12 +5410,18 @@ unsigned long long g_v4_gpu_first_hits, g_v4_dec_store_fetches;
  * the RAM tier holds experts that are not in VRAM: VRAM mirrors ADD to the
  * cache instead of duplicating RAM residents. */
 int coli_v4_gpu_resident_first(void) {
+#ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
     static int on = -1;
     if (on < 0) {
         const char *setting = getenv("V4_GPU_RESIDENT_FIRST");
         on = setting && atoi(setting) != 0;
     }
     return on;
+#else
+    /* only the dual-loader pipeline has VRAM-first lookups: without it every
+     * routed expert is still looked up, so its RAM pins must stay */
+    return 0;
+#endif
 }
 #endif
 

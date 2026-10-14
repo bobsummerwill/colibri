@@ -74,9 +74,10 @@ static Dev g[16];static int ng;
 /* g_peer[a][b]: device a's kernels may read device b's memory (peer access
  * enabled by dsv4_cuda_init, e.g. over NVLink). g_peer_lost[d]: a peer-side
  * failure in the decode MoE latched device d off (dsv4_cuda_peer_healthy);
- * no kernel reads its memory from another device again. The latch outlives
- * dsv4_cuda_shutdown on purpose: a sticky fault stays in the device's context
- * for the life of the process. */
+ * after the call that latched it (whose recompute on the primary may still
+ * read its mirrors in place), no kernel reads its memory from another device
+ * again. The latch outlives dsv4_cuda_shutdown on purpose: a sticky fault
+ * stays in the device's context for the life of the process. */
 static unsigned char g_peer[16][16],g_peer_lost[16];
 static bool dev_lost(int d){return d>=0&&d<16&&g_peer_lost[d];}
 static bool dev_ok(int a,int b){return a==b||(a>=0&&a<16&&b>=0&&b<16&&g_peer[a][b]&&!g_peer_lost[a]&&!g_peer_lost[b]);}
@@ -2055,9 +2056,9 @@ extern "C" int dsv4_cuda_expert_fp8(Dsv4CudaTensor *gate,Dsv4CudaTensor *up,Dsv4
 }
 /* Peer-compute failures. pstep keeps a peer step's first error; peer_fail
  * drains the peer and peer_latch reports the error once, with the device, as
- * it latches the peer off. peer_drain
- * waits out what was queued on the peer, so no peer kernel still writes this
- * device's p4 when it is reused, and clears the error the step left. */
+ * it latches the peer off. peer_drain waits out what was queued on the peer,
+ * so no peer kernel still writes this device's p4 when it is reused, and
+ * clears the error the step left. */
 static bool pstep(cudaError_t e,const char*s,const char**why,cudaError_t*err){if(e==cudaSuccess)return true;if(!*why){*why=s;*err=e;}return false;}
 static bool peer_drain(Dev*pc,int home){bool fine=cudaSetDevice(pc->id)==cudaSuccess&&cudaStreamSynchronize(pc->stream)==cudaSuccess;cudaSetDevice(home);cudaGetLastError();return fine;}
 /* DSV4_CUDA_PEER_FAULT=n[:lost] (tests): the n-th peer-compute pass fails at

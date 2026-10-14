@@ -245,8 +245,9 @@ live mirrors on the cache counts the mirrors it has added since the last read
 of free VRAM against that read and stops at the reserve instead of
 overshooting it by up to 64 mirrors. The first 8 may still overshoot it by
 about 100 MiB, so a reserve just under the free VRAM leaves a mirror set the
-cache can recycle. The bank-sized default, below 32 live mirrors included,
-keeps the 64-mirror margin. A failed mirror upload counts as a full card until
+cache can recycle. The bank-sized default already counts those 64 mirrors in
+its reserve; below 32 live mirrors it may still grow up to 64 mirrors past its
+600 MiB between two reads. A failed mirror upload counts as a full card until
 the next read.
 
 | VRAM | dense mirrors | prefill bank | recommended env | expected |
@@ -339,9 +340,9 @@ VRAM into a real tier:
   experts that are not in VRAM. A routing served from VRAM is not a store
   request: the hit rate in `DONE`/`PROF` is then the RAM hit rate of the
   experts the store was asked for. If a token cannot use the fused GPU path
-  after all (an upload failed), its mirrored experts are read from the store
-  through the loader lanes and the token runs on the CPU, as without the
-  switch.
+  after all (an attach failed: a failed upload, or a rows16-packed RAM slot),
+  its mirrored experts are read from the store through the loader lanes and
+  the token runs on the CPU, as without the switch.
 - `DSV4_CUDA_PEER_DEVICE=N`: a second mirror pool on GPU N (needs peer
   access, e.g. NVLink). By default (`DSV4_CUDA_PEER_COMPUTE=1`) the fused
   decode MoE runs the experts mirrored there ON that GPU: the token's input
@@ -363,20 +364,22 @@ failure in the process has latched off, peer access both ways, and on both
 GPUs, the primary's first, an architecture and kernel image the build runs);
 when a check fails, GPU N is left untouched, decode runs without it, and the
 `peer mirror pool off:` warning gives the reason and, for a missing kernel
-image, the `CUDA_ARCH` to rebuild with (a GPU that is full or taken by an
-exclusive-process job is reported as such). If the two-GPU init fails after
-the checks passed, GPU N's context is dropped again and decode retries on the
-primary alone. A miss grows the primary cache, then the pool, and once
-neither can grow recycles the older of the two LRU mirrors; a cache with
-fewer than 8 live mirrors (a nearly full card, `DSV4_CUDA_PEER_RESERVE_MB`
-above its free VRAM) is never recycled, so a starved pool only adds mirrors
-and never sends an expert to the CPU that the primary cache would have taken.
-A CUDA failure on the peer during decode latches it off for the rest of the
-run, with one `[DSV4 CUDA] peer device N failed in the decode MoE (...)`
-line. The token in flight is recomputed on the primary GPU, or on the CPU
-from host copies when the peer no longer answers, and the pool's mirrors
-count as misses from then on. The pool's VRAM on that GPU is released only
-when the engine closes.
+image, the build to use (a `CUDA_ARCH`, or the generic build for a DeepGEMM
+binary; a GPU that is full or taken by an exclusive-process job is reported
+as such). If the two-GPU init fails after the checks passed, GPU N's context
+is dropped again and decode retries on the primary alone. A miss grows the
+primary cache, then the pool, and once neither can grow recycles the older of
+the two LRU mirrors; a cache with fewer than 8 live mirrors (a nearly full
+card, `DSV4_CUDA_PEER_RESERVE_MB` above its free VRAM) is never recycled, so
+a starved pool only adds mirrors and never sends an expert to the CPU that
+the primary cache would have taken. A CUDA failure on the peer during decode
+latches it off for the rest of the run, with one
+`[DSV4 CUDA] peer device N failed in the decode MoE (...)` line. The token in
+flight is recomputed on the primary GPU, or on the CPU from host copies when
+the peer no longer answers, and the pool's mirrors count as misses from then
+on. The latch covers peer compute (`mode=compute`); a peer that stops
+answering without reporting an error is not detected. The pool's VRAM on that
+GPU is released only when the engine closes.
 
 The peer card holds nothing but mirrors (no dense weights, no prefill bank),
 at the same 12.75 MiB each. After ~0.3 GiB of CUDA context and the 1024 MiB
@@ -385,9 +388,9 @@ at the same 12.75 MiB each. After ~0.3 GiB of CUDA context and the 1024 MiB
 16 GB card ~1 200. `DSV4_CUDA_PEER_MIRRORS` (4096, i.e. 51 GiB) is only an
 upper bound, like `DSV4_CUDA_EXPERT_MIRRORS`: free VRAM sizes the pool.
 
-Both levers act where the MoE runs one token at a time, i.e. the ordinary
-decode step. Decode batches of more than one token (the verification of
-speculative drafts, and the steps of a serve that decodes several
+Both levers act where the MoE runs one token at a time, i.e. mainly the
+ordinary decode step. Decode batches of more than one token (the verification
+of speculative drafts, and the steps of a serve that decodes several
 conversations together, `KV_SLOTS`) go through the expert union and use
 neither (with the default `V4_EXPERT_UNION=1`; with `0` they run token by
 token and use both). `DSV4_HYBRID=1` turns `V4_GPU_RESIDENT_FIRST` off and
@@ -401,9 +404,9 @@ room for the second prefill bank. Every run gave the same answers (compared
 in full among the three `V4_GPU_RESIDENT_FIRST=1` rows; the one-GPU baseline
 kept only each answer's first 200 characters, which match).
 **To be re-measured:** these numbers come from intermediate builds of this
-branch (the `DSV4_CUDA_PEER_COMPUTE=0` row from one that always read the
-peer mirrors in place); they will be replaced by three samples per row on
-the final build.
+branch (from before the RAM pin ranking left mirrored experts out, and the
+`DSV4_CUDA_PEER_COMPUTE=0` row from one that always read the peer mirrors in
+place); they will be replaced by three samples per row on the final build.
 
 | configuration | decode tok/s (mean) |
 |---|---|
