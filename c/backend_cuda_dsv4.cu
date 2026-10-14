@@ -72,9 +72,14 @@ struct Dev { int id,sms,sm; cudaStream_t stream,aux; cudaEvent_t ready,fork,join
 };
 static Dev g[16];static int ng;
 /* g_peer[a][b]: device a's kernels may read device b's memory (peer access
- * enabled by dsv4_cuda_init, e.g. over NVLink). */
-static unsigned char g_peer[16][16];
-static bool dev_ok(int a,int b){return a==b||(a>=0&&a<16&&b>=0&&b<16&&g_peer[a][b]);}
+ * enabled by dsv4_cuda_init, e.g. over NVLink). g_peer_lost[d]: a peer-side
+ * failure in the decode MoE latched device d off (dsv4_cuda_peer_healthy);
+ * no kernel reads its memory from another device again. The latch outlives
+ * dsv4_cuda_shutdown on purpose: a sticky fault stays in the device's context
+ * for the life of the process. */
+static unsigned char g_peer[16][16],g_peer_lost[16];
+static bool dev_lost(int d){return d>=0&&d<16&&g_peer_lost[d];}
+static bool dev_ok(int a,int b){return a==b||(a>=0&&a<16&&b>=0&&b<16&&g_peer[a][b]&&!g_peer_lost[a]&&!g_peer_lost[b]);}
 static Dev *ctx(int d){for(int i=0;i<ng;i++)if(g[i].id==d)return g+i;return nullptr;}
 static int ok(cudaError_t e,const char *s){if(e==cudaSuccess)return 1;fprintf(stderr,"[DSV4 CUDA] %s: %s\n",s,cudaGetErrorString(e));return 0;}
 #if COLI_DSV4_TC
@@ -1390,15 +1395,16 @@ static int tc_dev_init(Dev*c){return bok(cublasLtCreate(&c->lt),"cuBLASLt create
 static int tc_dev_init(Dev*){return 1;}
 #endif
 extern "C" int dsv4_cuda_peer_access(int a,int b){return a!=b&&dev_ok(a,b)&&dev_ok(b,a);}
+extern "C" int dsv4_cuda_peer_healthy(int device){return !dev_lost(device);}
 /* DSV4_CUDA_BATCHED (1): the fused decode MoE runs its routed experts as
  * grouped launches; 0 = one launch chain per expert, no peer compute. */
 static bool moe_batched(){static int on=-1;if(on<0){const char*v=getenv("DSV4_CUDA_BATCHED");on=v?atoi(v)!=0:1;}return on;}
 /* Peer compute (DSV4_CUDA_PEER_COMPUTE, default 1, batched kernels only):
  * the fused decode MoE on device a runs the experts mirrored on device b ON
- * b. b must be another initialised device, each must reach the other's
- * memory (b's down-projection writes a's reduce buffer), and both must be
- * the same SM version, so the two run the same machine code and the result
- * stays bit-identical. Otherwise a reads b's mirrors in place. */
+ * b. b must be another initialised, healthy device, each must reach the
+ * other's memory (b's down-projection writes a's reduce buffer), and both
+ * must be the same SM version, so the two run the same machine code and the
+ * result stays bit-identical. Otherwise a reads b's mirrors in place. */
 static bool peer_runs(int a,int b){
     static int on=-1;if(on<0){const char*v=getenv("DSV4_CUDA_PEER_COMPUTE");on=v?atoi(v)!=0:1;}
     Dev*p=ctx(a),*q=ctx(b);return on&&moe_batched()&&a!=b&&p&&q&&p->sm==q->sm&&dev_ok(a,b)&&dev_ok(b,a);}
@@ -1914,7 +1920,7 @@ static int tc_fp4_matvec(Dev*c,Dsv4CudaTensor*t,float*y){int O=t->O,I=t->I;size_
 extern "C" int dsv4_cuda_expert_group(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *up,Dsv4CudaTensor *const *down,
         const float *weights,int count,float limit,float *y,const float *x){
     if(count<1||count>16||!gate||!up||!down)return 0;Dsv4CudaTensor *t=gate[0];Dev*c=t?ctx(t->device):nullptr;
-    if(!c||t->fmt!=4||!ok(cudaSetDevice(t->device),"select expert-group device"))return 0;int H=t->I,I=t->O;
+    if(!c||dev_lost(t->device)||t->fmt!=4||!ok(cudaSetDevice(t->device),"select expert-group device"))return 0;int H=t->I,I=t->O;
     for(int e=0;e<count;e++)if(!gate[e]||!up[e]||!down[e]||!dev_ok(t->device,gate[e]->device)||!dev_ok(t->device,up[e]->device)||!dev_ok(t->device,down[e]->device)||gate[e]->fmt!=4||up[e]->fmt!=4||down[e]->fmt!=4||gate[e]->I!=H||gate[e]->O!=I||up[e]->I!=H||up[e]->O!=I||down[e]->I!=I||down[e]->O!=H)return 0;
     size_t xb=(size_t)H*4,ib=(size_t)count*I*4,hb=(size_t)count*H*4;
     if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,(size_t)H*4)||
@@ -1969,20 +1975,43 @@ extern "C" int dsv4_cuda_expert_fp8(Dsv4CudaTensor *gate,Dsv4CudaTensor *up,Dsv4
     expert_reduce<<<(H+255)/256,256,0,c->stream>>>(c->dy,c->p4,1,H);
     return ok(cudaGetLastError(),"shared-expert launch")&&ok(cudaMemcpyAsync(y,c->dy,hb,cudaMemcpyDeviceToHost,c->stream),"shared-expert result download")&&ok(cudaStreamSynchronize(c->stream),"shared-expert sync");
 }
-extern "C" int dsv4_cuda_moe(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *up,Dsv4CudaTensor *const *down,
-        const float *weights,int count,Dsv4CudaTensor *sg,Dsv4CudaTensor *su,Dsv4CudaTensor *sd,float limit,float *y,const float *x){
-    /* Runs on the shared expert's device. Routed experts may live on a peer
-     * device (peer mirror pool): they run there (peer_runs), or this device
-     * reads them in place over P2P/NVLink with DSV4_CUDA_PEER_COMPUTE=0,
-     * DSV4_CUDA_BATCHED=0, or a peer of another SM version. */
-    if(count<1||count>16||!gate||!up||!down||!sg||!su||!sd)return 0;Dsv4CudaTensor*t=gate[0];Dev*c=ctx(sg->device);
-    if(!c||!t||t->fmt!=4||su->device!=sg->device||sd->device!=sg->device||sg->fmt!=8||su->fmt!=8||sd->fmt!=8||!ok(cudaSetDevice(sg->device),"select MoE device"))return 0;
-    int H=t->I,I=t->O;if(sg->I!=H||sg->O!=I||su->I!=H||su->O!=I||sd->I!=I||sd->O!=H)return 0;
-    for(int e=0;e<count;e++)if(!gate[e]||!up[e]||!down[e]||!dev_ok(sg->device,gate[e]->device)||!dev_ok(sg->device,up[e]->device)||!dev_ok(sg->device,down[e]->device)||gate[e]->fmt!=4||up[e]->fmt!=4||down[e]->fmt!=4)return 0;
+/* Peer-compute failures. pstep keeps a peer step's first error; peer_fail
+ * reports it once, with the device, as it latches the peer off. peer_drain
+ * waits out what was queued on the peer, so no peer kernel still writes this
+ * device's p4 when it is reused, and clears the error the step left. */
+static bool pstep(cudaError_t e,const char*s,const char**why,cudaError_t*err){if(e==cudaSuccess)return true;if(!*why){*why=s;*err=e;}return false;}
+static bool peer_drain(Dev*pc,int home){bool fine=cudaSetDevice(pc->id)==cudaSuccess&&cudaStreamSynchronize(pc->stream)==cudaSuccess;cudaSetDevice(home);cudaGetLastError();return fine;}
+/* DSV4_CUDA_PEER_FAULT=n[:lost] (tests): the n-th peer-compute pass fails at
+ * its join, after the peer's kernels ran, the way an asynchronous fault on
+ * the peer surfaces there; with :lost the peer also counts as unreadable.
+ * One stderr line says when it fired. */
+static bool peer_fault(bool*lost){
+    static long at=-1,n;static bool gone;
+    if(at<0){const char*e=getenv("DSV4_CUDA_PEER_FAULT");at=e&&*e?atol(e):0;gone=e&&strstr(e,":lost");}
+    if(at<=0||++n!=at)return false;*lost=gone;
+    fprintf(stderr,"[DSV4 CUDA] DSV4_CUDA_PEER_FAULT: peer-compute pass #%ld fails%s\n",at,gone?", device lost":"");return true;}
+/* Latch the peer off and drain it. -1: it still answers (an allocation or
+ * launch failure), so its mirrors are readable and the caller computes their
+ * experts here, reading them in place; 0: a sticky fault, its memory is not
+ * read again and the caller must fall back to host copies. */
+static int peer_fail(Dev*pc,int home,const char*why,cudaError_t err,bool lost){
+    bool alive=peer_drain(pc,home)&&!lost;int d=pc->id;
+    if(d>=0&&d<16&&!g_peer_lost[d]){g_peer_lost[d]=1;
+        fprintf(stderr,"[DSV4 CUDA] peer device %d failed in the decode MoE (%s: %s); latched off, decode continues on device %d%s\n",
+                d,why?why:"peer step",cudaGetErrorString(err),home,alive?"":" (its memory is no longer read)");}
+    return alive?-1:0;}
+/* One pass of dsv4_cuda_moe on c. With peer, experts mirrored on a device
+ * peer_runs() accepts run there. 1 = done, 0 = failed, -1 = the peer failed
+ * but still answers: run again without peer, which computes its experts here
+ * from the same mirrors (bit-identical). Every exit after peer work was
+ * queued drains the peer first. */
+static int moe_once(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *up,Dsv4CudaTensor *const *down,const float *weights,int count,
+        Dsv4CudaTensor *sg,Dsv4CudaTensor *su,Dsv4CudaTensor *sd,float limit,float *y,const float *x,Dev*c,int H,int I,bool peer){
     size_t hb=(size_t)H*4,ib=(size_t)count*I*4,parts=(size_t)count*H*4;
     if(!buf((void**)&c->dx,&c->xcap,hb)||!buf((void**)&c->dy,&c->ycap,hb)||!buf((void**)&c->p1,&c->p1cap,ib)||
        !buf((void**)&c->p2,&c->p2cap,ib)||!buf((void**)&c->p3,&c->p3cap,ib)||!buf((void**)&c->p4,&c->p4cap,parts)||
        !ok(cudaMemcpyAsync(c->dx,x,hb,cudaMemcpyHostToDevice,c->stream),"MoE activation upload"))return 0;
+    Dev*pc=nullptr;
     if(moe_batched()){
         /* Peer compute (peer_runs): routed experts whose mirrors live on a
          * peer device run THERE on local weights, concurrently with this
@@ -1992,43 +2021,70 @@ extern "C" int dsv4_cuda_moe(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *
          * same order: bit-identical to computing every expert here. */
         int pdev=-1;unsigned char on_peer[16]={0};
         for(int e=0;e<count;e++){int d=gate[e]->device;
-            if(d!=sg->device&&up[e]->device==d&&down[e]->device==d&&(pdev<0||pdev==d)&&peer_runs(sg->device,d)){pdev=d;on_peer[e]=1;}}
-        Dev*pc=pdev>=0?ctx(pdev):nullptr;
+            if(peer&&d!=sg->device&&up[e]->device==d&&down[e]->device==d&&(pdev<0||pdev==d)&&peer_runs(sg->device,d)){pdev=d;on_peer[e]=1;}}
+        pc=pdev>=0?ctx(pdev):nullptr;
         if(!buf((void**)&c->mvdesc,&c->mvdesccap,(size_t)2*count*sizeof(MvDesc))||!buf((void**)&c->expert_weights,&c->expert_weightscap,(size_t)count*sizeof(float))||
            !ok(cudaMemcpyAsync(c->expert_weights,weights,(size_t)count*sizeof(float),cudaMemcpyHostToDevice,c->stream),"MoE weights upload"))return 0;
         if(pc){
-            MvDesc pd[32];int k=0;
-            if(!ok(cudaEventRecord(c->fork,c->stream),"MoE peer fork")||!ok(cudaSetDevice(pdev),"select MoE peer device")||
-               !buf((void**)&pc->dx,&pc->xcap,hb)||!buf((void**)&pc->p1,&pc->p1cap,ib)||!buf((void**)&pc->p2,&pc->p2cap,ib)||!buf((void**)&pc->p3,&pc->p3cap,ib)||
-               !buf((void**)&pc->mvdesc,&pc->mvdesccap,(size_t)2*count*sizeof(MvDesc))||!buf((void**)&pc->expert_weights,&pc->expert_weightscap,(size_t)count*sizeof(float))||
-               !ok(cudaStreamWaitEvent(pc->stream,c->fork,0),"MoE peer wait")||
-               !ok(cudaMemcpyPeerAsync(pc->dx,pdev,c->dx,sg->device,hb,pc->stream),"MoE peer activation copy")||
-               !ok(cudaMemcpyAsync(pc->expert_weights,weights,(size_t)count*sizeof(float),cudaMemcpyHostToDevice,pc->stream),"MoE peer weights upload")){
-                cudaSetDevice(sg->device);return 0;}
-            for(int e=0;e<count;e++)if(on_peer[e]){pd[k++]={(uint8_t*)gate[e]->w,gate[e]->scale,pc->dx,pc->p1+(long long)e*I};pd[k++]={(uint8_t*)up[e]->w,up[e]->scale,pc->dx,pc->p2+(long long)e*I};}
-            if(!ok(cudaMemcpyAsync(pc->mvdesc,pd,(size_t)k*sizeof(MvDesc),cudaMemcpyHostToDevice,pc->stream),"MoE peer descriptors upload")){cudaSetDevice(sg->device);return 0;}
-            mv_fp4_grouped<4><<<dim3((I+3)/4,k),256,0,pc->stream>>>(pc->mvdesc,k,I,H);
-            expert_act_grouped<<<(count*I+255)/256,256,0,pc->stream>>>(pc->p3,pc->p1,pc->p2,pc->expert_weights,limit,count,I);fp8_sim<<<count*((I+127)/128),128,0,pc->stream>>>(pc->p3,count,I);
-            k=0;for(int e=0;e<count;e++)if(on_peer[e])pd[k++]={(uint8_t*)down[e]->w,down[e]->scale,pc->p3+(long long)e*I,c->p4+(long long)e*H};
-            if(!ok(cudaMemcpyAsync(pc->mvdesc,pd,(size_t)k*sizeof(MvDesc),cudaMemcpyHostToDevice,pc->stream),"MoE peer down descriptors upload")){cudaSetDevice(sg->device);return 0;}
-            mv_fp4_grouped<4><<<dim3((H+3)/4,k),256,0,pc->stream>>>(pc->mvdesc,k,H,I);
-            if(!ok(cudaEventRecord(pc->join,pc->stream),"MoE peer join")||!ok(cudaSetDevice(sg->device),"select MoE device"))return 0;
+            /* A stale error must not be blamed on the peer's launches below. */
+            cudaGetLastError();
+            MvDesc pd[32];int k=0;const char*why=nullptr;cudaError_t err=cudaSuccess;
+            bool fine=pstep(cudaEventRecord(c->fork,c->stream),"fork",&why,&err)&&pstep(cudaSetDevice(pdev),"device select",&why,&err)&&
+               pstep(buf((void**)&pc->dx,&pc->xcap,hb)&&buf((void**)&pc->p1,&pc->p1cap,ib)&&buf((void**)&pc->p2,&pc->p2cap,ib)&&buf((void**)&pc->p3,&pc->p3cap,ib)&&
+                     buf((void**)&pc->mvdesc,&pc->mvdesccap,(size_t)2*count*sizeof(MvDesc))&&buf((void**)&pc->expert_weights,&pc->expert_weightscap,(size_t)count*sizeof(float))
+                     ?cudaSuccess:cudaErrorMemoryAllocation,"buffer allocation",&why,&err)&&
+               pstep(cudaStreamWaitEvent(pc->stream,c->fork,0),"fork wait",&why,&err)&&
+               pstep(cudaMemcpyPeerAsync(pc->dx,pdev,c->dx,sg->device,hb,pc->stream),"activation copy",&why,&err)&&
+               pstep(cudaMemcpyAsync(pc->expert_weights,weights,(size_t)count*sizeof(float),cudaMemcpyHostToDevice,pc->stream),"weights upload",&why,&err);
+            if(fine){for(int e=0;e<count;e++)if(on_peer[e]){pd[k++]={(uint8_t*)gate[e]->w,gate[e]->scale,pc->dx,pc->p1+(long long)e*I};pd[k++]={(uint8_t*)up[e]->w,up[e]->scale,pc->dx,pc->p2+(long long)e*I};}
+                fine=pstep(cudaMemcpyAsync(pc->mvdesc,pd,(size_t)k*sizeof(MvDesc),cudaMemcpyHostToDevice,pc->stream),"descriptors upload",&why,&err);}
+            if(fine){mv_fp4_grouped<4><<<dim3((I+3)/4,k),256,0,pc->stream>>>(pc->mvdesc,k,I,H);
+                expert_act_grouped<<<(count*I+255)/256,256,0,pc->stream>>>(pc->p3,pc->p1,pc->p2,pc->expert_weights,limit,count,I);fp8_sim<<<count*((I+127)/128),128,0,pc->stream>>>(pc->p3,count,I);
+                k=0;for(int e=0;e<count;e++)if(on_peer[e])pd[k++]={(uint8_t*)down[e]->w,down[e]->scale,pc->p3+(long long)e*I,c->p4+(long long)e*H};
+                fine=pstep(cudaMemcpyAsync(pc->mvdesc,pd,(size_t)k*sizeof(MvDesc),cudaMemcpyHostToDevice,pc->stream),"down descriptors upload",&why,&err);}
+            if(fine){mv_fp4_grouped<4><<<dim3((H+3)/4,k),256,0,pc->stream>>>(pc->mvdesc,k,H,I);
+                fine=pstep(cudaGetLastError(),"launch",&why,&err)&&pstep(cudaEventRecord(pc->join,pc->stream),"join record",&why,&err);}
+            if(!fine)return peer_fail(pc,sg->device,why,err,false);
+            if(!ok(cudaSetDevice(sg->device),"select MoE device")){peer_drain(pc,sg->device);return 0;}
         }
         MvDesc hd[32];int k=0;
         for(int e=0;e<count;e++)if(!on_peer[e]){hd[k++]={(uint8_t*)gate[e]->w,gate[e]->scale,c->dx,c->p1+(long long)e*I};hd[k++]={(uint8_t*)up[e]->w,up[e]->scale,c->dx,c->p2+(long long)e*I};}
-        if(k){if(!ok(cudaMemcpyAsync(c->mvdesc,hd,(size_t)k*sizeof(*hd),cudaMemcpyHostToDevice,c->stream),"MoE descriptors upload"))return 0;
+        if(k){if(!ok(cudaMemcpyAsync(c->mvdesc,hd,(size_t)k*sizeof(*hd),cudaMemcpyHostToDevice,c->stream),"MoE descriptors upload")){if(pc)peer_drain(pc,sg->device);return 0;}
             mv_fp4_grouped<4><<<dim3((I+3)/4,k),256,0,c->stream>>>(c->mvdesc,k,I,H);}
         expert_act_grouped<<<(count*I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,c->expert_weights,limit,count,I);fp8_sim<<<count*((I+127)/128),128,0,c->stream>>>(c->p3,count,I);
         k=0;for(int e=0;e<count;e++)if(!on_peer[e])hd[k++]={(uint8_t*)down[e]->w,down[e]->scale,c->p3+(long long)e*I,c->p4+(long long)e*H};
-        if(k){if(!ok(cudaMemcpyAsync(c->mvdesc,hd,(size_t)k*sizeof(*hd),cudaMemcpyHostToDevice,c->stream),"MoE down descriptors upload"))return 0;
+        if(k){if(!ok(cudaMemcpyAsync(c->mvdesc,hd,(size_t)k*sizeof(*hd),cudaMemcpyHostToDevice,c->stream),"MoE down descriptors upload")){if(pc)peer_drain(pc,sg->device);return 0;}
             mv_fp4_grouped<4><<<dim3((H+3)/4,k),256,0,c->stream>>>(c->mvdesc,k,H,I);}
-        if(pc&&!ok(cudaStreamWaitEvent(c->stream,pc->join,0),"MoE peer join wait"))return 0;
+        if(pc){cudaError_t e=cudaStreamWaitEvent(c->stream,pc->join,0);if(e!=cudaSuccess)return peer_fail(pc,sg->device,"join wait",e,false);}
     }else for(int e=0;e<count;e++){run_mv<4>((uint8_t*)gate[e]->w,gate[e]->scale,c->dx,c->p1+(long long)e*I,I,H,1,c->stream);run_mv<4>((uint8_t*)up[e]->w,up[e]->scale,c->dx,c->p2+(long long)e*I,I,H,1,c->stream);expert_act<<<(I+255)/256,256,0,c->stream>>>(c->p3+(long long)e*I,c->p1+(long long)e*I,c->p2+(long long)e*I,weights[e],limit,I);fp8_sim<<<(I+127)/128,128,0,c->stream>>>(c->p3+(long long)e*I,1,I);run_mv<4>((uint8_t*)down[e]->w,down[e]->scale,c->p3+(long long)e*I,c->p4+(long long)e*H,H,I,1,c->stream);}
     expert_reduce<<<(H+255)/256,256,0,c->stream>>>(c->dy,c->p4,count,H);
     run_mv<8>((uint8_t*)sg->w,sg->scale,c->dx,c->p1,I,H,1,c->stream);run_mv<8>((uint8_t*)su->w,su->scale,c->dx,c->p2,I,H,1,c->stream);
     expert_act<<<(I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,1.f,limit,I);fp8_sim<<<(I+127)/128,128,0,c->stream>>>(c->p3,1,I);run_mv<8>((uint8_t*)sd->w,sd->scale,c->p3,c->p4,H,I,1,c->stream);
     moe_combine<<<(H+255)/256,256,0,c->stream>>>(c->dy,c->p4,H);
-    return ok(cudaGetLastError(),"MoE launch")&&ok(cudaMemcpyAsync(y,c->dy,hb,cudaMemcpyDeviceToHost,c->stream),"MoE result download")&&ok(cudaStreamSynchronize(c->stream),"MoE sync");
+    int r=ok(cudaGetLastError(),"MoE launch")&&ok(cudaMemcpyAsync(y,c->dy,hb,cudaMemcpyDeviceToHost,c->stream),"MoE result download")&&ok(cudaStreamSynchronize(c->stream),"MoE sync");
+    if(pc){
+        /* This stream waited on the join, so the peer's work is done, unless
+         * the peer faulted after it was queued: an asynchronous error there
+         * does not show on this device, and y could hold stale peer rows. */
+        bool lost=false;cudaError_t e=cudaEventSynchronize(pc->join);
+        if(e==cudaSuccess&&peer_fault(&lost))e=cudaErrorLaunchFailure;
+        if(e!=cudaSuccess)return peer_fail(pc,sg->device,"join",e,lost);
+    }
+    return r;
+}
+extern "C" int dsv4_cuda_moe(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *up,Dsv4CudaTensor *const *down,
+        const float *weights,int count,Dsv4CudaTensor *sg,Dsv4CudaTensor *su,Dsv4CudaTensor *sd,float limit,float *y,const float *x){
+    /* Runs on the shared expert's device. Routed experts may live on a peer
+     * device (peer mirror pool): they run there (peer_runs), or this device
+     * reads them in place over P2P/NVLink with DSV4_CUDA_PEER_COMPUTE=0,
+     * DSV4_CUDA_BATCHED=0, a peer of another SM version, and for the rest of
+     * a call whose peer failed. A latched-off peer's tensors are refused. */
+    if(count<1||count>16||!gate||!up||!down||!sg||!su||!sd)return 0;Dsv4CudaTensor*t=gate[0];Dev*c=ctx(sg->device);
+    if(!c||!t||dev_lost(sg->device)||t->fmt!=4||su->device!=sg->device||sd->device!=sg->device||sg->fmt!=8||su->fmt!=8||sd->fmt!=8||!ok(cudaSetDevice(sg->device),"select MoE device"))return 0;
+    int H=t->I,I=t->O;if(sg->I!=H||sg->O!=I||su->I!=H||su->O!=I||sd->I!=I||sd->O!=H)return 0;
+    for(int e=0;e<count;e++)if(!gate[e]||!up[e]||!down[e]||!dev_ok(sg->device,gate[e]->device)||!dev_ok(sg->device,up[e]->device)||!dev_ok(sg->device,down[e]->device)||gate[e]->fmt!=4||up[e]->fmt!=4||down[e]->fmt!=4)return 0;
+    int r=moe_once(gate,up,down,weights,count,sg,su,sd,limit,y,x,c,H,I,true);
+    return r<0?moe_once(gate,up,down,weights,count,sg,su,sd,limit,y,x,c,H,I,false):r;
 }
 extern "C" int dsv4_cuda_rmsnorm(Dsv4CudaActivation*x,Dsv4CudaTensor*w,float eps,int elements){
     Dev*c=x?ctx(x->device):nullptr;
@@ -2705,6 +2761,8 @@ extern "C" int dsv4_cuda_wo(Dsv4CudaTensor *wa,Dsv4CudaTensor *wb,int groups,flo
     bf16_round<<<(H+255)/256,256,0,c->stream>>>(c->p2,H);
     return ok(cudaGetLastError(),"wo launch")&&ok(cudaMemcpyAsync(out,c->p2,hb,cudaMemcpyDeviceToHost,c->stream),"wo result download")&&ok(cudaStreamSynchronize(c->stream),"wo sync");
 }
-extern "C" void dsv4_cuda_tensor_free(Dsv4CudaTensor*t){if(!t)return;cudaSetDevice(t->device);if(t->own_w&&t->w)cudaFree(t->w);if(t->bf16_cache)cudaFree(t->bf16_cache);if(t->own_scale&&t->scale)cudaFree(t->scale);if(t->own_dg_scale&&t->dg_scale)cudaFree(t->dg_scale);free(t);}
+/* A latched-off peer's context may refuse the frees (sticky fault): read the
+ * error so the next launch check does not report it. */
+extern "C" void dsv4_cuda_tensor_free(Dsv4CudaTensor*t){if(!t)return;cudaSetDevice(t->device);if(t->own_w&&t->w)cudaFree(t->w);if(t->bf16_cache)cudaFree(t->bf16_cache);if(t->own_scale&&t->scale)cudaFree(t->scale);if(t->own_dg_scale&&t->dg_scale)cudaFree(t->dg_scale);if(dev_lost(t->device))cudaGetLastError();free(t);}
 extern "C" long long dsv4_cuda_tensor_bytes(const Dsv4CudaTensor*t){return t?t->bytes:0;}
 extern "C" int dsv4_cuda_tensor_device(const Dsv4CudaTensor*t){return t?t->device:-1;}
