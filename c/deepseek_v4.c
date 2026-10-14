@@ -4870,6 +4870,20 @@ static int expert_prefetch_enabled(void) {
     }
     return enabled;
 }
+
+/* Tell the store which experts of `layer` it is about to be asked for:
+ * expert_ids[pick[i]] (expert_ids[i] without pick), count of them. */
+static void v4_expert_prefetch(ColiExpertStore *store, int layer,
+                               const int *expert_ids, const int *pick,
+                               int count) {
+    if (count < 1 || !expert_prefetch_enabled() || !store->ops->prefetch) return;
+    ColiExpertKey *keys = malloc((size_t)count * sizeof(*keys));
+    if (!keys) return;
+    for (int i = 0; i < count; i++)
+        keys[i] = (ColiExpertKey){layer, expert_ids[pick ? pick[i] : i]};
+    store->ops->prefetch(store, keys, (size_t)count);
+    free(keys);
+}
 #endif
 
 
@@ -5381,17 +5395,12 @@ static void v4_vk_token_free(V4VkToken *vk) {
 }
 #endif
 
-/* VRAM-first decode counters, cumulative (read by the serve stats line). */
-unsigned long long g_v4_gpu_first_hits = 0, g_v4_gpu_first_fetches = 0;
-/* Decode MoE timing (cumulative seconds; serve stats line): store fetch wait,
- * VRAM attach (upload on mirror miss), fused/grouped GPU compute, whole call. */
-double g_v4_dec_fetch_s = 0, g_v4_dec_attach_s = 0, g_v4_dec_gpu_s = 0, g_v4_dec_total_s = 0;
-unsigned long long g_v4_dec_attaches = 0, g_v4_dec_calls = 0;
-static double v4_dec_now(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-}
+/* Decode MoE counters (V4_SERVE_STATS_LOG; deepseek_v4_internal.h). */
+int g_v4_dec_counting;
+unsigned long long g_v4_dec_calls, g_v4_dec_uploads;
+double g_v4_dec_total_s, g_v4_dec_fetch_s, g_v4_dec_attach_s, g_v4_dec_gpu_s;
+unsigned long long g_v4_gpu_first_hits, g_v4_dec_store_fetches;
+
 #ifdef COLI_V4_GPU_TIER
 /* VRAM-first decode (V4_GPU_RESIDENT_FIRST=1): a routed expert already
  * mirrored in VRAM is computed from the mirror without asking the expert
@@ -5446,6 +5455,11 @@ static int moe_token_pipeline(float *output,
                               const float *input, int token) {
 #ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
     double profile_moe_began = coli_v4_block_profile_now();
+#endif
+#ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
+    /* decode MoE counters (deepseek_v4_internal.h): the routing included */
+    int dec = g_v4_dec_counting;
+    double dec_t0 = v4_wait_clock();
 #endif
     int d = config->hidden_size;
     int n = config->n_routed_experts;
@@ -5538,16 +5552,10 @@ static int moe_token_pipeline(float *output,
                           expert_ids, expert_weights, &selected);
 #endif
 
-#ifdef COLI_V4_EXPERIMENTAL_PREFETCH
-    if (!result && expert_prefetch_enabled() && store->ops->prefetch) {
-        ColiExpertKey *keys = malloc((size_t)selected * sizeof(*keys));
-        if (keys) {
-            for (int i = 0; i < selected; i++)
-                keys[i] = (ColiExpertKey){weights->plan.layer, expert_ids[i]};
-            store->ops->prefetch(store, keys, (size_t)selected);
-            free(keys);
-        }
-    }
+#if defined(COLI_V4_EXPERIMENTAL_PREFETCH) && \
+    !defined(COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER)
+    if (!result)
+        v4_expert_prefetch(store, weights->plan.layer, expert_ids, NULL, selected);
 #endif
 
 
@@ -5558,7 +5566,6 @@ static int moe_token_pipeline(float *output,
     /* views[i] belongs to expert_ids[i]; fetch[] lists the experts the store
      * must provide (all of them unless VRAM-first finds mirrors); leased[i]
      * marks views holding a store lease, the only ones released at the end. */
-    double dec_t0 = v4_dec_now();
     int alloc_n = selected ? selected : 1;
     ColiExpertView *views = malloc((size_t)alloc_n * sizeof(*views));
     unsigned char *leased = calloc((size_t)alloc_n, 1);
@@ -5569,22 +5576,24 @@ static int moe_token_pipeline(float *output,
                           weights->plan.layer, selected);
     if (!result) {
         memset(views, 0, (size_t)alloc_n * sizeof(*views));
-        int first = 0;
 #ifdef COLI_V4_GPU_TIER
-        first = store->gpu && coli_v4_gpu_resident_first() && !coli_v4_hybrid_enabled();
+        int first = store->gpu && coli_v4_gpu_resident_first() &&
+                    !coli_v4_hybrid_enabled();
 #endif
         for (int i = 0; i < selected; i++) {
             views[i].key = (ColiExpertKey){weights->plan.layer, expert_ids[i]};
 #ifdef COLI_V4_GPU_TIER
-            if (first && coli_v4_gpu_expert_peek(store, &views[i]) == 0) {
-                g_v4_gpu_first_hits++;
+            if (first && coli_v4_gpu_expert_peek(store, &views[i]) == 0)
                 continue;
-            }
             views[i].gate.gpu = views[i].up.gpu = views[i].down.gpu = NULL;
 #endif
             fetch[nfetch++] = i;
         }
-        if (first) g_v4_gpu_first_fetches += (unsigned long long)nfetch;
+        if (dec) g_v4_dec_store_fetches += (unsigned long long)nfetch;
+#ifdef COLI_V4_EXPERIMENTAL_PREFETCH
+        /* only what the store will be asked for: a mirrored expert is not */
+        v4_expert_prefetch(store, weights->plan.layer, expert_ids, fetch, nfetch);
+#endif
         int preload = nfetch < dual_loader_lanes()
             ? nfetch : dual_loader_lanes();
         for (int f = 0; f < preload; f++) {
@@ -5632,10 +5641,10 @@ static int moe_token_pipeline(float *output,
         for (int f = 0; !result && f < nfetch; f++) {
             int current = fetch[f];
             int slot = f % dual_loader_lanes();
-            double fw0 = v4_dec_now();
+            double fw0 = v4_wait_clock();
             int finish_failed = !loader_active[slot] ||
                 profiled_expert_load_finish(&loaders[slot]) != 0;
-            g_v4_dec_fetch_s += v4_dec_now() - fw0;
+            if (dec) g_v4_dec_fetch_s += v4_wait_clock() - fw0;
             if (finish_failed) {
                 result = moe_fail("layer %d: the read of expert %d did not complete",
                                   weights->plan.layer, jobs[slot].key.expert);
@@ -5656,10 +5665,13 @@ static int moe_token_pipeline(float *output,
                      * miss count is known, by the q* pass below */
                     coli_v4_gpu_expert_peek(store, &views[current]);
                 else {
-                    double at0 = v4_dec_now();
+                    double at0 = v4_wait_clock();
+                    unsigned long long uploads = coli_v4_gpu_expert_uploads();
                     coli_v4_gpu_expert_attach(store, &views[current]);
-                    g_v4_dec_attach_s += v4_dec_now() - at0;
-                    g_v4_dec_attaches++;
+                    if (dec) {
+                        g_v4_dec_attach_s += v4_wait_clock() - at0;
+                        g_v4_dec_uploads += coli_v4_gpu_expert_uploads() - uploads;
+                    }
                 }
             }
 #endif
@@ -5687,6 +5699,7 @@ static int moe_token_pipeline(float *output,
         int lanes = dual_loader_lanes(), nlazy = 0;
         for (int i = 0; i < selected; i++)
             if (!leased[i]) fetch[nlazy++] = i;
+        if (dec) g_v4_dec_store_fetches += (unsigned long long)nlazy;
         for (int f = 0; f < nlazy && f < lanes; f++)
             if (v4_lane_start(jobs, loaders, loader_active, f, store,
                               views[fetch[f]].key) != 0) {
@@ -5697,8 +5710,11 @@ static int moe_token_pipeline(float *output,
         for (int f = 0; !result && f < nlazy; f++) {
             int current = fetch[f];
             int slot = f % lanes;
-            if (!loader_active[slot] ||
-                profiled_expert_load_finish(&loaders[slot]) != 0) {
+            double fw0 = v4_wait_clock();
+            int finish_failed = !loader_active[slot] ||
+                profiled_expert_load_finish(&loaders[slot]) != 0;
+            if (dec) g_v4_dec_fetch_s += v4_wait_clock() - fw0;
+            if (finish_failed) {
                 result = moe_fail("layer %d: the read of expert %d did not complete",
                                   weights->plan.layer, jobs[slot].key.expert);
                 break;
@@ -5783,9 +5799,8 @@ static int moe_token_pipeline(float *output,
         if (hybrid_gpu_count == selected)
             gpu_compute = 1;    /* every expert made it: use the fused path */
     }
-    double gpu_t0 = v4_dec_now();
-    int gpu_timed = !result && gpu_compute && store->gpu;
     if (!result && gpu_compute && store->gpu) {
+        double gpu_t0 = v4_wait_clock();
         void *sg = coli_v4_layer_gpu(weights, "ffn.shared_experts.w1");
         void *su = coli_v4_layer_gpu(weights, "ffn.shared_experts.w3");
         void *sd = coli_v4_layer_gpu(weights, "ffn.shared_experts.w2");
@@ -5833,7 +5848,7 @@ static int moe_token_pipeline(float *output,
                     output[i] = coli_bf16_round(expert_output[i]);
         }
         free(gates); free(ups); free(downs);
-        if (gpu_timed) g_v4_dec_gpu_s += v4_dec_now() - gpu_t0;
+        if (dec) g_v4_dec_gpu_s += v4_wait_clock() - gpu_t0;
     } else if (!result && hybrid_gpu_count > 0 && store->gpu) {
         /* Hybrid split: the GPU computes the resident subset as one weighted
          * group while the CPU computes the rest; the two partial sums merge
@@ -5979,6 +5994,7 @@ static int moe_token_pipeline(float *output,
             if (!leased[i]) fetch[nvram++] = expert_ids[i];
         if (nvram)
             coli_v4_expert_store_note_vram(store, weights->plan.layer, fetch, nvram);
+        if (dec) g_v4_gpu_first_hits += (unsigned long long)nvram;
     }
 #endif
     if (views)
@@ -5986,8 +6002,10 @@ static int moe_token_pipeline(float *output,
             if (leased && leased[current])
                 coli_expert_release(store, &views[current]);
     free(views); free(leased); free(fetch);
-    g_v4_dec_total_s += v4_dec_now() - dec_t0;
-    g_v4_dec_calls++;
+    if (dec) {
+        g_v4_dec_total_s += v4_wait_clock() - dec_t0;
+        g_v4_dec_calls++;
+    }
 #if defined(COLI_VULKAN)
     v4_vk_token_free(&vk_step);
 #endif
@@ -11611,6 +11629,12 @@ static uint64_t g_v4_mirror_clock;
 static uint64_t v4_mirror_tick(void) {
     return __atomic_add_fetch(&g_v4_mirror_clock, 1, __ATOMIC_RELAXED);
 }
+/* Mirror uploads, every cache (coli_v4_gpu_expert_uploads). Uploads happen on
+ * the generation thread only. */
+static unsigned long long g_v4_mirror_uploads;
+unsigned long long coli_v4_gpu_expert_uploads(void) {
+    return g_v4_mirror_uploads;
+}
 /* Peer mirror pool (DSV4_CUDA_PEER_DEVICE): a second cache on another GPU
  * whose mirrors the fused MoE reads in place over P2P/NVLink. */
 static V4GpuExpertMirrorCache *g_v4_peer_mirrors;
@@ -11800,6 +11824,7 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
                 cache->entries[found].layer = view->key.layer;
                 cache->entries[found].expert = view->key.expert;
                 cache->entries[found].clock = v4_mirror_tick();
+                g_v4_mirror_uploads++;
                 view->gate.gpu = cache->entries[found].gate;
                 view->up.gpu = cache->entries[found].up;
                 view->down.gpu = cache->entries[found].down;
@@ -11853,6 +11878,7 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
         cache->entries[found].gate = gate;
         cache->entries[found].up = up;
         cache->entries[found].down = down;
+        g_v4_mirror_uploads++;
     }
     cache->entries[found].clock = v4_mirror_tick();
     view->gate.gpu = cache->entries[found].gate;
@@ -14603,8 +14629,10 @@ static int target_token(ColiV4Engine *engine, float **state_ptr, float **next_pt
                         ColiExpertStore *experts, int token, int position,
                         char *error, size_t error_size) {
     double t0 = spec_now();
+    g_v4_dec_counting = 1;   /* the decode MoE counters: decode forwards only */
     int result = target_token_impl(engine, state_ptr, next_ptr, attention, index, config,
                                    experts, token, position, error, error_size);
+    g_v4_dec_counting = 0;
     g_v4_prof_block_s += spec_now() - t0;
     g_v4_prof_forwards += 1;
     return result;
@@ -16942,29 +16970,32 @@ static void v4_serve_finish(ColiV4Engine *engine, ColiV4Session *session,
     double attention_s = (g_v4_prof_block_s - marks->block) - expert_matmul_s - expert_wait_s;
     if (attention_s < 0.0) attention_s = 0.0;
     {   /* V4_SERVE_STATS_LOG=1: the turn's DONE/PROF numbers on stderr too (the
-         * gateway consumes stdout), for decode benchmarking from the serve log. */
+         * gateway consumes stdout), for decode benchmarking from the serve log.
+         * v4_dec_moe: process totals of the single-token decode MoE
+         * (deepseek_v4_internal.h). v4_serve_turn: decode_s and tok_s are the
+         * decode's, hit% and the expert and attention seconds the whole turn's,
+         * prefill included (as DONE/PROF), and *_total are process totals of
+         * the decode experts computed from VRAM without a store lookup
+         * (V4_GPU_RESIDENT_FIRST) and of those fetched from the store. */
         static int stats_log = -1;
         if (stats_log < 0) {
             const char *setting = getenv("V4_SERVE_STATS_LOG");
             stats_log = setting && atoi(setting) > 0;
         }
-        extern unsigned long long g_v4_gpu_first_hits, g_v4_gpu_first_fetches;
-        extern double g_v4_dec_fetch_s, g_v4_dec_attach_s, g_v4_dec_gpu_s, g_v4_dec_total_s;
-        extern unsigned long long g_v4_dec_attaches, g_v4_dec_calls;
         if (stats_log)
             fprintf(stderr, "v4_dec_moe calls=%llu total_s=%.2f fetch_wait_s=%.2f "
-                    "attach_s=%.2f attaches=%llu gpu_s=%.2f (cumulative)\n",
+                    "attach_s=%.2f uploads=%llu gpu_s=%.2f (cumulative)\n",
                     g_v4_dec_calls, g_v4_dec_total_s, g_v4_dec_fetch_s,
-                    g_v4_dec_attach_s, g_v4_dec_attaches, g_v4_dec_gpu_s);
+                    g_v4_dec_attach_s, g_v4_dec_uploads, g_v4_dec_gpu_s);
         if (stats_log)
             fprintf(stderr, "v4_serve_turn prompt=%d completion=%d decode_s=%.2f "
                     "tok_s=%.3f hit=%.1f%% expert_disk_s=%.2f expert_wait_s=%.2f "
                     "expert_matmul_s=%.2f attention_s=%.2f rss_gb=%.1f "
-                    "vram_first_hits=%llu store_fetches=%llu (cumulative)\n",
+                    "vram_first_hits_total=%llu store_fetches_total=%llu\n",
                     prompt_tokens, completion, decode,
                     decode > 0.0 ? completion / decode : 0.0, hit_rate,
                     expert_disk_s, expert_wait_s, expert_matmul_s, attention_s,
-                    v4_serve_rss_gb(), g_v4_gpu_first_hits, g_v4_gpu_first_fetches);
+                    v4_serve_rss_gb(), g_v4_gpu_first_hits, g_v4_dec_store_fetches);
     }
     v4_prof_emit(elapsed, prompt_tokens, completion,
                  expert_disk_s, expert_wait_s, expert_matmul_s, attention_s,
