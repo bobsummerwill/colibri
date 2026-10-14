@@ -5782,10 +5782,14 @@ static int moe_token_pipeline(float *output,
                  * recomputed those experts on the primary and succeeded):
                  * compute the routed experts from host data on the CPU, as
                  * the path without GPU compute does. Its mirrors are misses
-                 * from the next lookup on. */
+                 * from the next lookup on. The views drop their mirror
+                 * handles: coli_v4_expert_forward_ref would otherwise hand
+                 * the peer's back to the backend's matvec. */
                 result = v4_views_fetch_host(store, views, leased, selected,
                                              weights->plan.layer);
                 for (int current = 0; !result && current < selected; current++) {
+                    views[current].gate.gpu = views[current].up.gpu =
+                        views[current].down.gpu = NULL;
                     result = coli_v4_expert_forward_ref(
                         expert_output, &views[current], input,
                         expert_weights[current], config->swiglu_limit);

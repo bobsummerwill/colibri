@@ -13,8 +13,9 @@
  * the call fails cleanly, so the engine can fall back to host copies. Either
  * way the peer is latched off once, with one log line: dsv4_cuda_peer_healthy
  * turns 0, peer compute and peer access report 0, tensors on the peer are
- * refused, and an all-on-primary call right after gives the reference bytes
- * (no stale error left behind).
+ * refused (the MoE, the expert group and the matvec the engine's CPU
+ * fallback could reach), and an all-on-primary call right after gives the
+ * reference bytes (no stale error left behind).
  *
  * The backend reads those variables once per process, so the test re-runs
  * itself once per scenario ("--child <name>"). Needs two devices with peer
@@ -90,8 +91,10 @@ static int child(const char *mode){
             fprintf(stderr,"%s: after the fault: healthy %d, compute %d, access %d (want 0 0 0)\n",mode,dsv4_cuda_peer_healthy(q),dsv4_cuda_peer_compute(p,q),dsv4_cuda_peer_access(p,q));return 7;}
         MASK(0x05);if(dsv4_cuda_moe(g,u,d,wt,E,sg,su,sd,10.f,got,x)){fprintf(stderr,"%s: a latched peer's tensors were used\n",mode);return 8;}
         if(dsv4_cuda_expert_group(gQ,uQ,dQ,wt,E,10.f,got,x)){fprintf(stderr,"%s: the expert group ran on the latched peer\n",mode);return 8;}
+        if(dsv4_cuda_matvec_grouped(gQ[0],got,x,1)){fprintf(stderr,"%s: a matvec ran on the latched peer\n",mode);return 8;}
         memset(got,0,sizeof got);if(!dsv4_cuda_moe(gP,uP,dP,wt,E,sg,su,sd,10.f,got,x)||!SAME()){fprintf(stderr,"%s: all-on-primary after the latch differs\n",mode);return 9;}
         if(!dsv4_cuda_expert_group(gP,uP,dP,wt,E,10.f,got,x)){fprintf(stderr,"%s: the expert group on the primary failed after the latch\n",mode);return 9;}
+        if(!dsv4_cuda_matvec_grouped(gP[0],got,x,1)){fprintf(stderr,"%s: a matvec on the primary failed after the latch\n",mode);return 9;}
         printf("%s: failing call %s; peer reported unhealthy and refused, primary unaffected\n",mode,soft?"bit-identical (recomputed on the primary)":"refused (host-data fallback)");
     }
     for(int e=0;e<E;e++){dsv4_cuda_tensor_free(gP[e]);dsv4_cuda_tensor_free(uP[e]);dsv4_cuda_tensor_free(dP[e]);dsv4_cuda_tensor_free(gQ[e]);dsv4_cuda_tensor_free(uQ[e]);dsv4_cuda_tensor_free(dQ[e]);}
