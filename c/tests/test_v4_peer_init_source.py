@@ -3,8 +3,8 @@
 tests/test_dsv4_peer_init_cuda.cu checks the behaviour on real GPUs; this
 pins the shape that a CPU-only CI host can see:
 
-- the engine settles the peer pool BEFORE any init (dsv4_cuda_peer_probe),
-  so a refused peer is never initialised;
+- the engine settles the peer pool BEFORE any init (DSV4_HYBRID=1 first, then
+  dsv4_cuda_peer_probe), so a refused peer is never initialised;
 - it never calls dsv4_cuda_shutdown() between the failed two-device init and
   the single-device retry (on Windows the loader's shutdown unloads the DLL);
 - with the peer unset the engine still makes exactly PR #1's single init;
@@ -34,8 +34,10 @@ class V4PeerInitSourceTest(unittest.TestCase):
 
     def test_the_peer_is_settled_before_any_init(self):
         body = self.open_body()
+        hybrid = body.index("coli_v4_hybrid_enabled()")
         probe = body.index("dsv4_cuda_peer_probe(device, peer,")
         pair = body.index("dsv4_cuda_init(devices, 2)")
+        self.assertLess(hybrid, probe)
         self.assertLess(probe, pair)
         self.assertEqual(body.count("dsv4_cuda_init("), 2)
         self.assertIn("int ndevices = 1;", body)
