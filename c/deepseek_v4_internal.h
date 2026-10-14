@@ -690,6 +690,24 @@ void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer);
 extern int (*coli_v4_expert_store_ram_first)(int layer, int expert);
 extern void (*coli_v4_expert_store_ram_gave)(void);
 
+/* VRAM-first decode (V4_GPU_RESIDENT_FIRST, the CUDA tier). An expert mirrored
+ * in VRAM is computed without a store lookup, so:
+ *   note_vram  counts the routings decode served from VRAM, once per
+ *              token-layer, where a lookup counts its routing (the .coli_usage
+ *              history, the dashboard's HITS and heat), but not as a request,
+ *              hit or miss (those describe the RAM cache) nor in the pin
+ *              ranking's usage (the store's own demand). No-op on another
+ *              ExpertStore backend.
+ *   vram_held  when set, marks held[expert] for each expert of `layer` that
+ *              decode would compute from VRAM, and the RAM pin ranking leaves
+ *              those out: a pin would hold a RAM slot that is never read.
+ *              Called with the store's lock held, from whichever thread looks
+ *              an expert up; NULL unless the CUDA tier set it at engine open. */
+void coli_v4_expert_store_note_vram(ColiExpertStore *store, int layer,
+                                    const int *experts, int count);
+extern void (*coli_v4_expert_store_vram_held)(ColiExpertStore *store, int layer,
+                                              unsigned char *held, int experts);
+
 #ifdef COLI_VULKAN
 /* The Vulkan routed-expert tier (vk_tier.c, Makefile.deepseek-v4 VK=1). The MoE
  * units reach it through this table, which the engine's own unit fills when
@@ -1015,6 +1033,9 @@ int coli_v4_gpu_expert_peek(ColiExpertStore *store, ColiExpertView *view);
 /* 1 while a peer mirror pool (DSV4_CUDA_PEER_DEVICE) is in use, 0 without
  * one or once a peer-side CUDA failure latched its device off. */
 int coli_v4_gpu_peer_pool_up(void);
+/* V4_GPU_RESIDENT_FIRST=1: decode computes an expert mirrored in VRAM without
+ * asking the store (block unit; the GPU unit reads it at engine open). */
+int coli_v4_gpu_resident_first(void);
 /* DSV4_HYBRID=1 gate plus its cross-unit counters/EMAs: defined in the block
  * unit, read by the serve unit's per-turn stderr line. */
 int coli_v4_hybrid_enabled(void);
@@ -1184,6 +1205,7 @@ extern void (*coli_v4_test_expert_wait_hook)(ColiExpertKey key);
 extern uint64_t coli_v4_test_fp4_batch_calls;
 extern uint64_t coli_v4_test_expert_victim_probes;
 int coli_v4_test_expert_slot_index(ColiExpertStore *store, ColiExpertKey key);
+int coli_v4_test_expert_pinned(ColiExpertStore *store, ColiExpertKey key);
 void coli_v4_test_reset_direct_io_stats(void);
 uint64_t coli_v4_test_direct_reads(void);
 uint64_t coli_v4_test_direct_fallbacks(void);

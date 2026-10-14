@@ -5381,11 +5381,7 @@ static void v4_vk_token_free(V4VkToken *vk) {
 }
 #endif
 
-/* VRAM-first decode (V4_GPU_RESIDENT_FIRST=1): a routed expert already
- * mirrored in VRAM is computed from the mirror without asking the expert
- * store, so its RAM slot goes cold and the RAM tier holds other experts:
- * VRAM mirrors ADD to the cache instead of duplicating RAM residents.
- * Counters are cumulative (read by the serve stats line). */
+/* VRAM-first decode counters, cumulative (read by the serve stats line). */
 unsigned long long g_v4_gpu_first_hits = 0, g_v4_gpu_first_fetches = 0;
 /* Decode MoE timing (cumulative seconds; serve stats line): store fetch wait,
  * VRAM attach (upload on mirror miss), fused/grouped GPU compute, whole call. */
@@ -5396,7 +5392,15 @@ static double v4_dec_now(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
-static int v4_gpu_resident_first(void) {
+#ifdef COLI_V4_GPU_TIER
+/* VRAM-first decode (V4_GPU_RESIDENT_FIRST=1): a routed expert already
+ * mirrored in VRAM is computed from the mirror without asking the expert
+ * store. The store still records the routing (coli_v4_expert_store_note_vram)
+ * and its RAM pin ranking leaves mirrored experts out
+ * (coli_v4_expert_store_vram_held), so their RAM slots age out of the LRU and
+ * the RAM tier holds experts that are not in VRAM: VRAM mirrors ADD to the
+ * cache instead of duplicating RAM residents. */
+int coli_v4_gpu_resident_first(void) {
     static int on = -1;
     if (on < 0) {
         const char *setting = getenv("V4_GPU_RESIDENT_FIRST");
@@ -5404,6 +5408,7 @@ static int v4_gpu_resident_first(void) {
     }
     return on;
 }
+#endif
 
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
 /* Hand `key` to loader lane `slot`; its job reads -1 until the lane has run. */
@@ -5622,7 +5627,7 @@ static int moe_token_pipeline(float *output,
         memset(views, 0, (size_t)alloc_n * sizeof(*views));
         int first = 0;
 #ifdef COLI_V4_GPU_TIER
-        first = store->gpu && v4_gpu_resident_first() && !coli_v4_hybrid_enabled();
+        first = store->gpu && coli_v4_gpu_resident_first() && !coli_v4_hybrid_enabled();
 #endif
         for (int i = 0; i < selected; i++) {
             views[i].key = (ColiExpertKey){weights->plan.layer, expert_ids[i]};
@@ -6006,6 +6011,16 @@ static int moe_token_pipeline(float *output,
      * copies read from. (The fused kernels sync internally, so this is only
      * ever a wait on already-finished work — never a correctness gamble.) */
     if (hybrid_pending_drain) coli_v4_gpu_expert_drain(store);
+    /* A view still without a lease was computed from VRAM (VRAM-first): its
+     * routing never reached the store, which counts it here, once per
+     * token-layer (fetch[] is free again: it carries the expert ids). */
+    if (!result) {
+        int nvram = 0;
+        for (int i = 0; i < selected; i++)
+            if (!leased[i]) fetch[nvram++] = expert_ids[i];
+        if (nvram)
+            coli_v4_expert_store_note_vram(store, weights->plan.layer, fetch, nvram);
+    }
 #endif
     if (views)
         for (int current = 0; current < selected; current++)
@@ -9586,19 +9601,29 @@ static void hot_repin_locked(V4HotPolicy *policy, V4ExpertStoreState *state,
     uint64_t *usage = policy->usage +
         (size_t)layer * state->experts_per_layer;
     int *pins = policy->pins + (size_t)layer * policy->pin_count;
+    /* VRAM-first decode computes a mirrored expert without asking the store:
+     * its RAM slot is left out of the ranking, so it is neither pinned nor
+     * refreshed here and ages out of the LRU (coli_v4_expert_store_vram_held;
+     * on allocation failure, rank as before). */
+    unsigned char *in_vram = NULL;
+    if (coli_v4_expert_store_vram_held &&
+        (in_vram = calloc((size_t)state->experts_per_layer, 1)))
+        coli_v4_expert_store_vram_held(policy->store, layer, in_vram,
+                                       state->experts_per_layer);
     for (int rank = 0; rank < policy->pin_count; rank++) {
         int best = -1;
         for (int expert = 0; expert < state->experts_per_layer; expert++) {
             int already = 0;
             for (int prior = 0; prior < rank; prior++)
                 if (pins[prior] == expert) { already = 1; break; }
-            if (!already && usage[expert] &&
+            if (!already && usage[expert] && !(in_vram && in_vram[expert]) &&
                 (best < 0 || usage[expert] > usage[best] ||
                  (usage[expert] == usage[best] && expert < best)))
                 best = expert;
         }
         pins[rank] = best;
     }
+    free(in_vram);
     for (int rank = 0; rank < policy->pin_count; rank++) {
         int expert = pins[rank];
         if (expert < 0) continue;
@@ -9868,6 +9893,17 @@ int coli_v4_test_expert_slot_index(ColiExpertStore *store, ColiExpertKey key) {
     return result;
 }
 
+/* 1 when the hot policy pins {layer, expert} in RAM now, -1 without one. */
+int coli_v4_test_expert_pinned(ColiExpertStore *store, ColiExpertKey key) {
+    V4HotPolicy *policy = store && store->state ? hot_find(store) : NULL;
+    if (!policy) return -1;
+    V4ExpertStoreState *state = store->state;
+    pthread_mutex_lock(&state->mutex);
+    int pinned = hot_is_pinned(policy, key.layer, key.expert);
+    pthread_mutex_unlock(&state->mutex);
+    return pinned;
+}
+
 void coli_v4_test_reset_direct_io_stats(void) {
     __atomic_store_n(&v4_direct_reads, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&v4_direct_flock_reads, 0, __ATOMIC_RELAXED);
@@ -9920,6 +9956,29 @@ void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer) {
 
 int (*coli_v4_expert_store_ram_first)(int layer, int expert);   /* exclusive RAM/VRAM: NULL unless a Vulkan tier sets it */
 void (*coli_v4_expert_store_ram_gave)(void);
+/* VRAM-first decode (deepseek_v4_internal.h): NULL unless the CUDA tier sets it */
+void (*coli_v4_expert_store_vram_held)(ColiExpertStore *store, int layer,
+                                       unsigned char *held, int experts);
+
+/* The routings VRAM-first decode served from VRAM, one call per token-layer:
+ * the history and the dashboard's view of them stay the routing's, as a
+ * lookup records them. stats, usage and layer_requests are left alone: they
+ * describe what the store itself was asked for. */
+void coli_v4_expert_store_note_vram(ColiExpertStore *store, int layer,
+                                    const int *experts, int count) {
+    if (!store || !store->state || !experts || count < 1 || !hot_find(store)) return;
+    V4ExpertStoreState *state = store->state;
+    if (layer < 0 || layer >= state->layers) return;
+    pthread_mutex_lock(&state->mutex);
+    for (int i = 0; state->ehit && i < count; i++) {
+        if (experts[i] < 0 || experts[i] >= state->experts_per_layer) continue;
+        size_t index = (size_t)layer * state->experts_per_layer + experts[i];
+        state->ehit[index] = 1;
+        if (state->eheat && state->eheat[index] < 63) state->eheat[index]++;
+    }
+    rt_count(layer, experts, count);   /* skips ids outside the layer */
+    pthread_mutex_unlock(&state->mutex);
+}
 
 #ifdef COLI_VULKAN
 /* The Vulkan routed-expert tier's side of the store (deepseek_v4_internal.h). A
@@ -11045,6 +11104,8 @@ typedef struct V4GpuExpertMirrorCache V4GpuExpertMirrorCache;
  * place over P2P/NVLink (dsv4_cuda_peer_compute says which). */
 static V4GpuExpertMirrorCache *g_v4_peer_mirrors;
 static V4GpuExpertMirrorCache *v4_peer_mirrors_create(int device, int primary);
+static void v4_gpu_expert_vram_held(ColiExpertStore *store, int layer,
+                                    unsigned char *held, int experts);
 static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_capacity(
     int device, int capacity);
 static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create(int device,
@@ -11133,6 +11194,11 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     if (engine->experts && !engine->experts->gpu)
         engine->experts->gpu =
             v4_gpu_expert_mirrors_create(device, mirror_suggested);
+    /* VRAM-first decode never asks the store for a mirrored expert: its RAM
+     * pin ranking leaves them out (the peer pool's too, once there is one). */
+    if (engine->experts && engine->experts->gpu &&
+        coli_v4_gpu_resident_first() && !coli_v4_hybrid_enabled())
+        coli_v4_expert_store_vram_held = v4_gpu_expert_vram_held;
     if (ndevices == 2 && engine->experts && engine->experts->gpu && !g_v4_peer_mirrors) {
         /* The probe checked access both ways; this is what init enabled. A
          * pool refused from here on (no primary cache, an allocation, a
@@ -11170,6 +11236,7 @@ void coli_v4_gpu_engine_close(ColiV4Engine *engine) {
         }
         engine->gpu.layer_ready[layer] = 0;
     }
+    coli_v4_expert_store_vram_held = NULL;   /* it scans the caches freed here */
     if (engine->experts && engine->experts->gpu) {
         v4_gpu_expert_mirrors_free(
             (V4GpuExpertMirrorCache *)engine->experts->gpu);
@@ -11995,6 +12062,30 @@ static int v4_mirror_peek_cache(V4GpuExpertMirrorCache *cache, ColiExpertView *v
     }
     pthread_mutex_unlock(&cache->mutex);
     return -1;
+}
+/* coli_v4_expert_store_vram_held (VRAM-first decode): the experts of `layer`
+ * with a live mirror in the store's cache or in the peer pool (while its
+ * device is healthy: v4_peer_pool, like peek). It runs on any thread that
+ * looks an expert up, with the store's lock held, and takes only the caches'
+ * own locks; nothing that holds one of those calls the store. */
+static void v4_gpu_expert_vram_held(ColiExpertStore *store, int layer,
+                                    unsigned char *held, int experts) {
+    if (!store || !store->gpu || !held) return;
+    V4GpuExpertMirrorCache *caches[2] = {
+        (V4GpuExpertMirrorCache *)store->gpu, v4_peer_pool()};
+    for (int c = 0; c < 2; c++) {
+        V4GpuExpertMirrorCache *cache = caches[c];
+        if (!cache) continue;
+        pthread_mutex_lock(&cache->mutex);
+        for (int i = 0; i < cache->count; i++) {
+            const V4GpuExpertMirror *entry = &cache->entries[i];
+            if (entry->layer == layer && entry->expert >= 0 &&
+                entry->expert < experts &&
+                entry->gate && entry->up && entry->down)
+                held[entry->expert] = 1;
+        }
+        pthread_mutex_unlock(&cache->mutex);
+    }
 }
 /* The LRU stamp of the mirror a recycle in this cache would replace, or
  * UINT64_MAX when the cache cannot recycle: fewer than V4_MIRROR_RECYCLE_MIN
