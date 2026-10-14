@@ -1392,12 +1392,15 @@ static int tc_dev_init(Dev*){return 1;}
 extern "C" int dsv4_cuda_peer_access(int a,int b){return a!=b&&dev_ok(a,b)&&dev_ok(b,a);}
 /* Asked BEFORE dsv4_cuda_init (DSV4_CUDA_PEER_DEVICE), so a peer that is
  * refused is never initialised: both ordinals visible, distinct and < 16 (the
- * size of g_peer), a compute capability this build accepts
+ * size of g_peer), a compute capability this build accepts for each
  * (dsv4_cuda_backend_arch_ok), peer access in both directions, and a kernel
- * image for the peer in this binary (cudaFuncGetAttributes: "no kernel image"
- * or "invalid device function" otherwise). Only that last check needs a
- * context on the peer; on refusal it is destroyed again unless the backend
- * already holds a device. 1 = usable; 0 = refused, the reason in why. */
+ * image in this binary for each (cudaFuncGetAttributes: "no kernel image" or
+ * "invalid device function" otherwise). The primary is checked first: one the
+ * build cannot run fails its own init anyway, and its peer must not be left
+ * holding a context for a CPU-only run. Only the kernel-image check makes a
+ * context: the primary's is the one its init creates; the peer's is destroyed
+ * again on refusal unless the backend already holds a device. 1 = usable;
+ * 0 = refused, the reason in why. */
 extern "C" int dsv4_cuda_peer_probe(int device,int peer,char *why,int why_size){
     char none[1];if(!why||why_size<1){why=none;why_size=1;}why[0]=0;
     int count=0;cudaError_t e=cudaGetDeviceCount(&count);
@@ -1406,24 +1409,27 @@ extern "C" int dsv4_cuda_peer_probe(int device,int peer,char *why,int why_size){
     for(int k=0;k<2;k++){int d=k?peer:device;
         if(d<0||d>=count){snprintf(why,why_size,"device %d is not a visible CUDA device (%d visible)",d,count);return 0;}
         if(d>=16){snprintf(why,why_size,"device %d: peer access is tracked for devices 0-15 only",d);return 0;}}
-    cudaDeviceProp p{};
-    if((e=cudaGetDeviceProperties(&p,peer))!=cudaSuccess){cudaGetLastError();snprintf(why,why_size,"peer device %d: %s",peer,cudaGetErrorString(e));return 0;}
-    if(!dsv4_cuda_backend_arch_ok(peer)){
+    cudaDeviceProp p[2]{};const char *role[2]={"primary","peer"};
+    for(int k=0;k<2;k++){int d=k?peer:device;
+        if((e=cudaGetDeviceProperties(&p[k],d))!=cudaSuccess){cudaGetLastError();snprintf(why,why_size,"%s device %d: %s",role[k],d,cudaGetErrorString(e));return 0;}
+        if(!dsv4_cuda_backend_arch_ok(d)){
 #ifdef COLI_DSV4_DEEPGEMM
-        snprintf(why,why_size,"peer device %d (%s, sm_%d%d): the %s backend runs on sm_120 only (pair other cards with the generic build: no DEEPGEMM)",peer,p.name,p.major,p.minor,dsv4_cuda_backend_name());
+            snprintf(why,why_size,"%s device %d (%s, sm_%d%d): the %s backend runs on sm_120 only (pair other cards with the generic build: no DEEPGEMM)",role[k],d,p[k].name,p[k].major,p[k].minor,dsv4_cuda_backend_name());
 #else
-        snprintf(why,why_size,"peer device %d (%s, sm_%d%d): the generic kernels need sm_60 or newer",peer,p.name,p.major,p.minor);
+            snprintf(why,why_size,"%s device %d (%s, sm_%d%d): the generic kernels need sm_60 or newer",role[k],d,p[k].name,p[k].major,p[k].minor);
 #endif
-        return 0;}
+            return 0;}}
     int ab=0,ba=0;
     if((e=cudaDeviceCanAccessPeer(&ab,device,peer))!=cudaSuccess||(e=cudaDeviceCanAccessPeer(&ba,peer,device))!=cudaSuccess){cudaGetLastError();snprintf(why,why_size,"peer query %d<->%d: %s",device,peer,cudaGetErrorString(e));return 0;}
     if(!ab||!ba){snprintf(why,why_size,"no peer access %d%s%d (P2P needs NVLink or a P2P-capable PCIe path; nvidia-smi topo -p2p r shows it)",ab?peer:device,!ab&&!ba?"<->":"->",ab?device:peer);return 0;}
-    if((e=cudaSetDevice(peer))==cudaSuccess){cudaFuncAttributes fa;e=cudaFuncGetAttributes(&fa,(const void*)mv_fp4_grouped<4>);}
-    if(e!=cudaSuccess){cudaGetLastError();if(!ng&&cudaSetDevice(peer)==cudaSuccess)cudaDeviceReset();cudaGetLastError();
+    for(int k=0;k<2;k++){int d=k?peer:device;
+        if((e=cudaSetDevice(d))==cudaSuccess){cudaFuncAttributes fa;e=cudaFuncGetAttributes(&fa,(const void*)mv_fp4_grouped<4>);}
+        if(e==cudaSuccess)continue;
+        cudaGetLastError();if(k&&!ng&&cudaSetDevice(peer)==cudaSuccess)cudaDeviceReset();cudaGetLastError();
 #ifdef COLI_DSV4_DEEPGEMM
-        snprintf(why,why_size,"peer device %d (%s, sm_%d%d): %s (this %s build carries sm_120a code only; pair other cards with the generic build: no DEEPGEMM)",peer,p.name,p.major,p.minor,cudaGetErrorString(e),dsv4_cuda_backend_name());
+        snprintf(why,why_size,"%s device %d (%s, sm_%d%d): %s (this %s build carries sm_120a code only; pair other cards with the generic build: no DEEPGEMM)",role[k],d,p[k].name,p[k].major,p[k].minor,cudaGetErrorString(e),dsv4_cuda_backend_name());
 #else
-        snprintf(why,why_size,"peer device %d (%s, sm_%d%d): %s (this build has no code for it; rebuild with a CUDA_ARCH that covers sm_%d%d, e.g. CUDA_ARCH=%s)",peer,p.name,p.major,p.minor,cudaGetErrorString(e),p.major,p.minor,p.major<8?"portable-pre-ampere NO_TC=1":"portable");
+        snprintf(why,why_size,"%s device %d (%s, sm_%d%d): %s (this build has no code for it; rebuild with a CUDA_ARCH that covers sm_%d%d, e.g. CUDA_ARCH=%s)",role[k],d,p[k].name,p[k].major,p[k].minor,cudaGetErrorString(e),p[k].major,p[k].minor,p[k].major<8?"portable-pre-ampere NO_TC=1":"portable");
 #endif
         return 0;}
     return 1;}

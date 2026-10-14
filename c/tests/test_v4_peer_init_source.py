@@ -4,7 +4,8 @@ tests/test_dsv4_peer_init_cuda.cu checks the behaviour on real GPUs; this
 pins the shape that a CPU-only CI host can see:
 
 - the engine settles the peer pool BEFORE any init (DSV4_HYBRID=1 first, then
-  dsv4_cuda_peer_probe), so a refused peer is never initialised;
+  dsv4_cuda_peer_probe), so a refused peer is never initialised, and the probe
+  checks the primary before it touches the peer;
 - it never calls dsv4_cuda_shutdown() between the failed two-device init and
   the single-device retry (on Windows the loader's shutdown unloads the DLL);
 - with the peer unset the engine still makes exactly PR #1's single init;
@@ -79,13 +80,18 @@ class V4PeerInitSourceTest(unittest.TestCase):
     def test_probe_checks_before_any_context(self):
         probe = function_body(self.backend, 'extern "C" int dsv4_cuda_peer_probe(', "\n    return 1;}")
         order = [probe.index(s) for s in (
-            "cudaGetDeviceCount(", "peer==device", "dsv4_cuda_backend_arch_ok(peer)",
+            "cudaGetDeviceCount(", "peer==device", "dsv4_cuda_backend_arch_ok(d)",
             "cudaDeviceCanAccessPeer(&ab,device,peer)", "cudaDeviceCanAccessPeer(&ba,peer,device)",
-            "cudaSetDevice(peer)", "cudaFuncGetAttributes(")]
+            "cudaSetDevice(d)", "cudaFuncGetAttributes(")]
         self.assertEqual(order, sorted(order))
-        # the kernel-image check is the only one that makes a context: undone on refusal
+        # architecture and kernel image for both devices, the primary first, so
+        # a primary the build cannot run never gets its peer touched
+        self.assertEqual(probe.count("for(int k=0;k<2;k++){int d=k?peer:device;"), 3)
+        self.assertIn('const char *role[2]={"primary","peer"};', probe)
+        # the kernel-image check is the only one that makes a context: the
+        # peer's is undone on refusal (the primary's is the one its init makes)
         self.assertEqual(len(re.findall(r"cudaSetDevice\(", probe)), 2)
-        self.assertIn("if(!ng&&cudaSetDevice(peer)==cudaSuccess)cudaDeviceReset();", probe)
+        self.assertIn("if(k&&!ng&&cudaSetDevice(peer)==cudaSuccess)cudaDeviceReset();", probe)
 
 
 if __name__ == "__main__":

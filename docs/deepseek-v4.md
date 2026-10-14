@@ -333,11 +333,12 @@ VRAM into a real tier:
   output row is written into the primary GPU's reduce buffer. Results are
   bit-identical to computing every expert on one GPU. GPU N is checked before
   anything is set up on it (a visible device other than the primary, peer
-  access both ways, an architecture and kernel image the build runs); when it
-  fails, it is left untouched, decode runs on the primary alone, and the
-  `peer mirror pool off:` warning gives the reason and, for a missing kernel
-  image, the `CUDA_ARCH` to rebuild with. With `DSV4_HYBRID=1` there is no
-  peer pool: hybrid decode uploads only into the primary GPU's mirrors.
+  access both ways, and on both GPUs, the primary's first, an architecture
+  and kernel image the build runs); when a check fails, GPU N is left
+  untouched, decode runs without it, and the `peer mirror pool off:` warning
+  gives the reason and, for a missing kernel image, the `CUDA_ARCH` to
+  rebuild with. With `DSV4_HYBRID=1` there is no peer pool: hybrid decode
+  uploads only into the primary GPU's mirrors.
 
 Measured on the REAP 150B setup above (2× RTX 3090 with an NVLink bridge,
 `--ram 40`, six 300-token answers, greedy; answers identical in every run):
