@@ -11702,10 +11702,10 @@ void coli_v4_gpu_moe_batch_hint(int total_fresh_tokens) {
     v4_gpu_moe_batch_hint_tokens = total_fresh_tokens;
 }
 
-int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
-                       const uint16_t *gate, const float *bias,
-                       const int *forced_indices, int experts, int dimension,
-                       int topk, float route_scale);
+int coli_v4_route_bf16_logits(float *weights, int *indices, const float *hidden,
+                              const uint16_t *gate, const float *bias,
+                              const int *forced_indices, int experts, int dimension,
+                              int topk, float route_scale, const float *logits);
 
 /* The expert bank exists only while a large prefill runs: it is ~2.2 GiB of
  * VRAM that decode never touches, and holding it clamps the decode expert
@@ -12024,24 +12024,56 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
         /* Tokens route independently (the router keeps only stack state), so
          * the chunk spreads over the OpenMP team; each token's gate dot
          * products keep their serial order, so routing stays bit-identical
-         * to the CPU union and to decode. */
+         * to the CPU union and, in builds without Vulkan, to decode's CPU
+         * router. */
+        const int experts = config->n_routed_experts;
+        float *logits = NULL;
+        int route_team = batch >= 16;
+#ifdef COLI_VULKAN
+        /* With the Vulkan matmul hook set, the CPU union projects the whole
+         * batch's gate logits in one device call, and the hook refuses calls
+         * from inside an OpenMP team (each token would silently fall back to
+         * CPU dot products): take the logits the union's way, on this thread.
+         * If the device declines the batch, the union lets each token's
+         * router offer it a GEMV: when it takes one (token 0's, tried here)
+         * the loop stays serial so every token gets its own; otherwise all
+         * of them compute on the CPU and the team keeps them. The device's
+         * batched GEMM need not round like decode's per-token GEMV. */
+        if (batch > 1 && coli_v4_vk_matmul) {
+            logits = malloc((size_t)batch * experts * sizeof(*logits));
+            if (!logits) {
+                route_team = 0;
+            } else if (coli_v4_vk_matmul(11, raw_gate, NULL, 0, experts,
+                                         config->hidden_size, logits, inputs,
+                                         batch) != 0) {
+                if (coli_v4_vk_matmul(11, raw_gate, NULL, 0, experts,
+                                      config->hidden_size, logits, inputs,
+                                      1) == 0)
+                    route_team = 0;
+                free(logits);
+                logits = NULL;
+            }
+        }
+#endif
         int route_failed = 0;
-#pragma omp parallel for schedule(static) if (batch >= 16) reduction(|:route_failed)
+#pragma omp parallel for schedule(static) if (route_team) reduction(|:route_failed)
         for (int item = 0; item < batch; item++) {
             if (hashed)
                 for (int rank = 0; rank < topk; rank++)
                     ids[item * topk + rank] =
                         (int)table[(size_t)tokens[item] * topk + rank];
-            if (coli_v4_route_bf16(
+            if (coli_v4_route_bf16_logits(
                     route_weights + (size_t)item * topk,
                     ids + (size_t)item * topk,
                     inputs + (size_t)item * config->hidden_size,
                     raw_gate, raw_bias,
                     hashed ? ids + (size_t)item * topk : NULL,
-                    config->n_routed_experts, config->hidden_size, topk,
-                    config->routed_scaling_factor))
+                    experts, config->hidden_size, topk,
+                    config->routed_scaling_factor,
+                    logits ? logits + (size_t)item * experts : NULL))
                 route_failed = 1;
         }
+        free(logits);
         if (route_failed) return -1;
     } else if (!dsv4_cuda_route_top6_batch(
                    in_mirror, gate, bias, batch,
