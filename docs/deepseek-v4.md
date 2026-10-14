@@ -385,8 +385,17 @@ Measured on the REAP 150B setup above (2× RTX 3090 with an NVLink bridge,
 Prefill is unchanged (it runs on the primary GPU's bank). On this box the
 host→GPU uploads run at ~12 GB/s (PCIe 4.0 x8 per card), so an expert read
 from the peer pool beats an upload from RAM by a wide margin.
-`V4_SERVE_STATS_LOG=1` prints per-turn decode stats and the decode MoE split
-(store fetch wait / VRAM attach / GPU) on stderr.
+`V4_SERVE_STATS_LOG=1` prints two lines per turn on stderr. `v4_serve_turn`
+repeats the turn's `DONE`/`PROF` numbers: `decode_s` and `tok_s` are the
+decode's, the hit rate and the expert and attention seconds cover the whole
+turn, prefill included; `vram_first_hits_total` and `store_fetches_total` are
+process totals of the decode's routed experts computed from VRAM without a
+store lookup and fetched from the store. `v4_dec_moe` gives process totals of
+the single-token decode MoE (decode forwards only: prefill chunks, batched
+speculative verify and the `KV_SLOTS` multiplexed decode are not counted):
+token-layers (`calls`), their wall time from routing on, the wait for store
+fetches, the VRAM attach time and the mirror `uploads` it caused, and the
+fused GPU compute.
 
 ## Prefill: segments, chunks, checkpoints
 
@@ -560,7 +569,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_CUDA_PEER_FAULT` (unset, `.cu`) | tests: `n` = the n-th peer-compute pass fails at its join and the peer is latched off (that call recomputes on the primary); `n:lost` = the peer also counts as lost (the call fails, decode takes host copies) |
 | `DSV4_CUDA_PEER_MIRRORS` (4096) / `DSV4_CUDA_PEER_RESERVE_MB` (1024) | peer pool capacity, minimum 8 (a smaller or non-numeric value leaves the pool off) / VRAM kept free on the peer |
 | `DSV4_CUDA_PIN_CAP_GB` (20, `.cu`) | cap on page-locked expert-slab bytes for uploads, in GiB; negative = 0 (nothing pinned), empty or unparsable = 20, at most 1 PiB (no cap) |
-| `V4_SERVE_STATS_LOG` (0) | `1` = per-turn decode stats and decode MoE timing on stderr |
+| `V4_SERVE_STATS_LOG` (0) | `1` = per-turn `v4_serve_turn` (the turn's DONE/PROF numbers, VRAM-first totals) and `v4_dec_moe` (decode MoE totals) lines on stderr |
 
 **Prefill / checkpoints**
 | var | meaning |
