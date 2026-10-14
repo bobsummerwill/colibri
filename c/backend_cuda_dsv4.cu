@@ -1968,12 +1968,48 @@ extern "C" int dsv4_cuda_moe(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *
        !buf((void**)&c->p2,&c->p2cap,ib)||!buf((void**)&c->p3,&c->p3cap,ib)||!buf((void**)&c->p4,&c->p4cap,parts)||
        !ok(cudaMemcpyAsync(c->dx,x,hb,cudaMemcpyHostToDevice,c->stream),"MoE activation upload"))return 0;
     static int batched=-1;if(batched<0)batched=getenv("DSV4_CUDA_BATCHED")?atoi(getenv("DSV4_CUDA_BATCHED")):1;
-    if(batched){MvDesc hd[32];for(int e=0;e<count;e++){hd[2*e]={(uint8_t*)gate[e]->w,gate[e]->scale,c->dx,c->p1+(long long)e*I};hd[2*e+1]={(uint8_t*)up[e]->w,up[e]->scale,c->dx,c->p2+(long long)e*I};}
-        if(!buf((void**)&c->mvdesc,&c->mvdesccap,(size_t)2*count*sizeof(*hd))||!buf((void**)&c->expert_weights,&c->expert_weightscap,(size_t)count*sizeof(float))||
-           !ok(cudaMemcpyAsync(c->mvdesc,hd,(size_t)2*count*sizeof(*hd),cudaMemcpyHostToDevice,c->stream),"MoE descriptors upload")||!ok(cudaMemcpyAsync(c->expert_weights,weights,(size_t)count*sizeof(float),cudaMemcpyHostToDevice,c->stream),"MoE weights upload"))return 0;
-        mv_fp4_grouped<4><<<dim3((I+3)/4,2*count),256,0,c->stream>>>(c->mvdesc,2*count,I,H);expert_act_grouped<<<(count*I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,c->expert_weights,limit,count,I);fp8_sim<<<count*((I+127)/128),128,0,c->stream>>>(c->p3,count,I);
-        for(int e=0;e<count;e++)hd[e]={(uint8_t*)down[e]->w,down[e]->scale,c->p3+(long long)e*I,c->p4+(long long)e*H};if(!ok(cudaMemcpyAsync(c->mvdesc,hd,(size_t)count*sizeof(*hd),cudaMemcpyHostToDevice,c->stream),"MoE down descriptors upload"))return 0;
-        mv_fp4_grouped<4><<<dim3((H+3)/4,count),256,0,c->stream>>>(c->mvdesc,count,H,I);
+    if(batched){
+        /* Peer compute (DSV4_CUDA_PEER_COMPUTE, default 1): routed experts
+         * whose mirrors live on a peer device run THERE on local weights,
+         * concurrently with this device's experts. The token's input goes
+         * over P2P and each expert's down-projection row lands straight in
+         * this device's p4 slot, so the reduce below is unchanged. Same
+         * kernels, same slots, same order: bit-identical to computing every
+         * expert here (=0 reads the peer mirrors in place instead). */
+        static int peer_compute=-1;if(peer_compute<0){const char*v=getenv("DSV4_CUDA_PEER_COMPUTE");peer_compute=v?atoi(v)!=0:1;}
+        int pdev=-1;unsigned char on_peer[16]={0};
+        for(int e=0;e<count;e++){int d=gate[e]->device;
+            if(peer_compute&&d!=sg->device&&up[e]->device==d&&down[e]->device==d&&(pdev<0||pdev==d)&&ctx(d)){pdev=d;on_peer[e]=1;}}
+        Dev*pc=pdev>=0?ctx(pdev):nullptr;
+        if(!buf((void**)&c->mvdesc,&c->mvdesccap,(size_t)2*count*sizeof(MvDesc))||!buf((void**)&c->expert_weights,&c->expert_weightscap,(size_t)count*sizeof(float))||
+           !ok(cudaMemcpyAsync(c->expert_weights,weights,(size_t)count*sizeof(float),cudaMemcpyHostToDevice,c->stream),"MoE weights upload"))return 0;
+        if(pc){
+            MvDesc pd[32];int k=0;
+            if(!ok(cudaEventRecord(c->fork,c->stream),"MoE peer fork")||!ok(cudaSetDevice(pdev),"select MoE peer device")||
+               !buf((void**)&pc->dx,&pc->xcap,hb)||!buf((void**)&pc->p1,&pc->p1cap,ib)||!buf((void**)&pc->p2,&pc->p2cap,ib)||!buf((void**)&pc->p3,&pc->p3cap,ib)||
+               !buf((void**)&pc->mvdesc,&pc->mvdesccap,(size_t)2*count*sizeof(MvDesc))||!buf((void**)&pc->expert_weights,&pc->expert_weightscap,(size_t)count*sizeof(float))||
+               !ok(cudaStreamWaitEvent(pc->stream,c->fork,0),"MoE peer wait")||
+               !ok(cudaMemcpyPeerAsync(pc->dx,pdev,c->dx,sg->device,hb,pc->stream),"MoE peer activation copy")||
+               !ok(cudaMemcpyAsync(pc->expert_weights,weights,(size_t)count*sizeof(float),cudaMemcpyHostToDevice,pc->stream),"MoE peer weights upload")){
+                cudaSetDevice(sg->device);return 0;}
+            for(int e=0;e<count;e++)if(on_peer[e]){pd[k++]={(uint8_t*)gate[e]->w,gate[e]->scale,pc->dx,pc->p1+(long long)e*I};pd[k++]={(uint8_t*)up[e]->w,up[e]->scale,pc->dx,pc->p2+(long long)e*I};}
+            if(!ok(cudaMemcpyAsync(pc->mvdesc,pd,(size_t)k*sizeof(MvDesc),cudaMemcpyHostToDevice,pc->stream),"MoE peer descriptors upload")){cudaSetDevice(sg->device);return 0;}
+            mv_fp4_grouped<4><<<dim3((I+3)/4,k),256,0,pc->stream>>>(pc->mvdesc,k,I,H);
+            expert_act_grouped<<<(count*I+255)/256,256,0,pc->stream>>>(pc->p3,pc->p1,pc->p2,pc->expert_weights,limit,count,I);fp8_sim<<<count*((I+127)/128),128,0,pc->stream>>>(pc->p3,count,I);
+            k=0;for(int e=0;e<count;e++)if(on_peer[e])pd[k++]={(uint8_t*)down[e]->w,down[e]->scale,pc->p3+(long long)e*I,c->p4+(long long)e*H};
+            if(!ok(cudaMemcpyAsync(pc->mvdesc,pd,(size_t)k*sizeof(MvDesc),cudaMemcpyHostToDevice,pc->stream),"MoE peer down descriptors upload")){cudaSetDevice(sg->device);return 0;}
+            mv_fp4_grouped<4><<<dim3((H+3)/4,k),256,0,pc->stream>>>(pc->mvdesc,k,H,I);
+            if(!ok(cudaEventRecord(pc->join,pc->stream),"MoE peer join")||!ok(cudaSetDevice(sg->device),"select MoE device"))return 0;
+        }
+        MvDesc hd[32];int k=0;
+        for(int e=0;e<count;e++)if(!on_peer[e]){hd[k++]={(uint8_t*)gate[e]->w,gate[e]->scale,c->dx,c->p1+(long long)e*I};hd[k++]={(uint8_t*)up[e]->w,up[e]->scale,c->dx,c->p2+(long long)e*I};}
+        if(k){if(!ok(cudaMemcpyAsync(c->mvdesc,hd,(size_t)k*sizeof(*hd),cudaMemcpyHostToDevice,c->stream),"MoE descriptors upload"))return 0;
+            mv_fp4_grouped<4><<<dim3((I+3)/4,k),256,0,c->stream>>>(c->mvdesc,k,I,H);}
+        expert_act_grouped<<<(count*I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,c->expert_weights,limit,count,I);fp8_sim<<<count*((I+127)/128),128,0,c->stream>>>(c->p3,count,I);
+        k=0;for(int e=0;e<count;e++)if(!on_peer[e])hd[k++]={(uint8_t*)down[e]->w,down[e]->scale,c->p3+(long long)e*I,c->p4+(long long)e*H};
+        if(k){if(!ok(cudaMemcpyAsync(c->mvdesc,hd,(size_t)k*sizeof(*hd),cudaMemcpyHostToDevice,c->stream),"MoE down descriptors upload"))return 0;
+            mv_fp4_grouped<4><<<dim3((H+3)/4,k),256,0,c->stream>>>(c->mvdesc,k,H,I);}
+        if(pc&&!ok(cudaStreamWaitEvent(c->stream,pc->join,0),"MoE peer join wait"))return 0;
     }else for(int e=0;e<count;e++){run_mv<4>((uint8_t*)gate[e]->w,gate[e]->scale,c->dx,c->p1+(long long)e*I,I,H,1,c->stream);run_mv<4>((uint8_t*)up[e]->w,up[e]->scale,c->dx,c->p2+(long long)e*I,I,H,1,c->stream);expert_act<<<(I+255)/256,256,0,c->stream>>>(c->p3+(long long)e*I,c->p1+(long long)e*I,c->p2+(long long)e*I,weights[e],limit,I);fp8_sim<<<(I+127)/128,128,0,c->stream>>>(c->p3+(long long)e*I,1,I);run_mv<4>((uint8_t*)down[e]->w,down[e]->scale,c->p3+(long long)e*I,c->p4+(long long)e*H,H,I,1,c->stream);}
     expert_reduce<<<(H+255)/256,256,0,c->stream>>>(c->dy,c->p4,count,H);
     run_mv<8>((uint8_t*)sg->w,sg->scale,c->dx,c->p1,I,H,1,c->stream);run_mv<8>((uint8_t*)su->w,su->scale,c->dx,c->p2,I,H,1,c->stream);
