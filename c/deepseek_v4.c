@@ -5381,6 +5381,12 @@ static void v4_vk_token_free(V4VkToken *vk) {
 }
 #endif
 
+/* VRAM-first decode (V4_GPU_RESIDENT_FIRST=1): a routed expert already
+ * mirrored in VRAM is computed from the mirror without asking the expert
+ * store, so its RAM slot goes cold and the RAM tier holds other experts:
+ * VRAM mirrors ADD to the cache instead of duplicating RAM residents.
+ * Counters are cumulative (read by the serve stats line). */
+unsigned long long g_v4_gpu_first_hits = 0, g_v4_gpu_first_fetches = 0;
 /* Decode MoE timing (cumulative seconds; serve stats line): store fetch wait,
  * VRAM attach (upload on mirror miss), fused/grouped GPU compute, whole call. */
 double g_v4_dec_fetch_s = 0, g_v4_dec_attach_s = 0, g_v4_dec_gpu_s = 0, g_v4_dec_total_s = 0;
@@ -5389,6 +5395,14 @@ static double v4_dec_now(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+static int v4_gpu_resident_first(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *setting = getenv("V4_GPU_RESIDENT_FIRST");
+        on = setting && atoi(setting) != 0;
+    }
+    return on;
 }
 
 static int moe_token_pipeline(float *output,
@@ -5507,20 +5521,48 @@ static int moe_token_pipeline(float *output,
     ExpertLoadJob jobs[DUAL_EXPERT_LOADER_MAX] = {{0}};
     ExpertLoadHandle loaders[DUAL_EXPERT_LOADER_MAX] = {{0}};
     int loader_active[DUAL_EXPERT_LOADER_MAX] = {0};
+    /* views[i] belongs to expert_ids[i]; fetch[] lists the experts the store
+     * must provide (all of them unless VRAM-first finds mirrors); leased[i]
+     * marks views holding a store lease, the only ones released at the end. */
     double dec_t0 = v4_dec_now();
+    int alloc_n = selected ? selected : 1;
+    ColiExpertView *views = malloc((size_t)alloc_n * sizeof(*views));
+    unsigned char *leased = calloc((size_t)alloc_n, 1);
+    int *fetch = malloc((size_t)alloc_n * sizeof(*fetch));
+    int nfetch = 0;
+    if (!result && (!views || !leased || !fetch))
+        result = moe_fail("layer %d: out of memory for %d expert views",
+                          weights->plan.layer, selected);
     if (!result) {
-        int preload = selected < dual_loader_lanes()
-            ? selected : dual_loader_lanes();
-        for (int i = 0; i < preload; i++) {
-            jobs[i].store = store;
-            jobs[i].key = (ColiExpertKey){weights->plan.layer, expert_ids[i]};
-            jobs[i].result = -1;
-            if (profiled_expert_load_start(&loaders[i], &jobs[i]) != 0) {
+        memset(views, 0, (size_t)alloc_n * sizeof(*views));
+        int first = 0;
+#ifdef COLI_V4_GPU_TIER
+        first = store->gpu && v4_gpu_resident_first() && !coli_v4_hybrid_enabled();
+#endif
+        for (int i = 0; i < selected; i++) {
+            views[i].key = (ColiExpertKey){weights->plan.layer, expert_ids[i]};
+#ifdef COLI_V4_GPU_TIER
+            if (first && coli_v4_gpu_expert_peek(store, &views[i]) == 0) {
+                g_v4_gpu_first_hits++;
+                continue;
+            }
+            views[i].gate.gpu = views[i].up.gpu = views[i].down.gpu = NULL;
+#endif
+            fetch[nfetch++] = i;
+        }
+        if (first) g_v4_gpu_first_fetches += (unsigned long long)nfetch;
+        int preload = nfetch < dual_loader_lanes()
+            ? nfetch : dual_loader_lanes();
+        for (int f = 0; f < preload; f++) {
+            jobs[f].store = store;
+            jobs[f].key = (ColiExpertKey){weights->plan.layer, expert_ids[fetch[f]]};
+            jobs[f].result = -1;
+            if (profiled_expert_load_start(&loaders[f], &jobs[f]) != 0) {
                 result = moe_fail("layer %d: could not start reading expert %d",
-                                  weights->plan.layer, expert_ids[i]);
+                                  weights->plan.layer, expert_ids[fetch[f]]);
                 break;
             }
-            loader_active[i] = 1;
+            loader_active[f] = 1;
         }
     }
 #else
@@ -5549,19 +5591,16 @@ static int moe_token_pipeline(float *output,
     if (!result) memset(output, 0, (size_t)d * sizeof(*output));
 
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
-    ColiExpertView *views = malloc((size_t)(selected ? selected : 1) * sizeof(*views));
 #ifdef COLI_V4_GPU_TIER
     int gpu_compute = 0;
 #endif
-    if (!views) result = moe_fail("layer %d: out of memory for %d expert views",
-                                  weights->plan.layer, selected);
     if (!result) {
-        memset(views, 0, (size_t)selected * sizeof(*views));
 #ifdef COLI_V4_GPU_TIER
         gpu_compute = 1;
 #endif
-        for (int current = 0; !result && current < selected; current++) {
-            int slot = current % dual_loader_lanes();
+        for (int f = 0; !result && f < nfetch; f++) {
+            int current = fetch[f];
+            int slot = f % dual_loader_lanes();
             double fw0 = v4_dec_now();
             int finish_failed = !loader_active[slot] ||
                 profiled_expert_load_finish(&loaders[slot]) != 0;
@@ -5578,6 +5617,7 @@ static int moe_token_pipeline(float *output,
                 break;
             }
             views[current] = jobs[slot].view;
+            leased[current] = 1;
 #ifdef COLI_V4_GPU_TIER
             if (store->gpu) {
                 if (coli_v4_hybrid_enabled())
@@ -5598,17 +5638,17 @@ static int moe_token_pipeline(float *output,
                 gpu_compute = 0;
 #endif
 
-            int next = current + dual_loader_lanes();
-            if (next < selected) {
+            int next = f + dual_loader_lanes();
+            if (next < nfetch) {
                 memset(&jobs[slot], 0, sizeof(jobs[slot]));
                 jobs[slot].store = store;
                 jobs[slot].key = (ColiExpertKey){weights->plan.layer,
-                                                expert_ids[next]};
+                                                expert_ids[fetch[next]]};
                 jobs[slot].result = -1;
                 if (profiled_expert_load_start(&loaders[slot],
                                                &jobs[slot]) != 0)
                     result = moe_fail("layer %d: could not start reading expert %d",
-                                      weights->plan.layer, expert_ids[next]);
+                                      weights->plan.layer, expert_ids[fetch[next]]);
                 else
                     loader_active[slot] = 1;
             }
@@ -5621,6 +5661,25 @@ static int moe_token_pipeline(float *output,
             }
     }
 #ifdef COLI_V4_GPU_TIER
+    /* A mirror-only view has no host data. If the token cannot take the fused
+     * GPU path after all (an attach failed), fetch those experts from the
+     * store now so every path below sees complete views. */
+    if (!result && !gpu_compute) {
+        for (int i = 0; !result && i < selected; i++) {
+            if (leased[i]) continue;
+            ColiExpertView host;
+            memset(&host, 0, sizeof(host));
+            if (v4_lookup_waited(store, views[i].key, &host) != 0) {
+                result = moe_fail("layer %d: reading expert %d from the expert store failed",
+                                  weights->plan.layer, views[i].key.expert);
+                break;
+            }
+            void *g = views[i].gate.gpu, *u = views[i].up.gpu, *dn = views[i].down.gpu;
+            views[i] = host;
+            views[i].gate.gpu = g; views[i].up.gpu = u; views[i].down.gpu = dn;
+            leased[i] = 1;
+        }
+    }
     int hybrid_gpu_count = 0;
     int hybrid_pending_drain = 0;   /* async DMA enqueued, not yet drained */
     int hybrid_uploads = 0;
@@ -5867,9 +5926,11 @@ static int moe_token_pipeline(float *output,
      * ever a wait on already-finished work — never a correctness gamble.) */
     if (hybrid_pending_drain) coli_v4_gpu_expert_drain(store);
 #endif
-    for (int current = 0; current < selected; current++)
-        coli_expert_release(store, &views[current]);
-    free(views);
+    if (views)
+        for (int current = 0; current < selected; current++)
+            if (leased && leased[current])
+                coli_expert_release(store, &views[current]);
+    free(views); free(leased); free(fetch);
     g_v4_dec_total_s += v4_dec_now() - dec_t0;
     g_v4_dec_calls++;
 #if defined(COLI_VULKAN)
@@ -16634,6 +16695,7 @@ static void v4_serve_finish(ColiV4Engine *engine, ColiV4Session *session,
             const char *setting = getenv("V4_SERVE_STATS_LOG");
             stats_log = setting && atoi(setting) > 0;
         }
+        extern unsigned long long g_v4_gpu_first_hits, g_v4_gpu_first_fetches;
         extern double g_v4_dec_fetch_s, g_v4_dec_attach_s, g_v4_dec_gpu_s, g_v4_dec_total_s;
         extern unsigned long long g_v4_dec_attaches, g_v4_dec_calls;
         if (stats_log)
@@ -16644,11 +16706,12 @@ static void v4_serve_finish(ColiV4Engine *engine, ColiV4Session *session,
         if (stats_log)
             fprintf(stderr, "v4_serve_turn prompt=%d completion=%d decode_s=%.2f "
                     "tok_s=%.3f hit=%.1f%% expert_disk_s=%.2f expert_wait_s=%.2f "
-                    "expert_matmul_s=%.2f attention_s=%.2f rss_gb=%.1f\n",
+                    "expert_matmul_s=%.2f attention_s=%.2f rss_gb=%.1f "
+                    "vram_first_hits=%llu store_fetches=%llu (cumulative)\n",
                     prompt_tokens, completion, decode,
                     decode > 0.0 ? completion / decode : 0.0, hit_rate,
                     expert_disk_s, expert_wait_s, expert_matmul_s, attention_s,
-                    v4_serve_rss_gb());
+                    v4_serve_rss_gb(), g_v4_gpu_first_hits, g_v4_gpu_first_fetches);
     }
     v4_prof_emit(elapsed, prompt_tokens, completion,
                  expert_disk_s, expert_wait_s, expert_matmul_s, attention_s,
