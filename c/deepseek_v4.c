@@ -12019,6 +12019,19 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
         fprintf(stderr, "v4_gpu moe-batch=on bank=%d-experts\n",
                 dsv4_cuda_expert_bank_slots(config->n_routed_experts));
     }
+    /* V4_MOE_BATCH_PROF=1: one `moebprof` line per chunk-layer splitting the
+     * batched MoE into switch (the layer change below: waiting for the
+     * prefetch worker, swapping banks, launching the next prefetch; 0 on a
+     * layer's later chunks) / route / refill (store lookups + bank uploads) /
+     * compute (routed + shared kernels, download, sync). */
+    static int moeb_prof = -1;
+    if (moeb_prof < 0) {
+        const char *setting = getenv("V4_MOE_BATCH_PROF");
+        moeb_prof = setting && atoi(setting) > 0;
+    }
+#define MOEB_MS(a, b) (((b).tv_sec - (a).tv_sec) * 1e3 + ((b).tv_nsec - (a).tv_nsec) / 1e6)
+    struct timespec moeb_t0, moeb_t1, moeb_t2, moeb_t3;
+    double moeb_switch = 0.0;
     /* Route-aware refill: the persistent bank is a perfect per-layer expert
      * cache. Each chunk routes first, then uploads only the routed experts
      * that are not already resident for this layer, so every expert is read
@@ -12026,6 +12039,8 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
      * re-reads the same experts several times per layer under prefill's
      * expert-major sweeps (measured ~4-6x the layer's expert bytes). */
     if (bank_layer != weights->plan.layer) {
+        struct timespec moeb_switch0 = {0, 0};
+        if (moeb_prof) clock_gettime(CLOCK_MONOTONIC, &moeb_switch0);
         v4_bank2_join();
         int double_on = v4_bank_double_usable() && !v4_bank2_alloc_failed;
         if (coli_v4_bank_pair_decide(double_on, v4_bank2_layer,
@@ -12076,6 +12091,11 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
                 }
             }
         }
+        if (moeb_prof) {
+            struct timespec moeb_switch1;
+            clock_gettime(CLOCK_MONOTONIC, &moeb_switch1);
+            moeb_switch = MOEB_MS(moeb_switch0, moeb_switch1);
+        }
     }
     long long elements = (long long)batch * config->hidden_size;
     if (!in_mirror) {
@@ -12087,6 +12107,8 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
         }
     }
     if (!dsv4_cuda_activation_upload(in_mirror, inputs, elements)) return -1;
+    if (moeb_prof) clock_gettime(CLOCK_MONOTONIC, &moeb_t0);
+    int moeb_missing = 0;
     int topk = config->num_experts_per_tok;
     int ids[128 * 6];
     float route_weights[128 * 6];
@@ -12174,6 +12196,7 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
                    config->routed_scaling_factor, ids, route_weights)) {
         return -1;
     }
+    if (moeb_prof) clock_gettime(CLOCK_MONOTONIC, &moeb_t1);
     /* Upload the chunk's missing routed experts. Lookups run in parallel
      * (thread-safe; the CPU union's loaders already do this), uploads stay
      * sequential on the single bank. */
@@ -12384,12 +12407,24 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
             return -1;
         }
     }
+    if (moeb_prof) {
+        moeb_missing = missing_count;
+        clock_gettime(CLOCK_MONOTONIC, &moeb_t2);
+    }
     if (!dsv4_cuda_route_moe_ids_batch(in_mirror, ids, route_weights, batch,
                                        bank, config->swiglu_limit,
                                        out_mirror) ||
         !dsv4_cuda_activation_download(outputs, out_mirror, elements) ||
         !dsv4_cuda_activation_sync(out_mirror))
         return -1;
+    if (moeb_prof) {
+        clock_gettime(CLOCK_MONOTONIC, &moeb_t3);
+        fprintf(stderr, "moebprof layer=%d n=%d missing=%d switch=%.1f route=%.1f "
+                "refill=%.1f compute=%.1f ms\n", weights->plan.layer, batch,
+                moeb_missing, moeb_switch, MOEB_MS(moeb_t0, moeb_t1),
+                MOEB_MS(moeb_t1, moeb_t2), MOEB_MS(moeb_t2, moeb_t3));
+    }
+#undef MOEB_MS
     return 0;
 #undef bank
 #undef bank_layer
