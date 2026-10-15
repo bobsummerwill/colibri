@@ -12233,12 +12233,12 @@ int coli_v4_gpu_dspark_mirrors_ensure(ColiV4Engine *engine) {
  * The routed experts dominate prefill wall time on CPU (0.7-0.9 s/token
  * measured on DeepSeek-V4-Flash). dsv4_cuda_route_moe_batch runs a whole
  * 64-token chunk's MoE on the GPU — batch routing, expert-bank grouped
- * GEMMs, shared expert — but needs the layer's full 256-expert bank in
- * VRAM (256 slots of 12.75 MiB, 13.5 MiB on DeepGEMM builds: 3.2 / 3.4
- * GiB). The bank is a single streaming buffer: target_batch's chunk loop
- * sits INSIDE the layer loop, so one bank upload per layer serves every
- * chunk of that layer, and the shared/gate mirrors rebind for free (they
- * are the layer's resident fp8 mirrors).
+ * GEMMs, shared expert — but needs the layer's full expert bank in VRAM
+ * (dsv4_cuda_expert_bank_slots slots of 12.75 MiB, 13.5 MiB on DeepGEMM
+ * builds: 3.2 / 3.4 GiB for 256). The bank is a single streaming buffer:
+ * target_batch's chunk loop sits INSIDE the layer loop, so one bank upload
+ * per layer serves every chunk of that layer, and the shared/gate mirrors
+ * rebind for free (they are the layer's resident fp8 mirrors).
  *
  * Opt-in via COLI_CUDA_MOE_BATCH=1: the bank competes for VRAM with the
  * decode-path expert mirror cache (whose growth guard keeps
@@ -12277,10 +12277,10 @@ void coli_v4_gpu_moe_batch_prefill(int prefill) {
     v4_gpu_moe_batch_in_prefill = prefill;
 }
 
-int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
-                       const uint16_t *gate, const float *bias,
-                       const int *forced_indices, int experts, int dimension,
-                       int topk, float route_scale);
+int coli_v4_route_bf16_logits(float *weights, int *indices, const float *hidden,
+                              const uint16_t *gate, const float *bias,
+                              const int *forced_indices, int experts, int dimension,
+                              int topk, float route_scale, const float *logits);
 
 /* The expert bank exists only while a large prefill runs: it is up to
  * 3.4 GiB of VRAM that decode never touches, and holding it clamps the
@@ -12305,6 +12305,9 @@ static int v4_moe_bank_failed;
  * up only the holes). Every failure path — second-bank allocation, an aux
  * upload API that an older Windows DLL does not export, a fully failed
  * layer — degrades to today's single-bank behaviour and says so once.
+ * Only the structural failures (nothing a prefetch uploads lands) stay off
+ * for the process; a second bank that did not fit is retried by the next
+ * prefill, since the VRAM it lacked may have been transient.
  * The worker holds at most ONE store lease at a time (the expert cache's
  * pin slots are bounded), and layer L+1's lookups live in L+1's own store
  * partition, so the prefetch does not evict the computing layer. */
@@ -12313,9 +12316,10 @@ static int v4_bank2_layer = -1;      /* prefetched layer; read only post-join */
 static unsigned char v4_bank2_valid[256];
 static pthread_t v4_bank2_thread;
 static int v4_bank2_running;
-static int v4_bank2_disabled;
+static int v4_bank2_disabled;        /* structural: prefetch produced nothing */
+static int v4_bank2_alloc_failed;    /* this prefill only; release() clears */
 static unsigned long long v4_bank2_swaps, v4_bank2_prefetched;
-static struct { ColiExpertStore *store; int layer; } v4_bank2_job;
+static struct { ColiExpertStore *store; int layer; int experts; } v4_bank2_job;
 
 static int v4_bank_double_on(void) {
     static int on = -1;
@@ -12326,13 +12330,20 @@ static int v4_bank_double_on(void) {
     return on;
 }
 
+/* COLI_CUDA_MOE_DOUBLE is on and the second bank is not off for good: the
+ * next prefill will try to allocate it. */
+static int v4_bank_double_usable(void) {
+    return v4_bank_double_on() && !v4_bank2_disabled;
+}
+
 static void *v4_bank2_worker(void *argument) {
     (void)argument;
     ColiExpertStore *store = v4_bank2_job.store;
     int layer = v4_bank2_job.layer;
+    int experts = v4_bank2_job.experts;   /* the model's routed experts, <= 256 */
     memset(v4_bank2_valid, 0, sizeof(v4_bank2_valid));
     int loaded = 0;
-    for (int expert = 0; expert < 256; expert++) {
+    for (int expert = 0; expert < experts; expert++) {
         ColiExpertView view;
         memset(&view, 0, sizeof(view));
         if (coli_expert_lookup(store, (ColiExpertKey){layer, expert},
@@ -12391,6 +12402,7 @@ void coli_v4_gpu_moe_batch_release(void) {
     /* A create failure is retried after every release: the freed VRAM is
      * exactly what the next attempt needs. */
     v4_moe_bank_failed = 0;
+    v4_bank2_alloc_failed = 0;
     v4_bank2_join();
     if (v4_bank2_swaps || v4_bank2_prefetched)
         fprintf(stderr, "v4_gpu moe-double swaps=%llu prefetched=%llu\n",
@@ -12447,22 +12459,32 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
     }
     if (!outputs || !weights || !config || !store || !inputs || !tokens ||
         batch < 1 || batch > 128) V4_MOE_BATCH_REFUSE("bad arguments");
-    /* The backend batch kernels are hardwired to this geometry. */
-    if (config->n_routed_experts != 256 || config->hidden_size != 4096 ||
-        config->num_experts_per_tok != 6)
+    /* The backend batch kernels are hardwired to this geometry. Expert-pruned
+     * checkpoints (REAP: fewer than 256 routed experts) take a bank of
+     * dsv4_cuda_expert_bank_slots slots (their own count on generic builds,
+     * 256 on DeepGEMM); only the GPU router needs exactly 256, so they route
+     * on the CPU below. */
+    if (config->n_routed_experts < 1 || config->n_routed_experts > 256 ||
+        config->hidden_size != 4096 || config->num_experts_per_tok != 6)
         V4_MOE_BATCH_REFUSE("unsupported model geometry");
     Dsv4CudaTensor *gate = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "ffn.gate");
     Dsv4CudaTensor *bias = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "ffn.gate.bias");
     Dsv4CudaTensor *sg = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "ffn.shared_experts.w1");
     Dsv4CudaTensor *su = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "ffn.shared_experts.w3");
     Dsv4CudaTensor *sd = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "ffn.shared_experts.w2");
-    if (!gate) V4_MOE_BATCH_REFUSE("no ffn.gate mirror");
+    /* The f32 gate mirror only exists for 256 experts (GPU router); pruned
+     * checkpoints route on the CPU and take the device from the shared
+     * experts instead. */
+    if (!gate && config->n_routed_experts == 256)
+        V4_MOE_BATCH_REFUSE("no ffn.gate mirror");
     if (!sg || !su || !sd) V4_MOE_BATCH_REFUSE("no shared-expert mirrors");
 #undef V4_MOE_BATCH_REFUSE
-    int device = dsv4_cuda_tensor_device(gate);
+    int device = dsv4_cuda_tensor_device(gate ? gate : sg);
     if (device < 0) return -1;
     if (!bank) {
-        bank = dsv4_cuda_expert_bank_create(256, 4096, 2048, device, sg, su, sd);
+        bank = dsv4_cuda_expert_bank_create(
+            dsv4_cuda_expert_bank_slots(config->n_routed_experts), 4096, 2048,
+            device, sg, su, sd);
         if (!bank) {
             /* Out of VRAM, or shared-mirror shapes off: remember instead of
              * retrying a multi-GiB allocation on every chunk. */
@@ -12471,7 +12493,8 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
             bank_failed = 1;
             return -1;
         }
-        fprintf(stderr, "v4_gpu moe-batch=on bank=256-experts\n");
+        fprintf(stderr, "v4_gpu moe-batch=on bank=%d-experts\n",
+                dsv4_cuda_expert_bank_slots(config->n_routed_experts));
     }
     /* Route-aware refill: the persistent bank is a perfect per-layer expert
      * cache. Each chunk routes first, then uploads only the routed experts
@@ -12481,7 +12504,7 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
      * expert-major sweeps (measured ~4-6x the layer's expert bytes). */
     if (bank_layer != weights->plan.layer) {
         v4_bank2_join();
-        int double_on = v4_bank_double_on() && !v4_bank2_disabled;
+        int double_on = v4_bank_double_usable() && !v4_bank2_alloc_failed;
         if (coli_v4_bank_pair_decide(double_on, v4_bank2_layer,
                                      weights->plan.layer) == V4_BANK_SWAP) {
             /* The prefetched bank becomes the active one; its valid map
@@ -12504,14 +12527,18 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
             if (next >= 0) {
                 if (!v4_moe_bank2) {
                     v4_moe_bank2 = dsv4_cuda_expert_bank_create(
-                        256, 4096, 2048, device, sg, su, sd);
+                        dsv4_cuda_expert_bank_slots(config->n_routed_experts),
+                        4096, 2048, device, sg, su, sd);
                     if (!v4_moe_bank2) {
                         /* Not enough VRAM for two full banks: stay on the
-                         * proven single-bank path, permanently and loudly. */
-                        v4_bank2_disabled = 1;
+                         * proven single-bank path for the rest of this
+                         * prefill, loudly; release() lets the next one try
+                         * again. */
+                        v4_bank2_alloc_failed = 1;
                         fprintf(stderr,
                                 "v4_gpu moe-double=off (second bank "
-                                "allocation failed; single-bank stays)\n");
+                                "allocation failed; single-bank this "
+                                "prefill)\n");
                     } else {
                         fprintf(stderr, "v4_gpu moe-double=on\n");
                     }
@@ -12519,6 +12546,7 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
                 if (v4_moe_bank2) {
                     v4_bank2_job.store = store;
                     v4_bank2_job.layer = next;
+                    v4_bank2_job.experts = config->n_routed_experts;
                     if (pthread_create(&v4_bank2_thread, NULL,
                                        v4_bank2_worker, NULL) == 0)
                         v4_bank2_running = 1;
@@ -12544,37 +12572,80 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
     snprintf(name, sizeof(name), "layers.%d.ffn.gate.bias",
              weights->plan.layer);
     const float *raw_bias = coli_v4_layer_data(weights, name, NULL);
-    /* The GPU router reads the bias from its mirror: a score-router layer
-     * that has a bias but no mirror of it (its upload failed) would route
-     * without the bias. Refuse it, so the CPU union routes it with the bias,
-     * as decode does (coli_v4_gpu_route). */
-    if (!hashed && raw_bias && !bias) return -1;
-    if (hashed) {
+    /* The GPU router reads the bias from its mirror: a layer that has a bias
+     * but no mirror of it (its upload failed) routes on the CPU, as decode
+     * does (coli_v4_gpu_route), instead of routing without the bias. */
+    if (hashed || config->n_routed_experts != 256 || (raw_bias && !bias)) {
         /* Hash layers route on the CPU: ids from the token table, weights
-         * from the bf16 gate logits — identical to the CPU union. */
+         * from the bf16 gate logits — identical to the CPU union. Pruned
+         * expert counts take the same CPU router (score top-k, no table):
+         * the GPU top-6 kernel assumes 256 logits per token. */
         const ColiDeepSeekV4TensorSpec *spec = NULL;
         snprintf(name, sizeof(name), "layers.%d.ffn.gate.tid2eid",
                  weights->plan.layer);
-        const int64_t *table = coli_v4_layer_data(weights, name, &spec);
+        const int64_t *table = hashed ?
+            coli_v4_layer_data(weights, name, &spec) : NULL;
         snprintf(name, sizeof(name), "layers.%d.ffn.gate.weight",
                  weights->plan.layer);
         const uint16_t *raw_gate = coli_v4_layer_data(weights, name, NULL);
-        if (!table || !spec || spec->rank != 2 || spec->shape[1] != topk ||
-            !raw_gate)
+        if (!raw_gate) return -1;
+        if (hashed && (!table || !spec || spec->rank != 2 ||
+                       spec->shape[1] != topk))
             return -1;
+        /* Tokens route independently (the router keeps only stack state), so
+         * the chunk spreads over the OpenMP team; each token's gate dot
+         * products keep their serial order, so routing stays bit-identical
+         * to the CPU union and, in builds without Vulkan, to decode's CPU
+         * router. */
+        const int experts = config->n_routed_experts;
+        float *logits = NULL;
+        int route_team = batch >= 16;
+#ifdef COLI_VULKAN
+        /* With the Vulkan matmul hook set, the CPU union projects the whole
+         * batch's gate logits in one device call, and the hook refuses calls
+         * from inside an OpenMP team (each token would silently fall back to
+         * CPU dot products): take the logits the union's way, on this thread.
+         * If the device declines the batch, the union lets each token's
+         * router offer it a GEMV: when it takes one (token 0's, tried here)
+         * the loop stays serial so every token gets its own; otherwise all
+         * of them compute on the CPU and the team keeps them. The device's
+         * batched GEMM need not round like decode's per-token GEMV. */
+        if (batch > 1 && coli_v4_vk_matmul) {
+            logits = malloc((size_t)batch * experts * sizeof(*logits));
+            if (!logits) {
+                route_team = 0;
+            } else if (coli_v4_vk_matmul(11, raw_gate, NULL, 0, experts,
+                                         config->hidden_size, logits, inputs,
+                                         batch) != 0) {
+                if (coli_v4_vk_matmul(11, raw_gate, NULL, 0, experts,
+                                      config->hidden_size, logits, inputs,
+                                      1) == 0)
+                    route_team = 0;
+                free(logits);
+                logits = NULL;
+            }
+        }
+#endif
+        int route_failed = 0;
+#pragma omp parallel for schedule(static) if (route_team) reduction(|:route_failed)
         for (int item = 0; item < batch; item++) {
-            for (int rank = 0; rank < topk; rank++)
-                ids[item * topk + rank] =
-                    (int)table[(size_t)tokens[item] * topk + rank];
-            if (coli_v4_route_bf16(
+            if (hashed)
+                for (int rank = 0; rank < topk; rank++)
+                    ids[item * topk + rank] =
+                        (int)table[(size_t)tokens[item] * topk + rank];
+            if (coli_v4_route_bf16_logits(
                     route_weights + (size_t)item * topk,
                     ids + (size_t)item * topk,
                     inputs + (size_t)item * config->hidden_size,
-                    raw_gate, raw_bias, ids + (size_t)item * topk,
-                    config->n_routed_experts, config->hidden_size, topk,
-                    config->routed_scaling_factor))
-                return -1;
+                    raw_gate, raw_bias,
+                    hashed ? ids + (size_t)item * topk : NULL,
+                    experts, config->hidden_size, topk,
+                    config->routed_scaling_factor,
+                    logits ? logits + (size_t)item * experts : NULL))
+                route_failed = 1;
         }
+        free(logits);
+        if (route_failed) return -1;
     } else if (!dsv4_cuda_route_top6_batch(
                    in_mirror, gate, bias, batch,
                    config->routed_scaling_factor, ids, route_weights)) {
@@ -12586,7 +12657,7 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
     int missing[256], missing_count = 0;
     for (int r = 0; r < batch * topk; r++) {
         int expert = ids[r];
-        if (expert < 0 || expert >= 256) return -1;
+        if (expert < 0 || expert >= config->n_routed_experts) return -1;
         if (!bank_valid[expert]) {
             bank_valid[expert] = 2; /* pending */
             missing[missing_count++] = expert;
@@ -12610,10 +12681,10 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
         if (full_min > 0 && missing_count &&
             v4_gpu_moe_batch_hint_tokens >= full_min) {
             int fresh_layer = 1;
-            for (int e = 0; e < 256 && fresh_layer; e++)
+            for (int e = 0; e < config->n_routed_experts && fresh_layer; e++)
                 if (bank_valid[e] == 1) fresh_layer = 0;
             if (fresh_layer)
-                for (int e = 0; e < 256; e++)
+                for (int e = 0; e < config->n_routed_experts; e++)
                     if (!bank_valid[e]) {
                         bank_valid[e] = 2;
                         missing[missing_count++] = e;
