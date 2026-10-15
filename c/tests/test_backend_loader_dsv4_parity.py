@@ -8,8 +8,8 @@ the names dsv4.def lists, and the MinGW host only sees what
 backend_loader_dsv4.c resolves and forwards. A name missing from dsv4.def is
 therefore absent from every freshly built DLL. For a RESOLVE'd symbol the
 loader rejects the DLL; for an optional one it silently takes the "older DLL"
-fallback -- which is how dsv4_cuda_device_unified (unified-memory devices,
-where the VRAM reserve guard must stay off) never reached a Windows build.
+fallback -- which is how dsv4_cuda_expert_bank_slots (bank sized to the
+expert count) and dsv4_cuda_device_unified never reached a Windows build.
 
 test_backend_loader_header_parity.py covers only the GLM loader (coli_cuda_*).
 This is its twin for the DeepSeek V4 loader. Pure text, no compiler: it runs
