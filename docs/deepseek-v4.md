@@ -273,6 +273,83 @@ GPU fill branch and the CPU branch using bandwidths measured at runtime, and
 layer's full expert set into a second VRAM bank while the current layer
 computes, falling back to the single bank when VRAM is short.
 
+### Expert-pruned checkpoints (REAP) and the generic kernels
+
+Expert-pruned checkpoints such as `puwaer/DeepSeek-V4-Flash-0731-reap-150b`
+(132 routed experts instead of 256) use the batched prefill MoE path too: the
+CPU router picks their experts (tokens in parallel, bit-identical to the CPU
+union; Vulkan builds take the chunk's gate logits from one device call, as the
+union does) because the GPU top-6 kernel assumes 256 logits, and on generic
+(non-DeepGEMM) builds the bank is sized to the model's expert count
+(132 slots, 1683 MiB, instead of 256 slots, 3264 MiB). DeepGEMM builds keep a
+256-slot bank.
+
+The generic kernels themselves got two bit-identical rewrites (same operands
+in the same order for every output; `_VERIFY=1` runs old and new side by side,
+keeps the old kernel's results and counts mismatching bits; it does that even
+when the switch below is `0`, and says so once at startup):
+
+- `DSV4_MOE_EXPERT_MAJOR` (1): the routed experts run expert-major — one warp
+  per expert row walks every token of the chunk that picked that expert, so
+  each expert's weights are read once per chunk instead of once per route.
+  It takes 2 routes per pass while the chunk averages fewer than 4 routes per
+  routed expert (small prompts, tail chunks) and 4 otherwise.
+- `DSV4_MM_WARP` (auto): warp-per-row dense batch matmul for fp8 shapes whose
+  I is a multiple of 256: short rows only (I ≤ 1024, e.g. `attn.wq_b`; unset,
+  empty or `auto`), all of them with `1`, none with `0`. Against the old
+  kernel it also measured faster for I = 2048 (~0.8× the time on the
+  shared-expert w2, 4096×2048), but slower for I = 4096 (~1.1×) and I = 8192
+  (~1.65×).
+
+Measured on 2× RTX 3090 (one used; sm_86, CUDA 12.0 `NO_TC=1`), Ryzen 9 9950X3D,
+62 GB RAM (`--ram 40`), one SN850X, REAP 150B, greedy, `--ctx 8192`, cold
+server per run, one run per cell:
+
+| prompt | CPU union (before) | GPU batch, per-route kernels | + expert-major + warp dense | + `COLI_CUDA_MOE_DOUBLE=1` |
+|---|---|---|---|---|
+| 1,992 tokens | 220.5 s | 125.4 s | 79.7 s | **69.1 s** |
+| ~3,000 tokens | 334.4 s\* | 183.5 s | 118.2 s | **105.8 s** |
+
+\* Not measured on upstream: this request ran on the CPU union of a patched
+build whose bank had failed to allocate, at upstream's per-token rate
+(0.111 s/token, as in the 1,992-token cell).
+
+Answers were identical to the CPU union in every run. Decode (disk-bound) is
+unchanged after short prompts, which stay below `COLI_CUDA_MOE_BATCH_MIN` and
+never use the bank, but after these two GPU-batch prefills it measured slower
+than after a CPU-union prefill: the 24-token answer to the 1,992-token prompt
+at 2.18 tok/s instead of 2.42 (~10 %), the answer to the ~3,000-token prompt
+at ~2.75 instead of 2.85 (~3 %). Those runs predate the bank keeping the RAM
+expert store's routing books. Measured again on one binary and one VRAM
+reserve, with the same answer text after either prefill, the 1,992-token case
+was 7.4 % slower (2.13 vs 2.30 tok/s), and the cause was the store's books: the
+bank reads each routed expert once per layer per prompt and those reads were
+all the store counted, so decode started with every RAM-resident expert at
+usage 1, the pins ranked by expert id and only 7-9 of 16 pins active, and took
+~57 % more RAM-cache misses, most of them in its first ten tokens. The bank now
+counts each chunk's routed union as the CPU union's lookups do (usage, the pin
+ramp, repins, the `.coli_usage` history) and keeps the members already in RAM
+recent, without extra reads. Measured again on the series with and without that
+change (the same answer text, five cold runs each), decode after the 1,992-token
+bank prefill went from 2.13 to 2.26 tok/s (+6.3 %, medians), against 2.30 after
+a CPU-union prefill: 67 % (means) to 79 % (medians) of the gap recovered. The
+bank prefill takes as long as before: 82 s to the first token with or without
+the change, against 216 s for the CPU union (medians of these later runs, so
+not quite the table's single-run times). The rest of the gap sits in the first
+~5 decode tokens and comes from which experts are resident at decode start. For
+one, the bank reads each routed expert once per layer, so a member the RAM cache
+evicted earlier in the layer is not read back as the CPU union's per-chunk
+lookups read it. The books also decide which experts a later request's prefill
+(or a long prompt's later segments) finds in RAM, so a table cell whose request
+followed another may move as well; that has not been measured.
+
+With `COLI_CUDA_MOE_DOUBLE=1` the default VRAM
+reserve also covers the prefetch bank (one more bank: +1683 MiB for this
+132-expert model, +3264 MiB for 256 experts), so it still allocates after
+decode has grown its mirror cache; the mirrors that room holds back cost some
+decode speed, and the reserve drops back to one bank once the prefetch has
+turned itself off (`moe-double=off`).
+
 ## Prefill: segments, chunks, checkpoints
 
 - **Chunks/segments.** Prefill runs layer-major over 128-token chunks
@@ -435,6 +512,10 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_CUDA_PIN_HOST` (1, `.cu`) | page-lock expert-cache slabs for DMA uploads |
 | `DSV4_CUDA_MOE_GROUPED` (1, `.cu`) | expert-grouped MoE GEMM rows; `0` = legacy replicated |
 | `V4_MOE_BANK_FULL` (off) | `=N`: prefetch a whole layer's experts above N tokens (measured worse) |
+| `DSV4_MOE_EXPERT_MAJOR` (1, `.cu`) | generic batched MoE: expert-major fp4 kernel (weights read once per chunk); `0` = one matvec per route; `_VERIFY=1` compares both bit for bit (keeps the per-route results, also with `0`) |
+| `DSV4_MOE_EM_TB` (auto, `.cu`) | routes per pass of the expert-major kernel: unset = 2 below 4 routes per routed expert in the chunk, else 4; `2`, `3`, `4` or `6` forces one (anything else is ignored with a warning) |
+| `DSV4_MM_WARP` (auto, `.cu`) | generic dense batch matmul, fp8 shapes whose I is a multiple of 256: warp-per-row kernel for I ≤ 1024 (unset, empty or `auto`), `1` = all of them, `0` = off; `DSV4_MM_WARP_VERIFY=1` compares bit for bit (keeps the old kernel's results, also with `0`) |
+| `V4_MOE_BATCH_PROF` (0) | `1` = one `moebprof` line per chunk-layer: switch (layer change: prefetch-worker wait, bank swap) / route / refill / compute ms |
 
 **Prefill / checkpoints**
 | var | meaning |
