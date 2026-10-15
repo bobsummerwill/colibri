@@ -9,7 +9,8 @@ pins the shape that a CPU-only CI host can see:
   and checks the primary before it touches the peer;
 - it never calls dsv4_cuda_shutdown() between the failed two-device init and
   the single-device retry (on Windows the loader's shutdown unloads the DLL);
-- with the peer unset the engine still makes exactly PR #1's single init;
+- with the peer unset the engine makes exactly one init,
+  dsv4_cuda_init(&device, 1), on the primary alone;
 - every failure inside dsv4_cuda_init goes through init_fail, which releases
   what was set up, drops the contexts of every device but the first and
   clears the last error, and shutdown shares that teardown;

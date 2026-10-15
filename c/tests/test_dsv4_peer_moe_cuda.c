@@ -81,7 +81,7 @@ static int child(const char *mode){
     }else{
         /* soft: the 3rd peer pass fails, the peer still answers; lost: the 1st one, the peer counts as lost */
         int soft=!strcmp(mode,"soft");
-        if(!compute){printf("SKIP: peer compute is off for devices %d and %d (different SM versions?)\n",p,q);dsv4_cuda_shutdown();return SKIP;}
+        if(!compute){printf("SKIP: peer compute is off for devices %d and %d (DSV4_CUDA_BATCHED=0, or different SM versions)\n",p,q);dsv4_cuda_shutdown();return SKIP;}
         if(soft){for(int m=1;m<=2;m++){MASK(m);if(!dsv4_cuda_moe(g,u,d,wt,E,sg,su,sd,10.f,got,x)||!SAME()){fprintf(stderr,"soft: pass %d before the fault differs\n",m);return 6;}}}
         int fm=soft?0x2d:0x01;MASK(fm);memset(got,0,sizeof got);
         int r=dsv4_cuda_moe(g,u,d,wt,E,sg,su,sd,10.f,got,x);

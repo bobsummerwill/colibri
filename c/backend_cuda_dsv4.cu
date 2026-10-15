@@ -901,7 +901,7 @@ extern "C" int dsv4_cuda_kv_ring_append(int device,int layer,const float*rows,
        window<1||dim<1||!ok(cudaSetDevice(device),"select kv ring device"))return 0;
     if(g_kv_ring[layer]&&g_kv_ring_rows[layer]!=window){cudaFree(g_kv_ring[layer]);g_kv_ring[layer]=NULL;}
     if(!g_kv_ring[layer]){
-        if(!ok(cudaMalloc((void**)&g_kv_ring[layer],(size_t)window*dim*4),"kv ring allocation"))return 0;
+        if(!alloc_ok(cudaMalloc((void**)&g_kv_ring[layer],(size_t)window*dim*4),"kv ring allocation"))return 0;
         g_kv_ring_rows[layer]=window;
     }
     int done=0;
@@ -925,7 +925,7 @@ extern "C" int dsv4_cuda_kv_comp_append(int device,int layer,const float*rows,
         int cap=g_kv_comp_cap[layer]?g_kv_comp_cap[layer]:512;
         while(cap<need)cap*=2;
         float*grown=NULL;
-        if(!ok(cudaMalloc((void**)&grown,(size_t)cap*dim*4),"kv comp allocation"))return 0;
+        if(!alloc_ok(cudaMalloc((void**)&grown,(size_t)cap*dim*4),"kv comp allocation"))return 0;
         if(g_kv_comp[layer]&&start_idx&&
            !ok(cudaMemcpyAsync(grown,g_kv_comp[layer],(size_t)start_idx*dim*4,
                                cudaMemcpyDeviceToDevice,c->stream),"kv comp grow copy")){cudaFree(grown);return 0;}
@@ -1543,8 +1543,9 @@ extern "C" void dsv4_cuda_graph_free(Dsv4CudaGraph*g){if(!g)return;cudaSetDevice
  * c->stream does not wait for, and from pageable memory it may return before
  * the DMA has landed: a kernel queued on c->stream right after could read a
  * half-written decode mirror, and decode output then drifted with the mirror
- * cache's recycling timing (expert slabs past DSV4_CUDA_PIN_CAP_GB are
- * pageable). Same blocking contract for the caller as cudaMemcpy. */
+ * cache's recycling timing (expert slabs past DSV4_CUDA_PIN_CAP_GB, or all of
+ * them with DSV4_CUDA_PIN_HOST=0, are pageable). Same blocking contract for
+ * the caller as cudaMemcpy. */
 static int h2d(Dev*c,void*dst,const void*src,size_t n,const char*what){
     return ok(cudaMemcpyAsync(dst,src,n,cudaMemcpyHostToDevice,c->stream),what)&&ok(cudaStreamSynchronize(c->stream),what);}
 static int upload(Dsv4CudaTensor **pt,const void *w,size_t wb,const uint8_t *sc,size_t sb,int O,int I,int d,int fmt){if(*pt)return 1;Dev *c=ctx(d);if(!c||!ok(cudaSetDevice(d),"select upload device"))return 0;Dsv4CudaTensor *t=(Dsv4CudaTensor*)calloc(1,sizeof(*t));t->O=O;t->I=I;t->device=d;t->fmt=fmt;t->bytes=wb+sb;

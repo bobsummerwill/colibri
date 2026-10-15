@@ -253,7 +253,7 @@ the next read.
 | VRAM | dense mirrors | prefill bank | recommended env | expected |
 |---|---|---|---|---|
 | 6 GB | no (6.3 GB does not fit) | yes (3.2 GiB) | `CUDA_DENSE=0 COLI_CUDA_MOE_BATCH=1 COLI_CUDA_ATTN_BATCH=0` | GPU MoE prefill (generic kernels on non-RTX50), CPU attention/decode; ~90 mirrors between prefills |
-| 8 GB | yes | no (~1 GiB left) | `CUDA_DENSE=1 COLI_CUDA_ATTN_BATCH=1 COLI_CUDA_MOE_BATCH=0` | GPU attention + GPU decode dense; MoE prefill on the CPU union; ~30 mirrors |
+| 8 GB | yes | no (~0.9 GiB left) | `CUDA_DENSE=1 COLI_CUDA_ATTN_BATCH=1 COLI_CUDA_MOE_BATCH=0` | GPU attention + GPU decode dense; MoE prefill on the CPU union; ~25 mirrors |
 | 10–12 GB | yes | 12 GB: yes (tight); 10 GB: only a pruned checkpoint's smaller bank on generic builds | `CUDA_DENSE=1 COLI_CUDA_ATTN_BATCH=1 COLI_CUDA_MOE_BATCH=1` | full GPU prefill; 12 GB: the 32-mirror minimum beside a 256-expert bank's reserve (~350 mirrors with `COLI_CUDA_MOE_BATCH=0`), ~150 beside a 132-expert one; 10 GB: the 32-mirror minimum beside a 132-expert bank (256 experts: `COLI_CUDA_MOE_BATCH=0`, ~190 mirrors) |
 | 16 GB (this box) | yes | yes | the canonical line above (mirror cap can be left unset) | ~330 mirrors; the numbers in this document predate the bank-sized reserve (the fixed 2800 MiB default left more mirrors, but too little room for the bank once decode had filled the card) |
 | 24 GB | yes | yes | canonical | ~1 000 mirrors (~9 %) |
@@ -310,15 +310,24 @@ when the switch below is `0`, and says so once at startup):
 
 Measured on 2× RTX 3090 (one used; sm_86, CUDA 12.0 `NO_TC=1`), Ryzen 9 9950X3D,
 62 GB RAM (`--ram 40`), one SN850X, REAP 150B, greedy, `--ctx 8192`, cold
-server per run:
+server per run, one run per cell:
 
 | prompt | CPU union (before) | GPU batch, per-route kernels | + expert-major + warp dense | + `COLI_CUDA_MOE_DOUBLE=1` |
 |---|---|---|---|---|
 | 1,992 tokens | 220.5 s | 125.4 s | 79.7 s | **69.1 s** |
-| ~3,000 tokens | 334.4 s | 183.5 s | 118.2 s | **105.8 s** |
+| ~3,000 tokens | 334.4 s\* | 183.5 s | 118.2 s | **105.8 s** |
 
-Answers were identical to the CPU union in every run. Decode is unchanged
-(2.2–2.9 tok/s, disk-bound). With `COLI_CUDA_MOE_DOUBLE=1` the default VRAM
+\* Not measured on upstream: this request ran on the CPU union of a patched
+build whose bank had failed to allocate, at upstream's per-token rate
+(0.111 s/token, as in the 1,992-token cell).
+
+Answers were identical to the CPU union in every run. Decode (disk-bound) is
+unchanged after short prompts but measured slower after these two: the
+24-token answer to the 1,992-token prompt at 2.18 tok/s instead of 2.42
+(~10 %), the answer to the ~3,000-token prompt at ~2.75 instead of 2.85
+(~3 %); the cause is not established.
+
+With `COLI_CUDA_MOE_DOUBLE=1` the default VRAM
 reserve also covers the prefetch bank (one more bank: +1683 MiB for this
 132-expert model, +3264 MiB for 256 experts), so it still allocates after
 decode has grown its mirror cache; the mirrors that room holds back cost some
@@ -403,10 +412,9 @@ Measured on the REAP 150B setup above (2× RTX 3090 with an NVLink bridge,
 room for the second prefill bank. Every run gave the same answers (compared
 in full among the three `V4_GPU_RESIDENT_FIRST=1` rows; the one-GPU baseline
 kept only each answer's first 200 characters, which match).
-**To be re-measured:** these numbers come from intermediate builds of this
-branch (from before the RAM pin ranking left mirrored experts out, and the
-`DSV4_CUDA_PEER_COMPUTE=0` row from one that always read the peer mirrors in
-place); they will be replaced by three samples per row on the final build.
+**To be re-measured:** one run per row, measured before the RAM pin ranking
+left mirrored experts out, and the `DSV4_CUDA_PEER_COMPUTE=0` row with a
+binary that always read the peer mirrors in place, as that setting now does.
 
 | configuration | decode tok/s (mean) |
 |---|---|
