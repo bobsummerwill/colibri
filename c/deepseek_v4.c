@@ -16204,8 +16204,10 @@ static int target_token(ColiV4Engine *engine, float **state_ptr, float **next_pt
                         ColiExpertStore *experts, int token, int position,
                         char *error, size_t error_size) {
     double t0 = spec_now();
+    g_v4_dec_counting = 1;   /* the decode MoE counters: decode forwards only */
     int result = target_token_impl(engine, state_ptr, next_ptr, attention, index, config,
                                    experts, token, position, error, error_size);
+    g_v4_dec_counting = 0;
     g_v4_prof_block_s += spec_now() - t0;
     g_v4_prof_forwards += 1;
     return result;
