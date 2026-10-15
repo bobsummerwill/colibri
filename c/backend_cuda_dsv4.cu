@@ -1915,6 +1915,16 @@ static Dsv4CudaTensor *expert_view(uint8_t*w,uint8_t*scale,int O,int I,int devic
     Dsv4CudaTensor*t=(Dsv4CudaTensor*)calloc(1,sizeof(*t));if(!t)return nullptr;
     t->w=w;t->scale=scale;t->O=O;t->I=I;t->fmt=4;t->device=device;t->bytes=(long long)O*(I/2)+(long long)O*(I/32);return t;
 }
+/* Slots the batched-MoE bank needs for a model with `experts` routed experts:
+ * the DeepGEMM kernels are compiled for a 256-expert grouping, the generic
+ * kernels take the model's own count (smaller bank for pruned checkpoints). */
+extern "C" int dsv4_cuda_expert_bank_slots(int experts){
+#ifdef COLI_DSV4_DEEPGEMM
+    return experts>=1&&experts<=256?256:0;
+#else
+    return experts>=1&&experts<=256?experts:0;
+#endif
+}
 extern "C" Dsv4CudaExpertSet *dsv4_cuda_expert_bank_create(int count,int H,int I,int device,
         Dsv4CudaTensor*sg,Dsv4CudaTensor*su,Dsv4CudaTensor*sd){
     int shared=sg||su||sd,J=sg?sg->O:0;
@@ -2255,8 +2265,10 @@ extern "C" int dsv4_cuda_route_moe_ids_batch(const Dsv4CudaActivation*input,cons
      * path (~10-20 ms per 128-token chunk-layer) but runs on any sm_80+ GPU,
      * so prefill stays GPU-side instead of falling back to the CPU union. */
     Dev*c=input?ctx(input->device):nullptr;
+    /* Any bank of up to 256 slots: the grouped kernels index slots by expert
+     * id, so expert-pruned checkpoints use a bank sized to their count. */
     if(!c||!ids||!weights||!set||!output||count<1||count>128||set->device!=input->device||output->device!=input->device||
-       set->count!=256||set->H!=4096||set->I!=2048||!set->bank_fc1||
+       set->count<1||set->count>256||set->H!=4096||set->I!=2048||!set->bank_fc1||
        input->elements<(long long)count*4096||output->elements<(long long)count*4096||
        !ok(cudaSetDevice(input->device),"select generic batched MoE device"))return 0;
     const int H=4096,I=2048,K=6;int routes=count*K;
