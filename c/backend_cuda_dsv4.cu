@@ -1925,6 +1925,18 @@ extern "C" int dsv4_cuda_expert_bank_slots(int experts){
     return experts>=1&&experts<=256?experts:0;
 #endif
 }
+/* Device bytes per slot of dsv4_cuda_expert_bank_create(count,H,I,...) below
+ * (FC1/FC2 fp4 weights and scales, DeepGEMM's scale copies, the pointer
+ * table): the engine sizes the VRAM decode leaves free for a bank before one
+ * exists. 12.75 MiB generic, 13.5 MiB DeepGEMM at H=4096, I=2048. */
+extern "C" long long dsv4_cuda_expert_bank_slot_bytes(int H,int I){
+    if(H<1||I<1)return 0;long long fc1_s=2LL*I*(H/32),fc2_s=(long long)H*(I/32);
+    long long bytes=(long long)I*H+fc1_s+(long long)H*(I/2)+fc2_s+3*(long long)sizeof(ExpertPtr);
+#ifdef COLI_DSV4_DEEPGEMM
+    bytes+=fc1_s+fc2_s;
+#endif
+    return bytes;
+}
 extern "C" Dsv4CudaExpertSet *dsv4_cuda_expert_bank_create(int count,int H,int I,int device,
         Dsv4CudaTensor*sg,Dsv4CudaTensor*su,Dsv4CudaTensor*sd){
     int shared=sg||su||sd,J=sg?sg->O:0;
