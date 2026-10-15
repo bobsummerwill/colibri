@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <climits>
+#include <algorithm>
 #include <vector>
 #ifndef _WIN32
 #include <unistd.h>
@@ -59,6 +60,7 @@ struct Dev { int id,sms; cudaStream_t stream,aux; cudaEvent_t ready,fork,join;fl
 #endif
     int *decode_state;
     MvDesc *mvdesc;size_t mvdesccap;float *expert_weights;size_t expert_weightscap;int *expert_ids;size_t expert_idcap;
+    int *emaj;size_t emajcap;float *emv1,*emv2,*emv4;size_t emv1cap,emv2cap,emv4cap;unsigned long long *emcount; /* expert-major MoE */
 #if COLI_DSV4_TC
     cublasLtHandle_t lt;TcPlan plans[2];
 #endif
@@ -135,6 +137,66 @@ template<int R> __global__ void mv_fp4_grouped(const MvDesc *desc,int count,int 
         #pragma unroll
         for(int r=0;r<R;r++)if(base+r<O)d.y[base+r]=s[r][0];}
 }
+#ifndef COLI_DSV4_DEEPGEMM /* generic batched MoE only (DeepGEMM builds use dg_moe_batch_contiguous) */
+/* Expert-major fp4 matvec for the generic batched MoE (DSV4_MOE_EXPERT_MAJOR).
+ * mv_fp4_grouped runs one matvec per route, so an expert picked by k tokens of
+ * the chunk has its weights streamed k times, and each 256-thread block spends
+ * most of its time in the shared-memory tree. Here one WARP owns one row of
+ * one bank expert and walks every route that picked it, TB at a time. Lane l
+ * holds the tree's partials j = l + 32q (q = 0..7): partial j sums
+ * i = j, j+256, ... in order, exactly like thread j of mv_fp4_grouped; the
+ * tree's 128/64/32 steps pair partials inside a lane and 16..1 are shuffles,
+ * so every output has the same operands in the same order: bit-identical
+ * (DSV4_MOE_EXPERT_MAJOR_VERIFY checks it at run time). No shared memory, no
+ * barriers. Rows below `split` go to y0, the rest to y1 (FC1 = gate, up). */
+template<int TB> __global__ void __launch_bounds__(256) mv_fp4_expert_major(const uint8_t*bank_w,const uint8_t*bank_s,size_t wstride,size_t sstride,
+        const int*experts,const int*offsets,const int*routes,const float*x,long long xstride,int xdiv,
+        float*y0,float*y1,int split,long long ystride,int O,int I){
+    int slot=blockIdx.y,lane=threadIdx.x&31,o=blockIdx.x*8+(threadIdx.x>>5);
+    if(o>=O)return;
+    int e=experts[slot],begin=offsets[slot],end=offsets[slot+1];
+    const uint8_t*w=bank_w+(size_t)e*wstride+(size_t)o*(I/2);const uint8_t*sc=bank_s+(size_t)e*sstride+(size_t)o*(I/32);
+    for(int g=begin;g<end;g+=TB){
+        int n=end-g<TB?end-g:TB;const float*xs[TB];float p[TB][8];
+        #pragma unroll
+        for(int t=0;t<TB;t++){xs[t]=t<n?x+(long long)(routes[g+t]/xdiv)*xstride:x;
+            #pragma unroll
+            for(int q=0;q<8;q++)p[t][q]=0.f;}
+        for(int c0=0;c0<I/32;c0+=8){
+            #pragma unroll
+            for(int q=0;q<8;q++){int i=lane+32*(c0+q);
+                float xv[TB];
+                #pragma unroll
+                for(int t=0;t<TB;t++)xv[t]=t<n?xs[t][i]:0.f;
+                uint8_t pk=w[i>>1],qq=(i&1)?pk>>4:pk&15;float f=f4(qq),es=e8(sc[i/32]);
+                #pragma unroll
+                for(int t=0;t<TB;t++)if(t<n)p[t][q]+=xv[t]*f*es;
+            }
+        }
+        #pragma unroll
+        for(int t=0;t<TB;t++){
+            float v0=p[t][0]+p[t][4],v1=p[t][1]+p[t][5],v2=p[t][2]+p[t][6],v3=p[t][3]+p[t][7];
+            v0=v0+v2;v1=v1+v3;float v=v0+v1;
+            #pragma unroll
+            for(int m=16;m;m>>=1)v+=__shfl_down_sync(0xffffffffu,v,m);
+            if(!lane&&t<n){long long route=routes[g+t];
+                if(o<split)y0[route*ystride+o]=v;else y1[route*ystride+(o-split)]=v;}
+        }
+    }
+}
+static void run_fp4_expert_major(int tb,const uint8_t*w,const uint8_t*sc,size_t wstride,size_t sstride,
+        const int*ex,const int*off,const int*rt,int nex,const float*x,long long xstride,int xdiv,
+        float*y0,float*y1,int split,long long ystride,int O,int I,cudaStream_t stream){
+    dim3 grid((O+7)/8,nex);
+    if(tb==3)mv_fp4_expert_major<3><<<grid,256,0,stream>>>(w,sc,wstride,sstride,ex,off,rt,x,xstride,xdiv,y0,y1,split,ystride,O,I);
+    else if(tb==2)mv_fp4_expert_major<2><<<grid,256,0,stream>>>(w,sc,wstride,sstride,ex,off,rt,x,xstride,xdiv,y0,y1,split,ystride,O,I);
+    else if(tb==6)mv_fp4_expert_major<6><<<grid,256,0,stream>>>(w,sc,wstride,sstride,ex,off,rt,x,xstride,xdiv,y0,y1,split,ystride,O,I);
+    else mv_fp4_expert_major<4><<<grid,256,0,stream>>>(w,sc,wstride,sstride,ex,off,rt,x,xstride,xdiv,y0,y1,split,ystride,O,I);
+}
+__global__ void count_bit_mismatch(const float*a,const float*b,long long n,unsigned long long*count){
+    long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n&&__float_as_uint(a[i])!=__float_as_uint(b[i]))atomicAdd(count,1ULL);}
+#endif
 template<int F> static void run_mv(const uint8_t*w,const uint8_t*sc,const float*x,float*y,int O,int I,int groups,cudaStream_t stream){
     static int rows=-1;if(rows<0){const char *p=getenv(F==4?"DSV4_CUDA_ROWS":"DSV4_CUDA_FP8_ROWS");rows=p?atoi(p):(F==4?4:1);}
     if(rows==32)mv_rows<F,32><<<(O+31)/32,256,0,stream>>>(w,sc,x,y,O,I,groups);
@@ -1266,6 +1328,7 @@ extern "C" void dsv4_cuda_shutdown(void){
 #endif
     }
     for(int i=0;i<ng;i++){cudaSetDevice(g[i].id);if(g[i].dx)cudaFree(g[i].dx);if(g[i].dy)cudaFree(g[i].dy);if(g[i].p1)cudaFree(g[i].p1);if(g[i].p2)cudaFree(g[i].p2);if(g[i].p3)cudaFree(g[i].p3);if(g[i].p4)cudaFree(g[i].p4);if(g[i].aux1)cudaFree(g[i].aux1);if(g[i].aux2)cudaFree(g[i].aux2);if(g[i].aux3)cudaFree(g[i].aux3);if(g[i].mvdesc)cudaFree(g[i].mvdesc);if(g[i].expert_weights)cudaFree(g[i].expert_weights);if(g[i].expert_ids)cudaFree(g[i].expert_ids);if(g[i].tcw)cudaFree(g[i].tcw);if(g[i].tcs)cudaFree(g[i].tcs);if(g[i].tcx)cudaFree(g[i].tcx);if(g[i].tcxs)cudaFree(g[i].tcxs);if(g[i].tc_workspace)cudaFree(g[i].tc_workspace);
+        if(g[i].emaj)cudaFree(g[i].emaj);if(g[i].emv1)cudaFree(g[i].emv1);if(g[i].emv2)cudaFree(g[i].emv2);if(g[i].emv4)cudaFree(g[i].emv4);if(g[i].emcount)cudaFree(g[i].emcount);
 #ifdef COLI_DSV4_DEEPGEMM
         if(g[i].dga1)cudaFree(g[i].dga1);if(g[i].dga2)cudaFree(g[i].dga2);if(g[i].dgsfa1)cudaFree(g[i].dgsfa1);if(g[i].dgsfa2)cudaFree(g[i].dgsfa2);if(g[i].dglayout)cudaFree(g[i].dglayout);if(g[i].dgrowmap)cudaFree(g[i].dgrowmap);if(g[i].dgmm1)cudaFree(g[i].dgmm1);if(g[i].dgmm2)cudaFree(g[i].dgmm2);if(g[i].dgref)cudaFree(g[i].dgref);if(g[i].dgdensews)cudaFree(g[i].dgdensews);
 #endif
@@ -2290,25 +2353,91 @@ extern "C" int dsv4_cuda_route_moe_ids_batch(const Dsv4CudaActivation*input,cons
     size_t w1=(size_t)I*(H/2),s1=(size_t)I*(H/32),w2=(size_t)H*(I/2),s2=(size_t)H*(I/32);
     size_t rb=(size_t)routes*I*sizeof(float),pb=(size_t)routes*H*sizeof(float),wb=(size_t)routes*sizeof(float);
     if(!buf((void**)&c->p1,&c->p1cap,rb)||!buf((void**)&c->p2,&c->p2cap,rb)||!buf((void**)&c->p3,&c->p3cap,rb)||
-       !buf((void**)&c->p4,&c->p4cap,pb)||!buf((void**)&c->expert_weights,&c->expert_weightscap,wb)||
-       !buf((void**)&c->mvdesc,&c->mvdesccap,(size_t)routes*2*sizeof(MvDesc)))return 0;
+       !buf((void**)&c->p4,&c->p4cap,pb)||!buf((void**)&c->expert_weights,&c->expert_weightscap,wb))return 0;
     if(!ok(cudaMemcpyAsync(c->expert_weights,weights,wb,cudaMemcpyHostToDevice,c->stream),"generic MoE weight upload"))return 0;
-    std::vector<MvDesc> hd((size_t)routes*2);
-    for(int r=0;r<routes;r++){int e=ids[r],t=r/K;
-        const uint8_t*fc1=set->bank_fc1+(size_t)e*2*w1,*fc1s=set->bank_fc1_scale+(size_t)e*2*s1;
-        const float*x=input->data+(long long)t*H;
-        hd[2*r]={fc1,fc1s,x,c->p1+(long long)r*I};
-        hd[2*r+1]={fc1+w1,fc1s+s1,x,c->p2+(long long)r*I};}
-    if(!ok(cudaMemcpyAsync(c->mvdesc,hd.data(),(size_t)routes*2*sizeof(MvDesc),cudaMemcpyHostToDevice,c->stream),"generic MoE fc1 descriptors"))return 0;
-    mv_fp4_grouped<4><<<dim3((I+3)/4,routes*2),256,0,c->stream>>>(c->mvdesc,routes*2,I,H);
+    /* Default: stream each routed expert once per chunk (mv_fp4_expert_major,
+     * bit-identical); DSV4_MOE_EXPERT_MAJOR=0 keeps one matvec per route.
+     * DSV4_MOE_EXPERT_MAJOR_VERIFY=1 runs both and counts bit mismatches (the
+     * per-route results are kept, so it also runs over an explicit =0, which
+     * it says once). Routes per pass (TB): 2 while the chunk averages fewer
+     * than 4 routes per routed expert (small prompts, tail chunks), else 4.
+     * On sm_86 TB=4 took ~1.4x TB=2's time at 1-2 routes per expert and
+     * pulled ahead from ~3-4.5 (more skewed routing = later); every TB is
+     * bit-identical. DSV4_MOE_EM_TB=2|3|4|6 forces one. */
+    static int em_mode=-1,em_mode_env=1,em_verify=0,em_tb=0;static unsigned long long em_calls=0,em_bad1=0,em_bad2=0;
+    if(em_mode<0){const char*v=getenv("DSV4_MOE_EXPERT_MAJOR");em_mode_env=v?atoi(v)!=0:1;em_mode=em_mode_env;
+        v=getenv("DSV4_MOE_EM_TB");if(v&&*v){em_tb=atoi(v);
+            if(em_tb!=2&&em_tb!=3&&em_tb!=4&&em_tb!=6){fprintf(stderr,"[DSV4 CUDA] DSV4_MOE_EM_TB=%s ignored (2, 3, 4 or 6): TB by route density\n",v);em_tb=0;}}
+        v=getenv("DSV4_MOE_EXPERT_MAJOR_VERIFY");em_verify=v&&atoi(v)!=0;
+        if(em_verify&&!em_mode){em_mode=1;fprintf(stderr,"[DSV4 CUDA] DSV4_MOE_EXPERT_MAJOR_VERIFY=1 overrides DSV4_MOE_EXPERT_MAJOR=0: the expert-major kernel runs beside the per-route one, whose results are kept\n");}}
+    int nex=0;const int*em_ex=nullptr,*em_off=nullptr,*em_rt=nullptr;
+    if(em_mode){
+        int cnt[256]={0},slot_of[256];for(int r=0;r<routes;r++)cnt[ids[r]]++;
+        std::vector<int> hm((size_t)set->count+1+set->count+routes);int*hex=hm.data(),*hoff=hex+set->count,*hrt=hoff+set->count+1;
+        hoff[0]=0;for(int e=0;e<set->count;e++)if(cnt[e]){slot_of[e]=nex;hex[nex]=e;hoff[nex+1]=hoff[nex]+cnt[e];nex++;}
+        std::vector<int> fill(hoff,hoff+nex);for(int r=0;r<routes;r++)hrt[fill[slot_of[ids[r]]]++]=r;
+        /* pack as [experts nex][offsets nex+1][routes] */
+        std::vector<int> packed((size_t)nex+nex+1+routes);std::copy(hex,hex+nex,packed.begin());std::copy(hoff,hoff+nex+1,packed.begin()+nex);
+        std::copy(hrt,hrt+routes,packed.begin()+2*nex+1);
+        if(!buf((void**)&c->emaj,&c->emajcap,packed.size()*sizeof(int))||
+           !ok(cudaMemcpyAsync(c->emaj,packed.data(),packed.size()*sizeof(int),cudaMemcpyHostToDevice,c->stream),"expert-major route lists"))return 0;
+        em_ex=c->emaj;em_off=c->emaj+nex;em_rt=c->emaj+2*nex+1;
+        /* verify is a diagnostic: without memory for its buffers it switches
+         * itself off for good and DSV4_MOE_EXPERT_MAJOR's own setting applies
+         * again (an overridden 0 sends this call down the per-route path) */
+        if(em_verify&&(!buf((void**)&c->emv1,&c->emv1cap,rb)||!buf((void**)&c->emv2,&c->emv2cap,rb)||!buf((void**)&c->emv4,&c->emv4cap,pb)||
+           (!c->emcount&&!alloc_ok(cudaMalloc(&c->emcount,2*sizeof(unsigned long long)),"expert-major verify counter")))){
+            em_verify=0;em_mode=em_mode_env;fprintf(stderr,"[DSV4 CUDA] DSV4_MOE_EXPERT_MAJOR_VERIFY off: no memory for its buffers\n");}
+    }
+    const int tb=em_tb?em_tb:routes<4*nex?2:4;
+    /* the per-route kernel's descriptor tables: per-route mode and verify only */
+    const bool per_route=!em_mode||em_verify;std::vector<MvDesc> hd;
+    if(per_route){
+        if(!buf((void**)&c->mvdesc,&c->mvdesccap,(size_t)routes*2*sizeof(MvDesc)))return 0;
+        hd.resize((size_t)routes*2);
+        for(int r=0;r<routes;r++){int e=ids[r],t=r/K;
+            const uint8_t*fc1=set->bank_fc1+(size_t)e*2*w1,*fc1s=set->bank_fc1_scale+(size_t)e*2*s1;
+            const float*x=input->data+(long long)t*H;
+            hd[2*r]={fc1,fc1s,x,c->p1+(long long)r*I};
+            hd[2*r+1]={fc1+w1,fc1s+s1,x,c->p2+(long long)r*I};}
+        if(!ok(cudaMemcpyAsync(c->mvdesc,hd.data(),(size_t)routes*2*sizeof(MvDesc),cudaMemcpyHostToDevice,c->stream),"generic MoE fc1 descriptors"))return 0;
+        mv_fp4_grouped<4><<<dim3((I+3)/4,routes*2),256,0,c->stream>>>(c->mvdesc,routes*2,I,H);
+    }
+    if(em_mode){
+        float*y0=em_verify?c->emv1:c->p1,*y1=em_verify?c->emv2:c->p2;
+        run_fp4_expert_major(tb,set->bank_fc1,set->bank_fc1_scale,2*w1,2*s1,
+            em_ex,em_off,em_rt,nex,input->data,H,K,y0,y1,I,I,2*I,H,c->stream);
+        if(em_verify){
+            if(!ok(cudaMemsetAsync(c->emcount,0,2*sizeof(unsigned long long),c->stream),"verify clear"))return 0;
+            count_bit_mismatch<<<((long long)routes*I+255)/256,256,0,c->stream>>>(c->p1,c->emv1,(long long)routes*I,c->emcount);
+            count_bit_mismatch<<<((long long)routes*I+255)/256,256,0,c->stream>>>(c->p2,c->emv2,(long long)routes*I,c->emcount);
+        }
+    }
     expert_act_grouped<<<((long long)routes*I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,c->expert_weights,limit,routes,I);
     fp8_sim<<<routes*((I+127)/128),128,0,c->stream>>>(c->p3,routes,I);
-    /* down: descriptors must not be overwritten while fc1 still reads them —
-     * the copy is stream-ordered after the launches above, so reuse is safe. */
-    for(int r=0;r<routes;r++){int e=ids[r];
-        hd[r]={set->bank_fc2+(size_t)e*w2,set->bank_fc2_scale+(size_t)e*s2,c->p3+(long long)r*I,c->p4+(long long)r*H};}
-    if(!ok(cudaMemcpyAsync(c->mvdesc,hd.data(),(size_t)routes*sizeof(MvDesc),cudaMemcpyHostToDevice,c->stream),"generic MoE down descriptors"))return 0;
-    mv_fp4_grouped<4><<<dim3((H+3)/4,routes),256,0,c->stream>>>(c->mvdesc,routes,H,I);
+    if(per_route){
+        /* down: descriptors must not be overwritten while fc1 still reads them —
+         * the copy is stream-ordered after the launches above, so reuse is safe. */
+        for(int r=0;r<routes;r++){int e=ids[r];
+            hd[r]={set->bank_fc2+(size_t)e*w2,set->bank_fc2_scale+(size_t)e*s2,c->p3+(long long)r*I,c->p4+(long long)r*H};}
+        if(!ok(cudaMemcpyAsync(c->mvdesc,hd.data(),(size_t)routes*sizeof(MvDesc),cudaMemcpyHostToDevice,c->stream),"generic MoE down descriptors"))return 0;
+        mv_fp4_grouped<4><<<dim3((H+3)/4,routes),256,0,c->stream>>>(c->mvdesc,routes,H,I);
+    }
+    if(em_mode){
+        float*y=em_verify?c->emv4:c->p4;
+        run_fp4_expert_major(tb,set->bank_fc2,set->bank_fc2_scale,w2,s2,
+            em_ex,em_off,em_rt,nex,c->p3,I,1,y,y,H,H,H,I,c->stream);
+        if(em_verify){
+            count_bit_mismatch<<<((long long)routes*H+255)/256,256,0,c->stream>>>(c->p4,c->emv4,(long long)routes*H,c->emcount+1);
+            unsigned long long bad[2]={0,0};
+            if(!ok(cudaMemcpyAsync(bad,c->emcount,sizeof(bad),cudaMemcpyDeviceToHost,c->stream),"verify read")||
+               !ok(cudaStreamSynchronize(c->stream),"verify sync"))return 0;
+            em_calls++;em_bad1+=bad[0];em_bad2+=bad[1];
+            if(bad[0]||bad[1]||em_calls%100==0)
+                fprintf(stderr,"moe-expert-major verify calls=%llu fc1_mismatch=%llu fc2_mismatch=%llu (this call %llu/%llu of %lld/%lld)\n",
+                        em_calls,em_bad1,em_bad2,bad[0],bad[1],(long long)routes*I*2,(long long)routes*H);
+        }
+    }
     expert_reduce_rows<<<((long long)count*H+255)/256,256,0,c->stream>>>(output->data,c->p4,count,K,H);
     /* shared experts (fp8 dense) over the whole chunk, then the same combine
      * as decode: routed = bf16(routed + bf16(shared)). */
