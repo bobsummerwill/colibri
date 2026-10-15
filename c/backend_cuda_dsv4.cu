@@ -61,6 +61,7 @@ struct Dev { int id,sms; cudaStream_t stream,aux; cudaEvent_t ready,fork,join;fl
     int *decode_state;
     MvDesc *mvdesc;size_t mvdesccap;float *expert_weights;size_t expert_weightscap;int *expert_ids;size_t expert_idcap;
     int *emaj;size_t emajcap;float *emv1,*emv2,*emv4;size_t emv1cap,emv2cap,emv4cap;unsigned long long *emcount; /* expert-major MoE */
+    float *mmv;size_t mmvcap;unsigned long long *mmvcount; /* DSV4_MM_WARP_VERIFY */
 #if COLI_DSV4_TC
     cublasLtHandle_t lt;TcPlan plans[2];
 #endif
@@ -237,12 +238,87 @@ template<int F> __global__ void mm_batch(const uint8_t *w,const uint8_t *sc,cons
         for(int t=0;t<16;t++)s[t][threadIdx.x]+=s[t][threadIdx.x+n];}__syncthreads();}
     if(!threadIdx.x)for(int t=0;t<tcount;t++)y[(long long)(tbase+t)*O+o]=s[t][0];
 }
+#ifndef COLI_DSV4_DEEPGEMM /* run_mm_batch's callers are all generic-build paths */
+/* Warp-per-row mm_batch for fp8 / bf16-rounded fp8 weights (DSV4_MM_WARP).
+ * One warp owns one output row and TB tokens; lane l holds the 256-wide
+ * tree's partials j = l + 32q, each summing i = j, j+256, ... in mm_batch's
+ * order, and the tree's 128/64/32 steps are in-lane adds, 16..1 shuffles:
+ * every output has mm_batch's operands in mm_batch's order (bit-identical;
+ * DSV4_MM_WARP_VERIFY counts mismatches). e4m3 decodes through a shared
+ * 256-entry table holding exactly e4m3()'s values. */
+template<int F,int TB> __global__ void __launch_bounds__(256) mm_batch_w(const uint8_t *w,const uint8_t *sc,const float *x,float *y,int O,int I,int T){
+    __shared__ float lut[256];
+    lut[threadIdx.x]=e4m3((uint8_t)threadIdx.x);__syncthreads();
+    int lane=threadIdx.x&31,o=blockIdx.x*8+(threadIdx.x>>5);if(o>=O)return;
+    int tbase=blockIdx.y*TB,tcount=T-tbase<TB?T-tbase:TB;
+    float p[TB][8];
+    #pragma unroll
+    for(int t=0;t<TB;t++)
+        #pragma unroll
+        for(int q=0;q<8;q++)p[t][q]=0.f;
+    for(int c0=0;c0<I/32;c0+=8){
+        #pragma unroll
+        for(int q=0;q<8;q++){int i=lane+32*(c0+q);
+            float v=lut[w[(long long)o*I+i]]*e8(sc[(o/128)*((I+127)/128)+i/128]);if constexpr(F==9)v=__bfloat162float(__float2bfloat16(v));
+            #pragma unroll
+            for(int t=0;t<TB;t++)if(t<tcount)p[t][q]+=x[(long long)(tbase+t)*I+i]*v;
+        }
+    }
+    #pragma unroll
+    for(int t=0;t<TB;t++){
+        float v0=p[t][0]+p[t][4],v1=p[t][1]+p[t][5],v2=p[t][2]+p[t][6],v3=p[t][3]+p[t][7];
+        v0=v0+v2;v1=v1+v3;float v=v0+v1;
+        #pragma unroll
+        for(int m=16;m;m>>=1)v+=__shfl_down_sync(0xffffffffu,v,m);
+        if(!lane&&t<tcount)y[(long long)(tbase+t)*O+o]=v;
+    }
+}
 static void run_mm_batch(Dsv4CudaTensor*t,const float*x,float*y,int T,cudaStream_t stream){
+    /* DSV4_MM_WARP, for fp8 shapes whose I is a multiple of 256: unset, empty
+     * or "auto" = warp kernel for short rows only (I <= 1024, e.g. attn.wq_b,
+     * where mm_batch spends most of each block in its tree); 1 (any non-zero
+     * number) = all of them; 0 = never. Kernel time against mm_batch on sm_86:
+     * ~0.4-0.55x at I = 1024, ~0.8x at I = 2048 (shared w2, 4096x2048), ~1.1x
+     * at I = 4096, ~1.65x at I = 8192; auto stays at I <= 1024 until I = 2048
+     * is checked in the engine.
+     * DSV4_MM_WARP_VERIFY=1 also runs mm_batch, keeps ITS results and counts
+     * mismatching bits; over DSV4_MM_WARP=0 it checks the auto shapes (said
+     * once at startup). */
+    static int mw=-1,mw_env=1,mwv=0;static unsigned long long vcalls=0,vbad=0;
+    if(mw<0){const char*e=getenv("DSV4_MM_WARP");mw_env=!e||!*e||!strcmp(e,"auto")?1:atoi(e)!=0?2:0;mw=mw_env;
+        e=getenv("DSV4_MM_WARP_VERIFY");mwv=e&&atoi(e)!=0;
+        if(mwv&&!mw){mw=1;fprintf(stderr,"[DSV4 CUDA] DSV4_MM_WARP_VERIFY=1 overrides DSV4_MM_WARP=0: the warp kernel runs beside mm_batch on the auto shapes, mm_batch's results are kept\n");}}
+    if(mw&&(t->fmt==8||t->fmt==9)&&t->I%256==0&&(mw==2||t->I<=1024)){
+        size_t n=(size_t)T*t->O;Dev*c=mwv?ctx(t->device):nullptr;
+        /* verify buffers are per device; without them verify switches itself
+         * off for good and DSV4_MM_WARP's own setting applies again (an
+         * overridden 0 sends this call to mm_batch below) */
+        if(mwv&&(!c||!buf((void**)&c->mmv,&c->mmvcap,n*sizeof(float))||
+                 (!c->mmvcount&&!alloc_ok(cudaMalloc(&c->mmvcount,sizeof(*c->mmvcount)),"mm-warp verify counter")))){
+            mwv=0;mw=mw_env;fprintf(stderr,"[DSV4 CUDA] DSV4_MM_WARP_VERIFY off: no memory for its buffers\n");}
+        if(mw){
+            dim3 wg((t->O+7)/8,(T+7)/8);float*dst=mwv?c->mmv:y;
+            if(t->fmt==9)mm_batch_w<9,8><<<wg,256,0,stream>>>((uint8_t*)t->w,t->scale,x,dst,t->O,t->I,T);
+            else mm_batch_w<8,8><<<wg,256,0,stream>>>((uint8_t*)t->w,t->scale,x,dst,t->O,t->I,T);
+            if(!mwv)return;
+            dim3 grid(t->O,(T+15)/16);
+            if(t->fmt==9)mm_batch<9><<<grid,256,0,stream>>>((uint8_t*)t->w,t->scale,x,y,t->O,t->I,T);
+            else mm_batch<8><<<grid,256,0,stream>>>((uint8_t*)t->w,t->scale,x,y,t->O,t->I,T);
+            unsigned long long bad=0;cudaMemsetAsync(c->mmvcount,0,sizeof(*c->mmvcount),stream);
+            count_bit_mismatch<<<(unsigned)((n+255)/256),256,0,stream>>>(y,c->mmv,(long long)n,c->mmvcount);
+            cudaMemcpyAsync(&bad,c->mmvcount,sizeof(bad),cudaMemcpyDeviceToHost,stream);cudaStreamSynchronize(stream);
+            vcalls++;vbad+=bad;
+            if(bad||vcalls%500==0)fprintf(stderr,"mm-warp verify calls=%llu mismatches=%llu (this call %llu of %zu, %dx%d T=%d fmt=%d)\n",
+                                          vcalls,vbad,bad,n,t->O,t->I,T,t->fmt);
+            return;
+        }
+    }
     dim3 grid(t->O,(T+15)/16);
     if(t->fmt==4)mm_batch<4><<<grid,256,0,stream>>>((uint8_t*)t->w,t->scale,x,y,t->O,t->I,T);
     else if(t->fmt==9)mm_batch<9><<<grid,256,0,stream>>>((uint8_t*)t->w,t->scale,x,y,t->O,t->I,T);
     else mm_batch<8><<<grid,256,0,stream>>>((uint8_t*)t->w,t->scale,x,y,t->O,t->I,T);
 }
+#endif
 __device__ int tc_sf_off(int outer,int inner,int sf_inner_dim){int base=((inner/4)*4+(outer/128)*sf_inner_dim)*128,o=outer&127;return base+(o%32)*16+(o/32)*4+(inner&3);}
 __device__ uint8_t e4m3_code(float x){int best=0;float bd=INFINITY;for(int v=0;v<255;v++){float z=e4m3((uint8_t)v),d=fabsf(z-x);if(d<bd||(d==bd&&!(v&1)&&(best&1))){bd=d;best=v;}}return (uint8_t)best;}
 __global__ void tc_expand(const uint8_t*q4,const uint8_t*src,uint8_t*q8,uint8_t*dst,int O,int I){
@@ -1328,7 +1404,7 @@ extern "C" void dsv4_cuda_shutdown(void){
 #endif
     }
     for(int i=0;i<ng;i++){cudaSetDevice(g[i].id);if(g[i].dx)cudaFree(g[i].dx);if(g[i].dy)cudaFree(g[i].dy);if(g[i].p1)cudaFree(g[i].p1);if(g[i].p2)cudaFree(g[i].p2);if(g[i].p3)cudaFree(g[i].p3);if(g[i].p4)cudaFree(g[i].p4);if(g[i].aux1)cudaFree(g[i].aux1);if(g[i].aux2)cudaFree(g[i].aux2);if(g[i].aux3)cudaFree(g[i].aux3);if(g[i].mvdesc)cudaFree(g[i].mvdesc);if(g[i].expert_weights)cudaFree(g[i].expert_weights);if(g[i].expert_ids)cudaFree(g[i].expert_ids);if(g[i].tcw)cudaFree(g[i].tcw);if(g[i].tcs)cudaFree(g[i].tcs);if(g[i].tcx)cudaFree(g[i].tcx);if(g[i].tcxs)cudaFree(g[i].tcxs);if(g[i].tc_workspace)cudaFree(g[i].tc_workspace);
-        if(g[i].emaj)cudaFree(g[i].emaj);if(g[i].emv1)cudaFree(g[i].emv1);if(g[i].emv2)cudaFree(g[i].emv2);if(g[i].emv4)cudaFree(g[i].emv4);if(g[i].emcount)cudaFree(g[i].emcount);
+        if(g[i].emaj)cudaFree(g[i].emaj);if(g[i].emv1)cudaFree(g[i].emv1);if(g[i].emv2)cudaFree(g[i].emv2);if(g[i].emv4)cudaFree(g[i].emv4);if(g[i].emcount)cudaFree(g[i].emcount);if(g[i].mmv)cudaFree(g[i].mmv);if(g[i].mmvcount)cudaFree(g[i].mmvcount);
 #ifdef COLI_DSV4_DEEPGEMM
         if(g[i].dga1)cudaFree(g[i].dga1);if(g[i].dga2)cudaFree(g[i].dga2);if(g[i].dgsfa1)cudaFree(g[i].dgsfa1);if(g[i].dgsfa2)cudaFree(g[i].dgsfa2);if(g[i].dglayout)cudaFree(g[i].dglayout);if(g[i].dgrowmap)cudaFree(g[i].dgrowmap);if(g[i].dgmm1)cudaFree(g[i].dgmm1);if(g[i].dgmm2)cudaFree(g[i].dgmm2);if(g[i].dgref)cudaFree(g[i].dgref);if(g[i].dgdensews)cudaFree(g[i].dgdensews);
 #endif
