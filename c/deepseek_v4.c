@@ -12242,10 +12242,23 @@ struct V4GpuExpertMirrorCache {
     V4GpuExpertMirror *entries;
     int capacity;
     int count;
-    uint64_t clock;
     int device;
     pthread_mutex_t mutex;
+    /* growth guard state, per cache (a peer pool on another card has its own
+     * free VRAM and its own, smaller reserve). reserve_mb < 0 = the bank-sized
+     * default of the primary card (v4_gpu_mirror_reserve_mb, per miss). */
+    long long reserve_mb;
+    long long last_free_mb;
+    unsigned probes;
+    int unified;
+    int upload_failed;
 };
+/* One LRU clock for every mirror cache, so the peer pool and the primary
+ * cache can compare their victims' ages. */
+static uint64_t g_v4_mirror_clock;
+static uint64_t v4_mirror_tick(void) {
+    return __atomic_add_fetch(&g_v4_mirror_clock, 1, __ATOMIC_RELAXED);
+}
 /* Mirror uploads, every cache (coli_v4_gpu_expert_uploads). Uploads happen on
  * the generation thread only. */
 static unsigned long long g_v4_mirror_uploads;
@@ -12264,6 +12277,9 @@ static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_capacity(
     }
     cache->capacity = capacity;
     cache->device = device;
+    cache->reserve_mb = -1;
+    cache->last_free_mb = -1;
+    cache->unified = -1;
     pthread_mutex_init(&cache->mutex, NULL);
     return cache;
 }
@@ -12323,12 +12339,16 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
          * slot instead of growing — decode keeps its hottest experts and
          * the next large prefill still fits. */
         int grow = cache->count < cache->capacity;
-        /* The default reserve is sized from the model's bank at engine open,
-         * covers the COLI_CUDA_MOE_DOUBLE second bank while that is on, and
-         * is only the attention headroom until the cache holds a minimum
-         * working set (v4_gpu_mirror_reserve_mb); DSV4_CUDA_VRAM_RESERVE_MB
-         * overrides. */
-        long long reserve_mb = v4_gpu_mirror_reserve_mb(cache->count);
+        /* The primary cache's default reserve is sized from the model's bank
+         * at engine open, covers the COLI_CUDA_MOE_DOUBLE second bank while
+         * that is on, and is only the attention headroom until the cache
+         * holds a minimum working set (v4_gpu_mirror_reserve_mb, evaluated
+         * per miss); DSV4_CUDA_VRAM_RESERVE_MB overrides. A cache with its
+         * own reserve (the peer pool: no dense weights or prefill bank live
+         * on that card) keeps it in reserve_mb instead. */
+        long long reserve_mb = cache->reserve_mb >= 0
+            ? cache->reserve_mb
+            : v4_gpu_mirror_reserve_mb(cache->count);
         /* cudaMemGetInfo is a driver round trip; with a large capacity the
          * guard is consulted on every miss (hundreds per token), so re-check
          * free VRAM only every 64 misses and reuse the last answer between
@@ -12339,10 +12359,9 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
          * a handful of entries on a 130 GB box (#1538). There is no separate
          * card to keep headroom on, so the guard does not apply; the
          * capacity (DSV4_CUDA_EXPERT_MIRRORS) bounds the cache instead. */
-        static int unified = -1;
-        if (unified < 0) {
-            unified = dsv4_cuda_device_unified(cache->device) ? 1 : 0;
-            if (unified)
+        if (cache->unified < 0) {
+            cache->unified = dsv4_cuda_device_unified(cache->device) ? 1 : 0;
+            if (cache->unified)
                 fprintf(stderr, "v4_gpu mirror-cache: unified memory, VRAM reserve "
                                 "guard off (free memory is the system's, not a "
                                 "card's); capacity %d bounds the cache\n",
@@ -12350,16 +12369,14 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
         }
         /* After a failed upload (upload_failed) last_free_mb is 0 until the
          * next probe: the card counts as full, also for an empty cache. */
-        static long long last_free_mb = -1;
-        static unsigned probes;
-        static int upload_failed;
-        if (grow && !unified && (cache->count > 0 || upload_failed)) {
-            if (last_free_mb < 0 ||
-                (probes++ % COLI_V4_MIRROR_PROBE_EVERY) == 0) {
-                last_free_mb = dsv4_cuda_mem_free_mb(cache->device);
-                upload_failed = 0;
+        if (grow && !cache->unified &&
+            (cache->count > 0 || cache->upload_failed)) {
+            if (cache->last_free_mb < 0 ||
+                (cache->probes++ % COLI_V4_MIRROR_PROBE_EVERY) == 0) {
+                cache->last_free_mb = dsv4_cuda_mem_free_mb(cache->device);
+                cache->upload_failed = 0;
             }
-            if (last_free_mb >= 0 && last_free_mb < reserve_mb) grow = 0;
+            if (cache->last_free_mb >= 0 && cache->last_free_mb < reserve_mb) grow = 0;
         }
         if (!grow && cache->count == 0) {
             pthread_mutex_unlock(&cache->mutex);
@@ -12374,7 +12391,7 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
          * reported the CUDA error), so only a probe below the reserve warns. */
         if (!grow && cache->count < 8) {
             static int warned;
-            if (!warned && !upload_failed) {
+            if (!warned && !cache->upload_failed) {
                 warned = 1;
                 fprintf(stderr, "v4_gpu mirror-cache: frozen below the VRAM reserve "
                                 "with %d live entries; a layer attaches up to 8 "
@@ -12414,7 +12431,7 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                     (int)view->down.columns, sync)) {
                 cache->entries[found].layer = view->key.layer;
                 cache->entries[found].expert = view->key.expert;
-                cache->entries[found].clock = ++cache->clock;
+                cache->entries[found].clock = v4_mirror_tick();
                 g_v4_mirror_uploads++;
                 view->gate.gpu = cache->entries[found].gate;
                 view->up.gpu = cache->entries[found].up;
@@ -12475,8 +12492,8 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                 cache->count--;
             else
                 cache->entries[found] = cache->entries[--cache->count];
-            last_free_mb = 0;
-            upload_failed = 1;
+            cache->last_free_mb = 0;
+            cache->upload_failed = 1;
             pthread_mutex_unlock(&cache->mutex);
             return -1;
         }
@@ -12485,7 +12502,7 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
         cache->entries[found].down = down;
         g_v4_mirror_uploads++;
     }
-    cache->entries[found].clock = ++cache->clock;
+    cache->entries[found].clock = v4_mirror_tick();
     view->gate.gpu = cache->entries[found].gate;
     view->up.gpu = cache->entries[found].up;
     view->down.gpu = cache->entries[found].down;
@@ -12551,7 +12568,7 @@ int coli_v4_gpu_expert_peek(ColiExpertStore *store, ColiExpertView *view) {
             cache->entries[i].expert == view->key.expert &&
             cache->entries[i].gate && cache->entries[i].up &&
             cache->entries[i].down) {
-            cache->entries[i].clock = ++cache->clock;
+            cache->entries[i].clock = v4_mirror_tick();
             view->gate.gpu = cache->entries[i].gate;
             view->up.gpu = cache->entries[i].up;
             view->down.gpu = cache->entries[i].down;
