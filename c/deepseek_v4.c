@@ -10874,6 +10874,7 @@ fail:
 #if defined(COLI_V4_GPU_TIER)
 #include "deepseek_v4_internal.h"
 #include "backend_cuda_dsv4.h"
+#include "deepseek_v4_bank_pair.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -10891,8 +10892,11 @@ static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_capacity(
 static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create(int device,
                                                             int suggested);
 static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache);
+int v4_bank_double_on(void);
 static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                                           ColiExpertView *view, int sync);
+static void v4_gpu_mirror_reserve_size(const ColiDeepSeekV4Config *config);
+static long long v4_gpu_mirror_reserve_mb(int live);
 
 int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     if (!engine) return -1;
@@ -10917,6 +10921,7 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     }
     engine->gpu.enabled = 1;
     engine->gpu.device = device;
+    v4_gpu_mirror_reserve_size(&engine->config);
     /* Routed-expert fp4 mirror cache hangs off the expert store; attach it at
      * open so moe_token_pipeline can mirror expert weights on demand. Default
      * capacity covers the pinned (hot) experts per layer so autopin never
@@ -11454,29 +11459,21 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
     }
     if (found < 0) {
         /* Growth guard: new mirrors may only claim VRAM while a reserve
-         * stays free for the transient prefill allocations (the expert bank,
-         * 3264 MiB or 3456 MiB on DeepGEMM builds, + attention buffers).
-         * Below the reserve, recycle the LRU slot instead of growing —
-         * decode keeps its hottest experts and the next large prefill still
-         * fits if the reserve covers the bank. */
+         * stays free for the transient prefill allocations (the expert
+         * bank(s) + attention buffers). Below the reserve, recycle the LRU
+         * slot instead of growing — decode keeps its hottest experts and
+         * the next large prefill still fits. */
         int grow = cache->count < cache->capacity;
-        /* VRAM reserve kept free while mirrors grow: meant for the transient
-         * prefill expert bank (COLI_CUDA_MOE_BATCH) plus attention buffers.
-         * DSV4_CUDA_VRAM_RESERVE_MB overrides; the default only reserves
-         * when that path is enabled, so small cards can still mirror. The
-         * 2800 MiB default is smaller than the bank: once the cache has grown
-         * to it, the next large prefill cannot allocate the bank and runs on
-         * the CPU union (docs: VRAM budget, ~4700 keeps the bank's room). */
-        static long long reserve_mb = -1;
-        if (reserve_mb < 0) {
-            const char *env = getenv("DSV4_CUDA_VRAM_RESERVE_MB");
-            reserve_mb = env ? atoll(env)
-                             : (coli_v4_gpu_moe_batch_wanted() ? 2800 : 600);
-            if (reserve_mb < 256) reserve_mb = 256;
-        }
+        /* The default reserve is sized from the model's bank at engine open,
+         * covers the COLI_CUDA_MOE_DOUBLE second bank while that is on, and
+         * is only the attention headroom until the cache holds a minimum
+         * working set (v4_gpu_mirror_reserve_mb); DSV4_CUDA_VRAM_RESERVE_MB
+         * overrides. */
+        long long reserve_mb = v4_gpu_mirror_reserve_mb(cache->count);
         /* cudaMemGetInfo is a driver round trip; with a large capacity the
          * guard is consulted on every miss (hundreds per token), so re-check
-         * free VRAM only every 64 misses and reuse the last answer between. */
+         * free VRAM only every 64 misses and reuse the last answer between
+         * (the default reserve carries that many mirrors of margin). */
         /* On unified memory (GB10, Jetson) cudaMemGetInfo's free is the
          * system's MemFree, which the page cache holding the model keeps
          * near zero; measured against a VRAM reserve it froze this cache at
@@ -11498,7 +11495,8 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
         static unsigned probes;
         static int upload_failed;
         if (grow && !unified && (cache->count > 0 || upload_failed)) {
-            if (last_free_mb < 0 || (probes++ & 63) == 0) {
+            if (last_free_mb < 0 ||
+                (probes++ % COLI_V4_MIRROR_PROBE_EVERY) == 0) {
                 last_free_mb = dsv4_cuda_mem_free_mb(cache->device);
                 upload_failed = 0;
             }
@@ -11721,10 +11719,10 @@ int coli_v4_gpu_dspark_mirrors_ensure(ColiV4Engine *engine) {
  * rebind for free (they are the layer's resident fp8 mirrors).
  *
  * Opt-in via COLI_CUDA_MOE_BATCH=1: the bank competes for VRAM with the
- * decode-path expert mirror cache (whose growth guard keeps
- * DSV4_CUDA_VRAM_RESERVE_MB free while this is enabled). Any failure —
- * allocation, missing mirror, backend stub — falls back to the CPU union
- * for the whole generation. */
+ * decode-path expert mirror cache (whose growth guard keeps the bank's room
+ * free, v4_gpu_mirror_reserve_mb). Any failure — allocation, missing
+ * mirror, backend stub — falls back to the CPU union for the whole
+ * generation. */
 int coli_v4_gpu_moe_batch_wanted(void) {
     static int wanted = -1;
     if (wanted < 0) {
@@ -11768,8 +11766,6 @@ int coli_v4_route_bf16_logits(float *weights, int *indices, const float *hidden,
  * generate() releases it when the prefill loop finishes; the next large
  * prefill re-creates and re-fills it (per-layer refill cost only, on prompts
  * that already run tens of seconds). */
-#include "deepseek_v4_bank_pair.h"
-
 static Dsv4CudaExpertSet *v4_moe_bank;
 static int v4_moe_bank_layer = -1;
 static int v4_moe_bank_hash_layer = -1;
@@ -11801,7 +11797,7 @@ static int v4_bank2_alloc_failed;    /* this prefill only; release() clears */
 static unsigned long long v4_bank2_swaps, v4_bank2_prefetched;
 static struct { ColiExpertStore *store; int layer; int experts; } v4_bank2_job;
 
-static int v4_bank_double_on(void) {
+int v4_bank_double_on(void) {
     static int on = -1;
     if (on < 0) {
         const char *setting = getenv("COLI_CUDA_MOE_DOUBLE");
@@ -11811,9 +11807,56 @@ static int v4_bank_double_on(void) {
 }
 
 /* COLI_CUDA_MOE_DOUBLE is on and the second bank is not off for good: the
- * next prefill will try to allocate it. */
+ * next prefill will try to allocate it, so this (not v4_bank_double_on) is
+ * whether VRAM should be kept free for it. */
 static int v4_bank_double_usable(void) {
     return v4_bank_double_on() && !v4_bank2_disabled;
+}
+
+/* One bank and one decode mirror of this model (bytes), sized at engine
+ * open: the attach path that consults the reserve has no model config. */
+static long long v4_reserve_bank_bytes, v4_reserve_mirror_bytes;
+
+static void v4_gpu_mirror_reserve_size(const ColiDeepSeekV4Config *config) {
+    long long hidden = config->hidden_size;
+    long long intermediate = config->moe_intermediate_size;
+    int slots = dsv4_cuda_expert_bank_slots(config->n_routed_experts);
+    /* gate, up (intermediate x hidden) and down (hidden x intermediate):
+     * fp4 nibbles plus one UE8M0 scale per 32, as dsv4_cuda_upload_fp4. */
+    v4_reserve_mirror_bytes =
+        3 * (intermediate * hidden / 2 + intermediate * hidden / 32);
+    v4_reserve_bank_bytes =
+        coli_v4_gpu_moe_batch_wanted() && slots > 0
+            ? slots * dsv4_cuda_expert_bank_slot_bytes((int)hidden,
+                                                       (int)intermediate)
+            : 0;
+    if (v4_reserve_bank_bytes > 0 && !getenv("DSV4_CUDA_VRAM_RESERVE_MB"))
+        fprintf(stderr, "v4_gpu mirror-reserve=%lldMiB (%d-slot bank %.0fMiB "
+                        "x%d + %dMiB headroom + %d mirrors; "
+                        "DSV4_CUDA_VRAM_RESERVE_MB overrides)\n",
+                v4_gpu_mirror_reserve_mb(COLI_V4_MIRROR_MIN_LIVE), slots,
+                v4_reserve_bank_bytes / 1048576.0,
+                v4_bank_double_usable() ? 2 : 1, COLI_V4_RESERVE_HEADROOM_MB,
+                COLI_V4_MIRROR_PROBE_EVERY);
+}
+
+/* VRAM the decode mirror cache keeps free while it grows past `live` entries
+ * (the growth guard in v4_gpu_expert_attach_cached_ex): the explicit
+ * DSV4_CUDA_VRAM_RESERVE_MB as given, else the bank-sized default
+ * (deepseek_v4_bank_pair.h), whose second bank drops out once
+ * COLI_CUDA_MOE_DOUBLE has latched off (v4_bank_double_usable). */
+static long long v4_gpu_mirror_reserve_mb(int live) {
+    static long long explicit_mb = -2;
+    if (explicit_mb == -2) {
+        const char *env = getenv("DSV4_CUDA_VRAM_RESERVE_MB");
+        explicit_mb = env ? atoll(env) : -1;
+        if (env && explicit_mb < 256) explicit_mb = 256;
+    }
+    if (explicit_mb >= 0) return explicit_mb;
+    return coli_v4_mirror_reserve_mb(
+        v4_reserve_bank_bytes,
+        v4_bank_double_usable() ? 2 : 1,
+        v4_reserve_mirror_bytes, live);
 }
 
 static void *v4_bank2_worker(void *argument) {
