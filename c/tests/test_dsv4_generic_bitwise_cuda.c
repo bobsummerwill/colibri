@@ -2,22 +2,25 @@
  *
  * dsv4_cuda_route_moe_ids_batch, the generic batched prefill MoE, has two
  * routed-expert kernels: one fp4 matvec per route (DSV4_MOE_EXPERT_MAJOR=0)
- * and the expert-major default, DSV4_MOE_EM_TB routes per pass. The two are
- * claimed bit-identical.
+ * and the expert-major default, DSV4_MOE_EM_TB routes per pass. run_mm_batch
+ * (dsv4_cuda_matmul_batch, and the shared experts of the MoE above) has the
+ * block kernel and the warp-per-row one (DSV4_MM_WARP, on fp8 shapes whose I
+ * is a multiple of 256: auto = I <= 1024, 1 = all of them, 0 = never). Each
+ * pair is claimed bit-identical.
  *
  * The backend reads those variables once per process, so this test re-runs
  * itself once per setting ("--child") and compares every child's output
  * hashes with the default run's; the _VERIFY settings add the backend's own
  * raw fp32 comparison of both kernels. Each child also checks the outputs
- * against the per-token decode entry point (dsv4_cuda_moe), so variants that
- * agree on garbage still fail. Those agree exactly today, but the check
- * allows rounding: decode kernels are free to change.
+ * against the per-token decode entry points (dsv4_cuda_moe, dsv4_cuda_matvec),
+ * so variants that agree on garbage still fail. Those agree exactly today,
+ * but the check allows rounding: decode kernels are free to change.
  *
  * Small on purpose (about 450 MiB of device memory per child, the CUDA
  * context included): a 9-expert bank (~115 MiB) at the H=4096 / I=2048 the
- * entry point requires. Chunk sizes include 1 and tails that are not
- * multiples of any TB. DeepGEMM builds do not have the kernel pair, so the
- * test skips there. */
+ * entry point requires, plus ~70 MiB of dense weights. Chunk and token counts
+ * include 1 and tails that are not multiples of any TB or tile. DeepGEMM
+ * builds have neither kernel pair, so the test skips there. */
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -36,6 +39,8 @@ static void env_set(const char *name, const char *value){if(value)setenv(name, v
 enum { H=4096, I=2048, E=9, K=6, MAXT=128 };
 #define COUNT(a) ((int)(sizeof(a)/sizeof(*(a))))
 static const int chunks[]={1,2,3,5,8,13,31,64,127,128};           /* MoE chunk sizes */
+static const struct { int O,In,fmt; } shapes[]={{32768,1024,8},{32768,1024,9},{1000,1024,8},{384,512,9},{520,2048,8}};
+static const int tokens[]={1,5,8,13,16,31,128};                    /* dense batch sizes */
 
 static uint64_t g_rng;
 static uint32_t rnd(void){g_rng=g_rng*6364136223846793005ull+1442695040888963407ull;return (uint32_t)(g_rng>>33);}
@@ -102,6 +107,22 @@ static int child(void){
     for(int e=0;e<E;e++){dsv4_cuda_tensor_free(g[e]);dsv4_cuda_tensor_free(u[e]);dsv4_cuda_tensor_free(d[e]);}
     dsv4_cuda_expert_set_free(bank);dsv4_cuda_tensor_free(sd);dsv4_cuda_tensor_free(su);dsv4_cuda_tensor_free(sg);
     free(ids);free(wt);free(ref);free(got);free(x);
+    /* ---- dense batch: warp kernel by default for I <= 1024 ---- */
+    for(int s=0;s<COUNT(shapes);s++){int O=shapes[s].O,In=shapes[s].In;seed(200+s);
+        Dsv4CudaTensor*w=fp8_tensor(O,In,shapes[s].fmt);
+        float*dx=malloc((size_t)MAXT*In*sizeof(float)),*dy=malloc((size_t)MAXT*O*sizeof(float)),*dr=malloc((size_t)O*sizeof(float));
+        Dsv4CudaActivation*din=dsv4_cuda_activation_create(dev,(long long)MAXT*In),*dout=dsv4_cuda_activation_create(dev,(long long)MAXT*O);
+        if(!w||!dx||!dy||!dr||!din||!dout)return 10;
+        for(int j=0;j<COUNT(tokens);j++){int T=tokens[j];fill_x(dx,(size_t)T*In);
+            if(!dsv4_cuda_activation_upload(din,dx,(long long)T*In)||!dsv4_cuda_matmul_batch(w,din,T,dout)||
+               !dsv4_cuda_activation_download(dy,dout,(long long)T*O)||!dsv4_cuda_activation_sync(dout)){fprintf(stderr,"matmul batch failed\n");return 11;}
+            printf("dense %dx%d fmt=%d T=%d %016llx\n",O,In,shapes[s].fmt,T,(unsigned long long)fnv(dy,(size_t)T*O*sizeof(float)));fflush(stdout);
+            int probe[2]={0,T-1};
+            for(int p=0;p<2;p++){int t=probe[p];if(!dsv4_cuda_matvec(w,dr,dx+(size_t)t*In)){fprintf(stderr,"matvec failed\n");return 12;}
+                if(!close_rows(dy+(size_t)t*O,dr,O,1e-4f,"dense vs matvec, T/token",T,t))return 13;}
+        }
+        dsv4_cuda_activation_free(dout);dsv4_cuda_activation_free(din);dsv4_cuda_tensor_free(w);free(dr);free(dy);free(dx);
+    }
     dsv4_cuda_shutdown();return 0;
 }
 
@@ -110,14 +131,17 @@ static int child(void){
  * compare their raw fp32 outputs (before the bf16 roundings that can hide a
  * difference in the MoE result); the backend prints a report when it counts a
  * mismatch, and any non-zero count fails the test. */
-static const char *const knobs[]={"DSV4_MOE_EXPERT_MAJOR","DSV4_MOE_EM_TB","DSV4_MOE_EXPERT_MAJOR_VERIFY"};
+static const char *const knobs[]={"DSV4_MOE_EXPERT_MAJOR","DSV4_MOE_EM_TB","DSV4_MOE_EXPERT_MAJOR_VERIFY","DSV4_MM_WARP","DSV4_MM_WARP_VERIFY"};
 static const char *const settings[][4]={
-    {NULL},                                       /* defaults: expert-major TB=4 (the reference) */
+    {NULL},                                       /* defaults: expert-major TB=4, MM_WARP auto (the reference) */
     {"DSV4_MOE_EXPERT_MAJOR","0"},                /* one matvec per route */
     {"DSV4_MOE_EXPERT_MAJOR","1"},
     {"DSV4_MOE_EM_TB","2"},{"DSV4_MOE_EM_TB","3"},{"DSV4_MOE_EM_TB","4"},{"DSV4_MOE_EM_TB","6"},
     {"DSV4_MOE_EXPERT_MAJOR_VERIFY","1","DSV4_MOE_EM_TB","2"},{"DSV4_MOE_EXPERT_MAJOR_VERIFY","1","DSV4_MOE_EM_TB","3"},
     {"DSV4_MOE_EXPERT_MAJOR_VERIFY","1","DSV4_MOE_EM_TB","4"},{"DSV4_MOE_EXPERT_MAJOR_VERIFY","1","DSV4_MOE_EM_TB","6"},
+    {"DSV4_MM_WARP","0"},                         /* block kernel everywhere */
+    {"DSV4_MM_WARP","1"},                         /* warp kernel on every fp8 shape, the MoE's shared experts included */
+    {"DSV4_MM_WARP","1","DSV4_MM_WARP_VERIFY","1"},
 };
 
 /* Runs one child under `set` and keeps only its hash lines in `hashes`:
@@ -134,10 +158,10 @@ static int run_child(const char *self,const char *const *set,char *hashes,size_t
     hashes[0]=0;
     for(char*line=all,*next;*line;line=next){
         char*nl=strchr(line,'\n');next=nl?nl+1:line+strlen(line);if(nl)*nl=0;
-        if(!strncmp(line,"moe ",4)){size_t l=strlen(line);if(used+l+2>cap)return 0;memcpy(hashes+used,line,l);used+=l;hashes[used++]='\n';hashes[used]=0;continue;}
+        if(!strncmp(line,"moe ",4)||!strncmp(line,"dense ",6)){size_t l=strlen(line);if(used+l+2>cap)return 0;memcpy(hashes+used,line,l);used+=l;hashes[used++]='\n';hashes[used]=0;continue;}
         if(!strstr(line,"verify calls="))continue;
-        /* "fc1_mismatch=N fc2_mismatch=N" */
-        for(const char*m=line;(m=strstr(m,"mismatch"))!=NULL;m+=8){const char*q=m+8;
+        /* "fc1_mismatch=N fc2_mismatch=N" (MoE) or "mismatches=N" (dense) */
+        for(const char*m=line;(m=strstr(m,"mismatch"))!=NULL;m+=8){const char*q=m+8;if(!strncmp(q,"es",2))q+=2;
             if(*q=='='&&strtoull(q+1,NULL,10)){fprintf(stderr,"%s: the backend's own check found mismatching bits:\n  %s\n",label,line);return -1;}}
     }
     return 1;
@@ -145,10 +169,10 @@ static int run_child(const char *self,const char *const *set,char *hashes,size_t
 
 int main(int argc,char **argv){
     if(argc>1&&!strcmp(argv[1],"--child"))return child();
-    if(strcmp(dsv4_cuda_backend_name(),"generic")){printf("dsv4 generic bitwise: SKIP (%s build has no generic kernel pair)\n",dsv4_cuda_backend_name());return 0;}
+    if(strcmp(dsv4_cuda_backend_name(),"generic")){printf("dsv4 generic bitwise: SKIP (%s build has no generic kernel pairs)\n",dsv4_cuda_backend_name());return 0;}
     enum { CAP=1<<16 };static char ref[CAP],got[CAP];char label[256];
     int r=run_child(argv[0],settings[0],ref,CAP,label,sizeof(label));if(r<=0)return r<0?2:1;
-    int lines=0,want=COUNT(chunks);for(const char*c=ref;*c;c++)lines+=*c=='\n';
+    int lines=0,want=COUNT(chunks)+COUNT(shapes)*COUNT(tokens);for(const char*c=ref;*c;c++)lines+=*c=='\n';
     if(lines!=want){fprintf(stderr,"defaults: %d output hashes, expected %d\n",lines,want);return 1;}
     for(int s=1;s<COUNT(settings);s++){
         if((r=run_child(argv[0],settings[s],got,CAP,label,sizeof(label)))<=0)return r<0?2:1;
