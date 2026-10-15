@@ -70,6 +70,9 @@ int main(void) {
     CHECK(coli_v4_mirror_reserve_mb(256 * slot_dg, 1, mirror, many) == 4873,
           "256 DeepGEMM: 600 + 3456 + 816, got %lld",
           coli_v4_mirror_reserve_mb(256 * slot_dg, 1, mirror, many));
+    CHECK(coli_v4_mirror_reserve_mb(256 * slot_dg, 2, mirror, many) == 8329,
+          "256 DeepGEMM, double: 600 + 6912 + 816, got %lld",
+          coli_v4_mirror_reserve_mb(256 * slot_dg, 2, mirror, many));
     /* the guard probes free VRAM every COLI_V4_MIRROR_PROBE_EVERY misses:
      * with the last probe just above the reserve, the growth until the next
      * one must still leave the bank(s) and the headroom free */

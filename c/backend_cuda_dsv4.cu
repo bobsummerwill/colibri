@@ -284,12 +284,13 @@ template<int F,int TB> __global__ void __launch_bounds__(256) mm_batch_w(const u
     }
 }
 static void run_mm_batch(Dsv4CudaTensor*t,const float*x,float*y,int T,cudaStream_t stream){
-    /* DSV4_MM_WARP: unset, empty or "auto" = warp kernel for short rows only
-     * (I <= 1024, e.g. attn.wq_b, where mm_batch spends most of each block in
-     * its tree); 1 (any non-zero number) = every fp8 shape; 0 = never. Kernel
-     * time against mm_batch on sm_86: ~0.4-0.55x at I = 1024, ~0.8x at
-     * I = 2048 (shared w2, 4096x2048), ~1.1x at I = 4096, ~1.65x at I = 8192;
-     * auto stays at I <= 1024 until I = 2048 is checked in the engine.
+    /* DSV4_MM_WARP, for fp8 shapes whose I is a multiple of 256: unset, empty
+     * or "auto" = warp kernel for short rows only (I <= 1024, e.g. attn.wq_b,
+     * where mm_batch spends most of each block in its tree); 1 (any non-zero
+     * number) = all of them; 0 = never. Kernel time against mm_batch on sm_86:
+     * ~0.4-0.55x at I = 1024, ~0.8x at I = 2048 (shared w2, 4096x2048), ~1.1x
+     * at I = 4096, ~1.65x at I = 8192; auto stays at I <= 1024 until I = 2048
+     * is checked in the engine.
      * DSV4_MM_WARP_VERIFY=1 also runs mm_batch, keeps ITS results and counts
      * mismatching bits; over DSV4_MM_WARP=0 it checks the auto shapes (said
      * once at startup). */
@@ -1507,7 +1508,7 @@ extern "C" int dsv4_cuda_init(const int *dev,int n){if(n<1||n>16)return 0;float 
 #endif
     return 1;}
 extern "C" void dsv4_cuda_shutdown(void){dev_release(ng);}
-extern "C" Dsv4CudaActivation *dsv4_cuda_activation_create(int device,long long elements){Dev*c=ctx(device);if(!c||elements<1||!ok(cudaSetDevice(device),"select activation device"))return nullptr;Dsv4CudaActivation*a=(Dsv4CudaActivation*)calloc(1,sizeof(*a));if(!a)return nullptr;a->device=device;a->elements=elements;if(!ok(cudaMalloc(&a->data,(size_t)elements*sizeof(float)),"activation allocation")){free(a);return nullptr;}return a;}
+extern "C" Dsv4CudaActivation *dsv4_cuda_activation_create(int device,long long elements){Dev*c=ctx(device);if(!c||elements<1||!ok(cudaSetDevice(device),"select activation device"))return nullptr;Dsv4CudaActivation*a=(Dsv4CudaActivation*)calloc(1,sizeof(*a));if(!a)return nullptr;a->device=device;a->elements=elements;if(!alloc_ok(cudaMalloc(&a->data,(size_t)elements*sizeof(float)),"activation allocation")){free(a);return nullptr;}return a;}
 extern "C" void dsv4_cuda_activation_free(Dsv4CudaActivation*a){if(!a)return;cudaSetDevice(a->device);cudaFree(a->data);free(a);}
 extern "C" int dsv4_cuda_activation_upload(Dsv4CudaActivation*a,const float*x,long long n){Dev*c=a?ctx(a->device):nullptr;if(!c||!x||n<0||n>a->elements||!ok(cudaSetDevice(a->device),"select activation upload device"))return 0;return ok(cudaMemcpyAsync(a->data,x,(size_t)n*sizeof(float),cudaMemcpyHostToDevice,c->stream),"activation upload");}
 extern "C" int dsv4_cuda_activation_download(float*x,const Dsv4CudaActivation*a,long long n){Dev*c=a?ctx(a->device):nullptr;if(!c||!x||n<0||n>a->elements||!ok(cudaSetDevice(a->device),"select activation download device"))return 0;return ok(cudaMemcpyAsync(x,a->data,(size_t)n*sizeof(float),cudaMemcpyDeviceToHost,c->stream),"activation download");}

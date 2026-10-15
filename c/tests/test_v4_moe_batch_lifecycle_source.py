@@ -22,15 +22,24 @@ from pathlib import Path
 SOURCE = Path(__file__).resolve().parent.parent / "deepseek_v4.c"
 
 
+def find(text, needle, start=0, where="deepseek_v4.c"):
+    """text.index(needle, start), except that a missing needle fails the test
+    with a message naming it rather than erroring with a bare ValueError."""
+    at = text.find(needle, start)
+    if at < 0:
+        raise AssertionError(f"{where}: no {needle!r}")
+    return at
+
+
 def function_body(text, signature):
-    start = text.index(signature)
-    end = text.index("\n}\n", start)
+    start = find(text, signature)
+    end = find(text, "\n}\n", start)
     return text[start:end]
 
 
 def call_arguments(text, start):
     """Top-level arguments of the call whose '(' is at or after start."""
-    open_at = text.index("(", start)
+    open_at = find(text, "(", start)
     depth, current, arguments = 0, [], []
     for char in text[open_at + 1:]:
         if char == "(":
@@ -53,26 +62,35 @@ class V4MoeBatchLifecycleSourceTest(unittest.TestCase):
         self.text = SOURCE.read_text(encoding="utf-8")
 
     def test_target_batch_passes_the_prefill_intent_down(self):
+        where = "target_batch"
         body = function_body(self.text, "static int target_batch(ColiV4Engine")
-        mark = body.index("coli_v4_gpu_moe_batch_prefill(use_prefill_pool ? 1 : 0);")
-        call = body.index("target_batch_impl(", mark)
-        clear = body.index("coli_v4_gpu_moe_batch_prefill(-1);", call)
-        self.assertLess(mark, call)
-        self.assertLess(call, clear)
+        mark = find(body, "coli_v4_gpu_moe_batch_prefill(use_prefill_pool ? 1 : 0);",
+                    where=where)
+        call = find(body, "target_batch_impl(", mark,
+                    where=f"{where}, after setting the prefill flag")
+        find(body, "coli_v4_gpu_moe_batch_prefill(-1);", call,
+             where=f"{where}, after the target_batch_impl call")
 
     def test_union_refuses_decode_batches_before_any_bank_work(self):
+        where = "coli_v4_gpu_moe_batch_union"
         body = function_body(self.text, "int coli_v4_gpu_moe_batch_union(")
-        refuse = body.index("if (!v4_gpu_moe_batch_in_prefill) return -1;")
-        self.assertLess(refuse, body.index("dsv4_cuda_expert_bank_create("))
-        self.assertLess(refuse, body.index("pthread_create(&v4_bank2_thread"))
+        refuse = find(body, "if (!v4_gpu_moe_batch_in_prefill) return -1;",
+                      where=where)
+        for bank_work in ("dsv4_cuda_expert_bank_create(",
+                          "pthread_create(&v4_bank2_thread"):
+            self.assertLess(refuse, find(body, bank_work, where=where),
+                            f"{where} reaches {bank_work} before the refusal")
 
     def test_generate_prefill_passes_1_and_decode_passes_0(self):
+        where = "session_generate_impl"
         body = function_body(self.text, "static int session_generate_impl(")
-        release = body.index("coli_v4_gpu_moe_batch_release();")
+        release = find(body, "coli_v4_gpu_moe_batch_release();", where=where)
         calls = [match.start() for match in
                  re.finditer(r"\btarget_batch\(", body)]
-        self.assertTrue(any(at < release for at in calls))
-        self.assertTrue(any(at > release for at in calls))
+        self.assertTrue(any(at < release for at in calls),
+                        f"{where}: no target_batch call before the release")
+        self.assertTrue(any(at > release for at in calls),
+                        f"{where}: no target_batch call after the release")
         for at in calls:
             arguments = call_arguments(body, at)
             self.assertEqual(len(arguments), 15, arguments)
@@ -80,27 +98,36 @@ class V4MoeBatchLifecycleSourceTest(unittest.TestCase):
                              f"target_batch at offset {at}: {arguments}")
 
     def test_every_generate_exit_releases_the_bank(self):
+        where = "coli_v4_session_generate"
         body = function_body(self.text, "int coli_v4_session_generate(ColiV4Session")
-        call = body.index("int result = session_generate_impl(")
-        release = body.index("coli_v4_gpu_moe_batch_release();", call)
-        self.assertLess(release, body.index("return result;", release))
-        self.assertEqual(body.count("return"), 1)
+        call = find(body, "int result = session_generate_impl(", where=where)
+        release = find(body, "coli_v4_gpu_moe_batch_release();", call,
+                       where=f"{where}, after the session_generate_impl call")
+        find(body, "return result;", release, where=f"{where}, after the release")
+        self.assertEqual(body.count("return"), 1,
+                         f"{where}: expected exactly one return")
 
     def test_engine_close_releases_before_teardown(self):
+        where = "coli_v4_gpu_engine_close"
         body = function_body(self.text, "void coli_v4_gpu_engine_close(")
-        release = body.index("coli_v4_gpu_moe_batch_release();")
+        release = find(body, "coli_v4_gpu_moe_batch_release();", where=where)
         for later in ("dsv4_cuda_tensor_free(", "v4_gpu_expert_mirrors_free(",
                       "dsv4_cuda_shutdown();"):
-            self.assertLess(release, body.index(later), later)
+            self.assertLess(release, find(body, later, where=where),
+                            f"{where} calls {later} before the release")
 
     def test_only_the_structural_bank2_latch_is_permanent(self):
         release = function_body(self.text, "void coli_v4_gpu_moe_batch_release(")
         self.assertIn("v4_bank2_alloc_failed = 0;", release)
         self.assertNotIn("v4_bank2_disabled = 0;", self.text)
+        where = "coli_v4_gpu_moe_batch_union"
         union = function_body(self.text, "int coli_v4_gpu_moe_batch_union(")
-        failed = union.index("if (!v4_moe_bank2) {", union.index(
-            "v4_moe_bank2 = dsv4_cuda_expert_bank_create("))
-        branch = union[failed:union.index("} else {", failed)]
+        create = find(union, "v4_moe_bank2 = dsv4_cuda_expert_bank_create(",
+                      where=where)
+        failed = find(union, "if (!v4_moe_bank2) {", create,
+                      where=f"{where}, after the second bank's allocation")
+        branch = union[failed:find(union, "} else {", failed,
+                                   where=f"{where}, after the failed branch")]
         self.assertIn("v4_bank2_alloc_failed = 1;", branch)
         self.assertNotIn("v4_bank2_disabled", branch)
         self.assertIn("v4_bank_double_usable() && !v4_bank2_alloc_failed", union)

@@ -12,7 +12,7 @@ int main(void){
     /* dsv4_cuda_route_moe_batch (GPU top-6 + MoE in one call) is DeepGEMM-only:
      * generic builds compile it as a `return 0` stub. The engine's batched
      * prefill routes first and calls route_moe_ids_batch, whose generic path
-     * test_dsv4_generic_bitwise_cuda.c covers. Skip before the 3.2 GB bank. */
+     * test_dsv4_generic_bitwise_cuda.c covers. Skip before the 3.2 GiB bank. */
     if(!strcmp(dsv4_cuda_backend_name(),"generic")){puts("dsv4 MoE batch: SKIP (generic build: dsv4_cuda_route_moe_batch needs DeepGEMM)");return 0;}
     int dev=0;if(!dsv4_cuda_init(&dev,1))return 1;
     Dsv4CudaTensor*sg=fp8_zero(I,H),*su=fp8_zero(I,H),*sd=fp8_zero(H,I),*gate=NULL;

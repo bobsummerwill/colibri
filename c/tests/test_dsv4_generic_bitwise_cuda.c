@@ -4,8 +4,9 @@
  * routed-expert kernels: one fp4 matvec per route (DSV4_MOE_EXPERT_MAJOR=0)
  * and the expert-major default, DSV4_MOE_EM_TB routes per pass. run_mm_batch
  * (dsv4_cuda_matmul_batch, and the shared experts of the MoE above) has the
- * block kernel and the warp-per-row one (DSV4_MM_WARP: auto = I <= 1024,
- * 1 = every fp8 shape, 0 = never). Each pair is claimed bit-identical.
+ * block kernel and the warp-per-row one (DSV4_MM_WARP, on fp8 shapes whose I
+ * is a multiple of 256: auto = I <= 1024, 1 = all of them, 0 = never). Each
+ * pair is claimed bit-identical.
  *
  * The backend reads those variables once per process, so this test re-runs
  * itself once per setting ("--child") and compares every child's output
