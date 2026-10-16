@@ -9975,15 +9975,37 @@ static V4ExpertSlot *hot_oldest_pool_victim(
     return last_resort;
 }
 
-static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
-                      ColiExpertView *view) {
+/* state->mutex held. The books one routing of `key` keeps: the pin ranking's
+ * usage and its per-layer request clock (the pin ramp, the repin cadence, the
+ * usage decay), the dashboard's HITS and heat, and the .coli_usage history.
+ * Every lookup_hot counts one; so do the routings computed elsewhere
+ * (coli_v4_expert_store_note_routed, coli_v4_expert_store_note_union). */
+static void hot_count_locked(V4HotPolicy *policy, V4ExpertStoreState *state,
+                             ColiExpertKey key) {
+    size_t index = (size_t)key.layer * state->experts_per_layer + key.expert;
+    policy->usage[index]++;
+    if (state->ehit) {
+        state->ehit[index] = 1;
+        if (state->eheat && state->eheat[index] < 63) state->eheat[index]++;
+    }
+    rt_count(key.layer, &key.expert, 1);   /* selection history, shared format (#700) */
+    uint64_t layer_requests = ++policy->layer_requests[key.layer];
+    if (policy->repin_interval &&
+        layer_requests % policy->repin_interval == 0)
+        hot_repin_locked(policy, state, key.layer);
+}
+
+/* policy: hot_find(store). counted = 0: a read whose routing the caller
+ * counts itself (coli_v4_expert_store_lookup_uncounted); the lookup is
+ * otherwise the same, its request, hit and miss counters included. */
+static int hot_lookup(ColiExpertStore *store, V4HotPolicy *policy,
+                      ColiExpertKey key, ColiExpertView *view, int counted) {
     if (!store || !store->state || !view) {
         if (view) memset(view, 0, sizeof(*view));
         return -1;
     }
     V4ExpertStoreState *state = store->state;
     V4ExpertRecord *record = get_record(state, key);
-    V4HotPolicy *policy = hot_find(store);
     if (!record || !policy) {
         memset(view, 0, sizeof(*view));
         return -1;
@@ -9991,15 +10013,7 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
     pthread_mutex_lock(&state->mutex);
     if (!policy->warming) {   /* the fill before the first request is not a use */
     state->stats.requests++;
-    policy->usage[(size_t)key.layer * state->experts_per_layer + key.expert]++;
-    if (state->ehit) {
-        size_t expert_index =
-            (size_t)key.layer * state->experts_per_layer + key.expert;
-        state->ehit[expert_index] = 1;
-        if (state->eheat && state->eheat[expert_index] < 63)
-            state->eheat[expert_index]++;
-    }
-    rt_count(key.layer, &key.expert, 1);   /* selection history, shared format (#700) */
+    if (counted) hot_count_locked(policy, state, key);
     /* ESPERIMENTO LOCALE (replay policy cache): sequenza ordinata delle
      * richieste come le vede la cache, hit e miss. V4_REPLAY_TRACE=<path>. */
     {
@@ -10009,11 +10023,7 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
             if (rp) replay_fp = fopen(rp, "w"); }
         if (replay_fp) fprintf(replay_fp, "%d %d\n", key.layer, key.expert);
     }
-    uint64_t layer_requests = ++policy->layer_requests[key.layer];
-    if (policy->repin_interval &&
-        layer_requests % policy->repin_interval == 0)
-        hot_repin_locked(policy, state, key.layer);
-    }
+    }   /* !warming; hot_count_locked repins */
 
     V4ExpertSlot *slot;
 retry_lookup:
@@ -10129,6 +10139,11 @@ retry_lookup:
     pthread_mutex_unlock(&state->mutex); return 0;
 }
 
+static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
+                      ColiExpertView *view) {
+    return hot_lookup(store, hot_find(store), key, view, 1);
+}
+
 #ifdef COLI_V4_TEST_HOOKS
 int coli_v4_test_expert_slot_index(ColiExpertStore *store, ColiExpertKey key) {
     if (!store || !store->state || key.layer < 0 || key.expert < 0) return -1;
@@ -10140,6 +10155,31 @@ int coli_v4_test_expert_slot_index(ColiExpertStore *store, ColiExpertKey key) {
     int result = slot ? (int)(slot - state->slots) : -1;
     pthread_mutex_unlock(&state->mutex);
     return result;
+}
+
+int coli_v4_test_expert_books(ColiExpertStore *store, int layer,
+                              uint64_t *usage, unsigned char *hit,
+                              unsigned char *heat, uint64_t *requests,
+                              int *pins) {
+    V4HotPolicy *policy = store ? hot_find(store) : NULL;
+    if (!policy || !store->state) return -1;
+    V4ExpertStoreState *state = store->state;
+    if (layer < 0 || layer >= state->layers) return -1;
+    size_t base = (size_t)layer * state->experts_per_layer;
+    pthread_mutex_lock(&state->mutex);
+    for (int expert = 0; expert < state->experts_per_layer; expert++) {
+        usage[expert] = policy->usage[base + expert];
+        hit[expert] = state->ehit ? state->ehit[base + expert] : 0;
+        heat[expert] = state->eheat ? state->eheat[base + expert] : 0;
+    }
+    *requests = policy->layer_requests[layer];
+    for (int rank = 0; rank < policy->pin_count; rank++) {
+        int expert = policy->pins[(size_t)layer * policy->pin_count + rank];
+        pins[rank] = expert >= 0 && hot_is_pinned(policy, layer, expert)
+            ? expert : -1;
+    }
+    pthread_mutex_unlock(&state->mutex);
+    return policy->pin_count;
 }
 
 void coli_v4_test_reset_direct_io_stats(void) {
@@ -10192,6 +10232,70 @@ void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer) {
     pthread_mutex_unlock(&state->mutex);
 }
 
+/* The CUDA expert bank's side of the store (COLI_V4_UNIT_GPU,
+ * COLI_CUDA_MOE_BATCH=1). The bank reads each routed expert once per layer per
+ * prompt and computes every routing from VRAM, so its reads cannot keep the
+ * books the CPU union's lookups keep (one lookup_hot per member of each chunk's
+ * union). It reads through lookup_uncounted and hands the store each chunk's
+ * routing twice: touch_union before the refill gives the union's members the
+ * RAM cache holds the recency touch a hit would, and note_union, once the
+ * chunk's MoE is done, counts each member (so a chunk that falls back to the
+ * CPU path is counted there, once). No lease, read, insert or eviction: what
+ * is read stays the bank's choice, and the request, hit and miss counters keep
+ * describing the cache's real traffic. Another ExpertStore backend keeps no
+ * books here: a plain lookup, no touch, no note. */
+int coli_v4_expert_store_lookup_uncounted(ColiExpertStore *store,
+                                          ColiExpertKey key,
+                                          ColiExpertView *view) {
+    V4HotPolicy *policy = hot_find(store);
+    if (!policy) return coli_expert_lookup(store, key, view);
+    return hot_lookup(store, policy, key, view, 0);
+}
+
+/* One chunk's routing on `layer`: `count` expert ids as the router returned
+ * them, each token's top-k, so the same expert repeats across tokens. Its
+ * union is walked as the CPU union looks it up (v4_moe_batch_union: each
+ * member once, ascending), and each member counted (note) or, if the RAM
+ * cache holds it, given a hit's recency touch. */
+static void hot_union(ColiExpertStore *store, int layer, const int *ids,
+                      int count, int note) {
+    if (!store || !store->state || !ids || count < 1) return;
+    V4ExpertStoreState *state = store->state;
+    V4HotPolicy *policy = hot_find(store);
+    if (!policy || layer < 0 || layer >= state->layers) return;
+    int experts = state->experts_per_layer;
+    unsigned char *routed = calloc((size_t)experts, 1);
+    if (!routed) return;   /* books only: out of memory skips one chunk's */
+    for (int i = 0; i < count; i++)
+        if (ids[i] >= 0 && ids[i] < experts) routed[ids[i]] = 1;
+    pthread_mutex_lock(&state->mutex);
+    for (int expert = 0; expert < experts; expert++) {
+        if (!routed[expert]) continue;
+        ColiExpertKey key = {layer, expert};
+        if (note) {
+            hot_count_locked(policy, state, key);
+            continue;
+        }
+        V4ExpertSlot *slot = indexed_expert_slot(state, key);
+        if (slot && slot->slab && slot->expert == expert) {
+            slot->used = ++state->clock;
+            touch_lru_slot(state, slot);
+        }
+    }
+    pthread_mutex_unlock(&state->mutex);
+    free(routed);
+}
+
+void coli_v4_expert_store_touch_union(ColiExpertStore *store, int layer,
+                                      const int *ids, int count) {
+    hot_union(store, layer, ids, count, 0);
+}
+
+void coli_v4_expert_store_note_union(ColiExpertStore *store, int layer,
+                                     const int *ids, int count) {
+    hot_union(store, layer, ids, count, 1);
+}
+
 int (*coli_v4_expert_store_ram_first)(int layer, int expert);   /* exclusive RAM/VRAM: NULL unless a Vulkan tier sets it */
 void (*coli_v4_expert_store_ram_gave)(void);
 
@@ -10209,17 +10313,8 @@ void coli_v4_expert_store_note_routed(ColiExpertStore *store, ColiExpertKey key)
     V4ExpertStoreState *state = store->state;
     V4HotPolicy *policy = hot_find(store);
     if (!policy || !get_record(state, key)) return;
-    size_t index = (size_t)key.layer * state->experts_per_layer + key.expert;
     pthread_mutex_lock(&state->mutex);
-    policy->usage[index]++;
-    if (state->ehit) {
-        state->ehit[index] = 1;
-        if (state->eheat && state->eheat[index] < 63) state->eheat[index]++;
-    }
-    rt_count(key.layer, &key.expert, 1);
-    uint64_t layer_requests = ++policy->layer_requests[key.layer];
-    if (policy->repin_interval && layer_requests % policy->repin_interval == 0)
-        hot_repin_locked(policy, state, key.layer);
+    hot_count_locked(policy, state, key);
     pthread_mutex_unlock(&state->mutex);
 }
 
@@ -12346,8 +12441,11 @@ static void *v4_bank2_worker(void *argument) {
     for (int expert = 0; expert < experts; expert++) {
         ColiExpertView view;
         memset(&view, 0, sizeof(view));
-        if (coli_expert_lookup(store, (ColiExpertKey){layer, expert},
-                               &view) != 0)
+        /* Uncounted, like the refill's reads: the layer's books come from
+         * its routing (coli_v4_expert_store_note_union), not from which
+         * experts a whole-layer prefetch happened to read. */
+        if (coli_v4_expert_store_lookup_uncounted(
+                store, (ColiExpertKey){layer, expert}, &view) != 0)
             continue;
         Dsv4CudaTensor *bg = NULL, *bu = NULL, *bd = NULL;
         int uploaded =
@@ -12663,6 +12761,16 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
             missing[missing_count++] = expert;
         }
     }
+    /* The RAM store's books follow the routing, as the CPU union's lookups
+     * keep them, and the reads below (and the second bank's prefetch) are
+     * uncounted: counted reads saw each expert once per layer per prompt, so
+     * decode started with flat usage, pins ranked by id, the pin ramp barely
+     * started and recency in first-read order. The union's members in RAM are
+     * made recent now, before the refill evicts for the missing ones; the
+     * union is counted once the chunk's MoE is done (note_union below). Both
+     * take the whole routing, bank hits included. */
+    coli_v4_expert_store_touch_union(store, weights->plan.layer, ids,
+                                     batch * topk);
     /* FULL-LAYER PREFETCH: a >=1k-token segment routes to nearly every
      * expert of the layer, and the incremental per-chunk refills that follow
      * the first one (3-30 experts each) run at poor disk queue depth. On the
@@ -12742,7 +12850,8 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
             #pragma omp parallel for schedule(dynamic, 1)
             for (int i = 0; i < group; i++) {
                 ColiExpertKey key = {weights->plan.layer, missing[i]};
-                fetched[0][i] = coli_expert_lookup(store, key, &views[0][i]) == 0;
+                fetched[0][i] = coli_v4_expert_store_lookup_uncounted(
+                    store, key, &views[0][i]) == 0;
             }
             clock_gettime(CLOCK_MONOTONIC, &_t1);
             double primed = (_t1.tv_sec - _t0.tv_sec) + (_t1.tv_nsec - _t0.tv_nsec) / 1e9;
@@ -12795,7 +12904,8 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
                 } else {
                     int i = item - 1;
                     ColiExpertKey key = {weights->plan.layer, missing[next_base + i]};
-                    fetched[nxt][i] = coli_expert_lookup(store, key, &views[nxt][i]) == 0;
+                    fetched[nxt][i] = coli_v4_expert_store_lookup_uncounted(
+                        store, key, &views[nxt][i]) == 0;
                 }
             }
             clock_gettime(CLOCK_MONOTONIC, &_t1);
@@ -12815,7 +12925,8 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
             ColiExpertKey key = {weights->plan.layer, retry[r]};
             ColiExpertView view;
             clock_gettime(CLOCK_MONOTONIC, &_t0);
-            int refused = coli_expert_lookup(store, key, &view) != 0;
+            int refused =
+                coli_v4_expert_store_lookup_uncounted(store, key, &view) != 0;
             {   /* a read on this thread, with nothing else running: expert wait (#1852) */
                 struct timespec read_end;
                 clock_gettime(CLOCK_MONOTONIC, &read_end);
@@ -12867,6 +12978,10 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
         !dsv4_cuda_activation_download(outputs, out_mirror, elements) ||
         !dsv4_cuda_activation_sync(out_mirror))
         return -1;
+    /* Counted only once nothing can fail: a refused chunk runs on the CPU
+     * path (the union, or per token), whose lookups count it. */
+    coli_v4_expert_store_note_union(store, weights->plan.layer, ids,
+                                    batch * topk);
     return 0;
 #undef bank
 #undef bank_layer
