@@ -328,7 +328,20 @@ unchanged after short prompts, which stay below `COLI_CUDA_MOE_BATCH_MIN` and
 never use the bank, but after these two GPU-batch prefills it measured slower
 than after a CPU-union prefill: the 24-token answer to the 1,992-token prompt
 at 2.18 tok/s instead of 2.42 (~10 %), the answer to the ~3,000-token prompt
-at ~2.75 instead of 2.85 (~3 %); the cause is not established.
+at ~2.75 instead of 2.85 (~3 %). Those runs predate the bank keeping the RAM
+expert store's routing books. Measured again on one binary and one VRAM
+reserve, with the same answer text after either prefill, the 1,992-token case
+was 7.4 % slower (2.13 vs 2.30 tok/s), and the cause was the store's books: the
+bank reads each routed expert once per layer per prompt and those reads were
+all the store counted, so decode started with every RAM-resident expert at
+usage 1, the pins ranked by expert id and only 7-9 of 16 pins active, and took
+~57 % more RAM-cache misses, most of them in its first ten tokens. The bank now
+counts each chunk's routed union as the CPU union's lookups do (usage, the pin
+ramp, repins, the `.coli_usage` history) and keeps the members already in RAM
+recent, without extra reads. That also decides which experts a later request's
+prefill (or a long prompt's later segments) finds in RAM, so a table cell whose
+request followed another may move as well. How much of the decode gap this
+recovers, and how much such a cell moves, has not been measured yet.
 
 With `COLI_CUDA_MOE_DOUBLE=1` the default VRAM
 reserve also covers the prefetch bank (one more bank: +1683 MiB for this
