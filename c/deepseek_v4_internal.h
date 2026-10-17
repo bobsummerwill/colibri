@@ -713,7 +713,8 @@ extern void (*coli_v4_expert_store_ram_gave)(void);
  *              token-layer, where a lookup counts its routing (the .coli_usage
  *              history, the dashboard's HITS and heat), but not as a request,
  *              hit or miss (those describe the RAM cache) nor in the pin
- *              ranking's usage (the store's own demand). No-op on another
+ *              ranking's usage and request clock (mirrored experts must
+ *              neither rank nor pace the RAM pins). No-op on another
  *              ExpertStore backend.
  *   vram_held  when set, marks held[expert] for each expert of `layer` that
  *              decode would compute from VRAM, and the RAM pin ranking leaves

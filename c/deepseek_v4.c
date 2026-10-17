@@ -9753,6 +9753,17 @@ static V4ExpertSlot *hot_oldest_pool_victim(
     return last_resort;
 }
 
+/* state->mutex held. The dashboard's view of one routing of the expert at
+ * `index` (layer * experts_per_layer + expert): its HITS for the turn and its
+ * heat, capped at 63. Every routing the store records keeps it, one that
+ * hot_count_locked counts and one VRAM-first decode served from a mirror
+ * (coli_v4_expert_store_note_vram) alike. */
+static void hot_heat_locked(V4ExpertStoreState *state, size_t index) {
+    if (!state->ehit) return;
+    state->ehit[index] = 1;
+    if (state->eheat && state->eheat[index] < 63) state->eheat[index]++;
+}
+
 /* state->mutex held. The books one routing of `key` keeps: the pin ranking's
  * usage and its per-layer request clock (the pin ramp, the repin cadence, the
  * usage decay), the dashboard's HITS and heat, and the .coli_usage history.
@@ -9764,10 +9775,7 @@ static void hot_count_locked(V4HotPolicy *policy, V4ExpertStoreState *state,
                              ColiExpertKey key) {
     size_t index = (size_t)key.layer * state->experts_per_layer + key.expert;
     policy->usage[index]++;
-    if (state->ehit) {
-        state->ehit[index] = 1;
-        if (state->eheat && state->eheat[index] < 63) state->eheat[index]++;
-    }
+    hot_heat_locked(state, index);
     rt_count(key.layer, &key.expert, 1);   /* selection history, shared format (#700) */
     uint64_t layer_requests = ++policy->layer_requests[key.layer];
     if (policy->repin_interval &&
@@ -10091,25 +10099,29 @@ void (*coli_v4_expert_store_ram_gave)(void);
 void (*coli_v4_expert_store_vram_held)(ColiExpertStore *store, int layer,
                                        unsigned char *held, int experts);
 
-/* The routings VRAM-first decode served from VRAM, one call per token-layer:
- * the history and the dashboard's view of them stay the routing's, as a
- * lookup records them. The store's stats and the rest of hot_count_locked's
- * books, usage and layer_requests, are left alone: these routings never
- * reached the store, so they are not its requests, and they neither rank nor
- * pace its RAM pins. The expert union does not read the mirrors: its lookups
- * (and the GPU bank's note_union) count every routed expert in full. */
+/* The routings VRAM-first decode served from VRAM, one call per token-layer.
+ * They keep the HITS, heat and history a lookup keeps (hot_heat_locked,
+ * rt_count), so the dashboard and the saved history see every routing. The
+ * rest of hot_count_locked's books, usage and layer_requests, is left alone
+ * so that the experts decode computes from VRAM neither rank nor pace the RAM
+ * pins (a pin would hold a RAM slot decode never reads); the request, hit and
+ * miss counters describe the RAM cache's traffic and are not touched either.
+ * A batched prefill keeps the full books for every routed expert, the books
+ * a CPU-union prefill leaves decode: the expert union's lookups and the GPU
+ * bank's note_union count each one, and neither reads the mirrors. With
+ * V4_EXPERT_UNION=0 a chunk the bank does not take runs token by token
+ * through moe_token_pipeline, so its mirrored experts are counted here, as
+ * in decode. */
 void coli_v4_expert_store_note_vram(ColiExpertStore *store, int layer,
                                     const int *experts, int count) {
     if (!store || !store->state || !experts || count < 1 || !hot_find(store)) return;
     V4ExpertStoreState *state = store->state;
     if (layer < 0 || layer >= state->layers) return;
     pthread_mutex_lock(&state->mutex);
-    for (int i = 0; state->ehit && i < count; i++) {
-        if (experts[i] < 0 || experts[i] >= state->experts_per_layer) continue;
-        size_t index = (size_t)layer * state->experts_per_layer + experts[i];
-        state->ehit[index] = 1;
-        if (state->eheat && state->eheat[index] < 63) state->eheat[index]++;
-    }
+    for (int i = 0; i < count; i++)
+        if (experts[i] >= 0 && experts[i] < state->experts_per_layer)
+            hot_heat_locked(state, (size_t)layer * state->experts_per_layer +
+                                   experts[i]);
     rt_count(layer, experts, count);   /* skips ids outside the layer */
     pthread_mutex_unlock(&state->mutex);
 }
