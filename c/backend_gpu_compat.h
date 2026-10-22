@@ -61,8 +61,10 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #define cudaError_t              hipError_t
 #define cudaSuccess              hipSuccess
 #define cudaErrorMemoryAllocation hipErrorOutOfMemory
+#define cudaErrorNotReady        hipErrorNotReady
 #define cudaGetErrorString       hipGetErrorString
 #define cudaGetLastError         hipGetLastError
+#define cudaPeekAtLastError      hipPeekAtLastError   /* cu_xb.cu */
 #define cudaSetDevice            hipSetDevice
 #define cudaGetDeviceCount       hipGetDeviceCount
 #define cudaDeviceProp           hipDeviceProp_t
@@ -95,11 +97,13 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #define cudaEventDestroy         hipEventDestroy
 #define cudaEventRecord          hipEventRecord
 #define cudaEventSynchronize     hipEventSynchronize
+#define cudaEventQuery           hipEventQuery
 #define cudaEventElapsedTime     hipEventElapsedTime
 #define cudaMallocHost           hipHostMalloc
 #define cudaFreeHost             hipHostFree
 #define cudaHostAlloc            hipHostMalloc        /* cuda_chain.cu: mapped host buffers */
 #define cudaHostAllocMapped      hipHostMallocMapped
+#define cudaHostAllocPortable    hipHostMallocPortable   /* cu_xb.cu: the tier's host pool and scratch */
 #define cudaHostAllocWriteCombined hipHostMallocWriteCombined
 #define cudaHostGetDevicePointer hipHostGetDevicePointer
 #define cudaHostRegister         hipHostRegister      /* the qwen36 tier's host pool */

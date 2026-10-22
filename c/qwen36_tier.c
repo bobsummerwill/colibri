@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <pthread.h>
 #include <time.h>
 #ifdef __linux__
@@ -66,6 +67,7 @@ static struct {
     float *is_x; size_t is_x_floats;      /* QT_MAX_ROWS*D input replicas per device */
     /* M3 */
     int *fill_order; int fill_cur;        /* warmstart order (heat desc) */
+    uint8_t *off;                         /* layers without experts (qt_layer_off): never planned */
     int issue_open;                       /* guard: no tensor_free while a group is in flight */
     pthread_cond_t cv_take;               /* signals qt_take done + queue space */
     uint64_t tick, swaps, inplace, pf_hits, pf_notes;
@@ -111,6 +113,7 @@ static uint32_t G_cold_heat[QT_MAX_DEV];   /* copy mode: the coldest resident's 
  * experts=cpu): the devices still take the dense trunk, which is read on every
  * token. Before, each of these switched the trunk off as well. */
 static int G_trunk_only;
+static int G_chain_own;   /* qt_chain_own: the arena's experts are the dense chain's to move */
 /* Where the engine's int4 bytes come from (qt_source_planar): 0 = the
  * container's signed pairs, 1 = expert_ffn.h's planar blocks, the layout the
  * engine keeps in RAM when its shared kernel computes the CPU's experts. */
@@ -584,6 +587,9 @@ void qt_trunk_withdraw(const char *why){
  * is withdrawn: CUDA_EXPERT_GB as a number is the user's word. The engine calls this
  * before its warm start, so nothing is resident yet; the tier stays up for nothing else
  * and every expert call answers "not here". */
+/* qt_reserve: device bytes the engine places after the tier sized itself (qwen36_tier.h) */
+static size_t G_reserve;
+void qt_reserve(size_t bytes){ G_reserve = bytes; }
 void qt_experts_withdraw(const char *why){
     const char *bg = getenv("CUDA_EXPERT_GB");
     if(!G.on || G_trunk_only || (bg && strcmp(bg,"auto") && atof(bg) > 0)) return;
@@ -850,7 +856,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     }
 
     /* Per-device allowance for tier + trunk: CUDA_EXPERT_GB when numeric,
-     * else free minus 1 GB headroom. The heat table is loaded here too (it
+     * else free minus 1 GB headroom and what the engine reserved (qt_reserve). The heat table is loaded here too (it
      * used to be loaded after the budgets) because the placer prices
      * experts by heat. */
     size_t capacity[QT_MAX_DEV]; int capdev[QT_MAX_DEV]; int ncap = G.ndev;
@@ -860,7 +866,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         capdev[i] = G.dev[i];
         capacity[i] = (bg && strcmp(bg,"auto") && atof(bg)>0)
                    ? (size_t)(atof(bg)*1024.0*1024.0*1024.0)
-                   : (freeb>(1ull<<30) ? freeb-(1ull<<30) : 0);
+                   : (freeb>(1ull<<30)+G_reserve ? freeb-(1ull<<30)-G_reserve : 0);
         fprintf(stderr,"[qtier] dev %d: %.1f GB free, allowance %.1f GB\n",
                 G.dev[i], freeb/1073741824.0, capacity[i]/1073741824.0);
     }
@@ -1319,7 +1325,7 @@ unsigned qt_chain_epoch(void){
 }
 int qt_chain_devices(void){ return G.on ? G.ndev : 0; }
 int qt_chain_resident(int layer,int eid,int device,ColiCudaTensor **g,ColiCudaTensor **u,ColiCudaTensor **d){
-    if(!G.on || G_trunk_only || layer<0 || layer>=G.nl || eid<0 || eid>=G.ne) return 0;
+    if(!G.on || G_trunk_only || G_chain_own || layer<0 || layer>=G.nl || eid<0 || eid>=G.ne) return 0;
     pthread_mutex_lock(&G.mx);
     QSlot *s=qs(layer,eid);
     int r=s->resident && s->tg && s->tu && s->td && G.dev[home2(layer,eid)]==device;
@@ -1345,6 +1351,32 @@ void qt_chain_count(int layer,const int *eids,int K){
         if(s->resident){ if(s->heat<0xFFFFFFFFu) s->heat++; G.hits[home2(layer,eids[k])]++; }
         else G.miss++;
     }
+    pthread_mutex_unlock(&G.mx);
+}
+/* The arena of a GGUF's experts on the tier's one device, for a chain that takes it over
+ * (qt_chain_own): its base, a slot's bytes, the up and down rows' offsets in a slot (gate at
+ * 0), its slots; 0 without an arena. qt_chain_slot: the slot expert eid of layer holds, -1
+ * none. qt_chain_own: from now on the chain moves experts in and out of the slots itself;
+ * the tier places, swaps and computes none (qt_note*, qt_issue and qt_chain_resident answer
+ * nothing), its uploads in flight done first. */
+int qt_chain_arena(void **base,size_t *slot,size_t *off_u,size_t *off_d,int *nslots){
+    if(!G.on || G.ndev!=1 || G.wfmt!=QT_GGUF || !G_arena_on || !G_arena[0]) return 0;
+    *base=G_arena[0]; *slot=G_aslot; *off_u=G_aoff_u; *off_d=G_aoff_d; *nslots=G_aslots[0];
+    return 1;
+}
+int qt_chain_slot(int layer,int eid){
+    if(!G.on || !G_arena_on || layer<0 || layer>=G.nl || eid<0 || eid>=G.ne) return -1;
+    pthread_mutex_lock(&G.mx);
+    QSlot *s=qs(layer,eid);
+    int r=s->resident && s->aslot>0 ? s->aslot-1 : -1;
+    pthread_mutex_unlock(&G.mx);
+    return r;
+}
+void qt_chain_own(void){
+    if(!G.on) return;
+    qt_fill_wait();
+    pthread_mutex_lock(&G.mx);
+    G_chain_own=1;
     pthread_mutex_unlock(&G.mx);
 }
 int qt_chain_format(int *fmt,int *gs){
@@ -1428,7 +1460,7 @@ static void stream_promote_locked(int layer,int eid){
 void qt_note(int layer,int eid,
              const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
              const float *gs,const float *us,const float *ds){
-    if(!G.on || !g4 || G_trunk_only) return;
+    if(!G.on || !g4 || G_trunk_only || G_chain_own) return;
     QSlot *s=qs(layer,eid);
     pthread_mutex_lock(&G.mx);
     if(G_stream){
@@ -1461,7 +1493,7 @@ void qt_heat_order(uint32_t *const *counts, int nl, int ne){
  * and room on its device or a resident colder than it, as of the last tick), so an engine
  * converts the bytes only then; qt_note_heat counts a pass of one it does not hand over. */
 int qt_note_wanted(int layer,int eid){
-    if(!G.on || G_trunk_only || layer<0 || layer>=G.nl || eid<0 || eid>=G.ne) return 0;
+    if(!G.on || G_trunk_only || G_chain_own || layer<0 || layer>=G.nl || eid<0 || eid>=G.ne) return 0;
     if(!G_stream) return 1;
     QSlot *s=qs(layer,eid);
     if(s->resident || s->queued) return 0;
@@ -1479,7 +1511,7 @@ void qt_note_heat(int layer,int eid){
 void qt_note_block(int layer,int eid,
              const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
              const float *gs,const float *us,const float *ds){
-    if(!G.on || !g4 || G_trunk_only) return;
+    if(!G.on || !g4 || G_trunk_only || G_chain_own) return;
     QSlot *s=qs(layer,eid);
     pthread_mutex_lock(&G.mx);
     if(G_stream) stream_point(s,g4,u4,d4,gs,us,ds);
@@ -1527,6 +1559,15 @@ int qt_fill_next(int *layer,int *eid){
 /* Plan the whole warmstart set in one pass -- same heat order and budget
  * reservation as qt_fill_next, but without loading. The experts are then
  * loaded by any number of threads and handed over via qt_note_planned. */
+/* Layer `layer` routes nothing (a Flint dense layer): no expert of it is ever planned. */
+void qt_layer_off(int layer){
+    if(!G.on || layer<0 || layer>=G.nl) return;
+    pthread_mutex_lock(&G.mx);
+    if(!G.off) G.off=calloc((size_t)G.nl,1);
+    if(G.off) G.off[layer]=1;
+    free(G.fill_order); G.fill_order=NULL;   /* planned again without it */
+    pthread_mutex_unlock(&G.mx);
+}
 int qt_plan_fill(int *layers,int *eids,int max){
     if(!G.on) return 0;
     size_t n=(size_t)G.nl*G.ne;
@@ -1543,6 +1584,7 @@ int qt_plan_fill(int *layers,int *eids,int max){
         if(full) break;
         int gi=G.fill_order[G.fill_cur++];
         int l=gi/G.ne, e=gi%G.ne, hd=home2(l,e);
+        if(G.off && G.off[l]) continue;   /* a layer with no experts (Flint's dense ones) */
         QSlot *s=qs(l,e);
         if(s->resident||s->queued||s->planned) continue;
         if(G.used[hd]+G.exp_bytes>G.budget[hd]) continue;
@@ -1562,7 +1604,7 @@ int qt_plan_fill(int *layers,int *eids,int max){
 void qt_note_planned(int layer,int eid,
              const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
              const float *gs,const float *us,const float *ds){
-    if(!G.on) return;
+    if(!G.on || G_chain_own) return;
     QSlot *s=qs(layer,eid);
     pthread_mutex_lock(&G.mx);
     if(!g4){
@@ -1714,6 +1756,7 @@ void qt_stats_mark(void){
 }
 
 static void qt_lfru_tick_locked(void){
+    if(G_chain_own) return;   /* the chain's to move */
     size_t n=(size_t)G.nl*G.ne;
     G.tick++;
     if(G_stream){   /* copy mode: qt_note_wanted's bar */
@@ -1752,7 +1795,7 @@ static void qt_lfru_tick_locked(void){
 }
 
 uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
-    if(!G.on||K>QT_MAX_ROWS) return 0;
+    if(!G.on||K>QT_MAX_ROWS||G_chain_own) return 0;
     uint32_t mask=0;
     ColiCudaTensor *tg[QT_MAX_DEV][QT_MAX_ROWS],*tu[QT_MAX_DEV][QT_MAX_ROWS],*td[QT_MAX_DEV][QT_MAX_ROWS];
     static int rows[QT_MAX_ROWS]={0};
@@ -1800,7 +1843,8 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
     return mask;
 }
 
-int qt_take(uint32_t mask,const float *val,int K,float *out){
+int qt_take(uint32_t mask,const float *val,int K,float *out){ return qt_take_scaled(mask,val,K,out,NULL,0.f); }
+int qt_take_scaled(uint32_t mask,const float *val,int K,float *out,const float *s,float eps){
     (void)K;
     if(!G.on) return mask==0;
     const float *result[QT_MAX_DEV]={0};
@@ -1819,6 +1863,12 @@ int qt_take(uint32_t mask,const float *val,int K,float *out){
         if(ok && result[di]) for(int j=0;j<G.is_cnt[di];j++){
             float w=val[G.is_k[di][j]];
             const float *row=result[di]+(size_t)j*G.D;
+            if(s){   /* Muse Spark: w * rmsnorm(row * s) */
+                double ms=0; for(int d=0;d<G.D;d++){ double v=(double)row[d]*s[d]; ms+=v*v; }
+                const float r=1.f/sqrtf((float)(ms/G.D)+eps);
+                for(int d=0;d<G.D;d++) out[d]+=w*(row[d]*s[d]*r);
+                continue;
+            }
             for(int d=0;d<G.D;d++) out[d]+=w*row[d];
         }
         G.is_cnt[di]=0;
@@ -1914,10 +1964,11 @@ void qt_shutdown(void){
         if(G_arena[i]) coli_cuda_pipe_free(G.dev[i],G_arena[i]);
         G_arena[i]=NULL; free(G_afree[i]); G_afree[i]=NULL; G_aslots[i]=G_anfree[i]=0;
     }
-    G_arena_on=0;
+    G_arena_on=0; G_chain_own=0;
     free(G.slot); G.slot=NULL;
     free(G.is_x); G.is_x=NULL; G.is_x_floats=0;
     free(G.fill_order); G.fill_order=NULL;
+    free(G.off); G.off=NULL;
     free(G.heat0); G.heat0=NULL;
     pthread_cond_destroy(&G.cv_take);
     pthread_cond_destroy(&G.cv);

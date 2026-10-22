@@ -66,6 +66,7 @@
 #include <time.h>
 #include "../backend_vulkan.h"
 #include "../vk_chain.h"
+#include "../vk_tier.h"           /* vkt_host_pairs: the bench's CPU in place */
 #include "../vk_kvsplit.h"        /* the KV cache split between the device and the host */
 #include "../delta_attention.h"      /* the KDA step the KDA ops follow */
 #include "../hyper_connections.h"    /* the mHC arithmetic */
@@ -246,6 +247,28 @@ static void test_chunk_rows(void) {
 }
 
 /* ---- attention ---------------------------------------------------------------------- */
+/* a verify's S rows: each the bits of a decode step of that row alone (chain_attn_dec.comp's
+ * blocks from each row's own positions, the rows before VKC_ATTN_DEC_MIN as theirs run) */
+static void test_attn_rows_bits(int S, int pos_base, int H, int KVH, int hd) {
+    int cap = pos_base + S + 4, qseg = 2 * hd, koff = 64;
+    size_t kn = (size_t)koff + (size_t)KVH * cap * hd;
+    float *q = fvec((size_t)S * H * qseg, 1.f), *kc = fvec(kn, 1.f), *vc = fvec(kn, 1.f);
+    VkcBuf *qb = up(q, (size_t)S * H * qseg), *kb = up(kc, kn), *vb = up(vc, kn);
+    VkcBuf *ob = vkc_buf((size_t)S * H * hd * 4, VKC_DOWN), *o1 = vkc_buf((size_t)H * hd * 4, VKC_DOWN);
+    VkcAttn p = {S, H, KVH, hd, pos_base, cap, 0, H * qseg, qseg, hd, H * qseg, qseg, 1, 0, H * hd, 0, 0, 1.f / sqrtf((float)hd), koff, koff};
+    vkc_begin(); int ok = vkc_attn(qb, kb, vb, ob, qb, NULL, &p); vkc_submit(1);
+    float *all = malloc((size_t)S * H * hd * 4);
+    memcpy(all, vkc_ptr(ob), (size_t)S * H * hd * 4);
+    int same = ok;
+    for (int r = 0; r < S && same; r++) {
+        VkcAttn p1 = p; p1.S = 1; p1.pos_base = pos_base + r; p1.q_off = p.q_off + r * p.q_row; p1.g_off = p.g_off + r * p.g_row;
+        vkc_begin(); same = vkc_attn(qb, kb, vb, o1, qb, NULL, &p1); vkc_submit(1);
+        same = same && !memcmp(vkc_ptr(o1), all + (size_t)r * H * hd, (size_t)H * hd * 4);
+    }
+    CHECK(same, "attn S %d pos %d H %d/%d hd %d: each row a one-row step's bits", S, pos_base, H, KVH, hd);
+    free(all); free(q); free(kc); free(vc);
+    vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(ob); vkc_free(o1);
+}
 static void test_attn_hk(int S, int pos_base, int H, int KVH, int hd, int use_list) {
     int cap = 300, gsz = hd, qseg = hd + gsz, koff = 64;
     int T = pos_base + S;
@@ -3447,8 +3470,12 @@ static void bench_xb(void) {
     if (ge && *ge) gs = atoi(ge);
     if (getenv("COLI_VK_BENCH_ACT")) act = atoi(getenv("COLI_VK_BENCH_ACT"));   /* 1 SiTU (Kimi K3) */
     if (E < K) E = K;
+    /* COLI_VK_BENCH_HOST=1: every expert in the tier's host pool (the device reads it over the bus;
+     * COLI_VK_TIER_HOST=1 must be set at the device's start) */
+    const int host = getenv("COLI_VK_BENCH_HOST") && atoi(getenv("COLI_VK_BENCH_HOST")) && coli_vk_tier_host_pool();
     if (!coli_vk_xb_init(D, I, act, 0, 4.f, 25.f)) { printf("bench xb: no expert batch here\n"); return; }
     coli_vk_tier_pool_limit((size_t)1 << 40);
+    if (host) coli_vk_tier_pool_limit_dev(2, (size_t)1 << 40);
     ColiVkTensor **t = calloc((size_t)E * 3, sizeof *t);
     ColiVkExpert **ex = calloc(E, sizeof *ex);
     int ok = 1;
@@ -3456,7 +3483,8 @@ static void bench_xb(void) {
         for (int m = 0; m < 3 && ok; m++) {
             int f = m < 2 ? fg : fd, in = m < 2 ? D : I, out = m < 2 ? I : D, g = f == 4 || f == 7 || f == 12 || f == 13 ? gs : 0;
             uint8_t *rows; size_t stride; float *sc;
-            if (!(ok = coli_vk_tier_tensor(&t[e * 3 + m], f, in, out, g, &rows, &stride, &sc))) break;
+            if (!(ok = host ? coli_vk_tier_tensor_pad(2, &t[e * 3 + m], f, in, out, g, 0, 0, &rows, &stride, &sc)
+                            : coli_vk_tier_tensor(&t[e * 3 + m], f, in, out, g, &rows, &stride, &sc))) break;
             size_t rb = coli_vk_tensor_row_bytes(f, in), ns = coli_vk_tensor_scale_count(f, in, out, g);
             for (int o = 0; o < out; o++)
                 for (size_t b = 0; b < rb; b++) rows[(size_t)o * stride + b] = f == 12 ? (uint8_t)(rnd() % 0x70) : (uint8_t)rnd();
@@ -3486,9 +3514,53 @@ static void bench_xb(void) {
     }
     size_t rg = coli_vk_tensor_row_bytes(fg, D), rd = coli_vk_tensor_row_bytes(fd, I);
     double bytes = (double)K * (2.0 * rg * I + (double)rd * D);
-    if (ok) printf("bench xb fmt %d/%d gs %d act %d K %d [D %d I %d]: device %.1f us per layer (%.1f GB/s), wall %.1f us\n",
-                   fg, fd, gs, act, K, D, I, best_dev * 1e3 / nl, bytes * nl / (best_dev * 1e-3) / 1e9, best_wall * 1e6 / nl);
+    if (ok) printf("bench xb fmt %d/%d gs %d act %d K %d [D %d I %d]%s: device %.1f us per layer (%.1f GB/s), wall %.1f us\n",
+                   fg, fd, gs, act, K, D, I, host ? ", host pool" : "", best_dev * 1e3 / nl, bytes * nl / (best_dev * 1e-3) / 1e9, best_wall * 1e6 / nl);
     else printf("bench xb: the batch failed\n");
+    if (ok && host && fg >= 100 && fd >= 100) {   /* the CPU computing them in place (vkt_host_pairs), K pairs a step */
+        VktHostExpert *hv = calloc((size_t)E, sizeof *hv);
+        const VktHostExpert **hp = malloc((size_t)K * sizeof *hp); const float **xp = malloc((size_t)K * sizeof *xp);
+        float *gu = malloc((size_t)K * 2 * I * sizeof(float)), *hh = malloc((size_t)K * I * sizeof(float)), *dn = malloc((size_t)K * D * sizeof(float));
+        int good = hv && hp && xp && gu && hh && dn;
+        for (int e = 0; e < E && good; e++) {
+            ColiVkTensorInfo ti[3]; const void *r[3];
+            for (int m = 0; m < 3 && good; m++)
+                good = coli_vk_tensor_info(t[e * 3 + m], &ti[m]) && (r[m] = coli_vk_tensor_host_rows(t[e * 3 + m], NULL)) != NULL;
+            if (good) hv[e] = (VktHostExpert){r[0], r[1], r[2], ti[0].fmt - 100, ti[2].fmt - 100,
+                                              (size_t)ti[0].rowWords * 4, (size_t)ti[2].rowWords * 4};
+        }
+        double best = 1e9;
+        for (int r = -1; r < 3 && good; r++) {
+            double t0 = bnow();
+            for (int l = 0; l < nl && good; l++) {
+                for (int k = 0; k < K; k++) { hp[k] = &hv[((l * K) + k) % E]; xp[k] = x; }
+                good = vkt_host_pairs(hp, xp, K, D, I, 0.f, 0, gu, hh, dn);
+            }
+            double wl = bnow() - t0;
+            if (r >= 0 && wl < best) best = wl;
+        }
+        if (good) printf("bench xb: the CPU in place, %d pairs a step: %.1f us a pair (%.1f GB/s)\n", K, best * 1e6 / nl / K,
+                         bytes * nl / best / 1e9);
+        else printf("bench xb: the CPU could not read the host pool's rows here\n");
+        free(hv); free(hp); free(xp); free(gu); free(hh); free(dn);
+    }
+    if (ok && host) {   /* the same experts copied up by the copy engine (coli_vk_tensor_copy), all at once */
+        ColiVkTensor **d = calloc((size_t)E * 3, sizeof *d);
+        int made = 1;
+        for (int i = 0; i < E * 3 && made; i++) made = coli_vk_tier_tensor_like(0, &d[i], t[i], 0, 0);
+        double best = 1e9;
+        for (int r = 0; r < 4 && made; r++) {
+            double t0 = bnow();
+            if (!coli_vk_tensor_copy(d, t, E * 3)) { made = 0; break; }
+            double w = bnow() - t0;
+            if (w < best) best = w;
+        }
+        if (made) printf("bench xb: the %d experts copied up by the copy engine in %.2f ms (%.1f GB/s), %.1f us an expert\n",
+                         E, best * 1e3, bytes / K * E / best / 1e9, best * 1e6 / E);
+        else printf("bench xb: no device copies here\n");
+        for (int i = 0; i < E * 3; i++) if (d[i]) coli_vk_tensor_free(d[i]);
+        free(d);
+    }
     for (int e = 0; e < E; e++) if (ex[e]) coli_vk_xb_expert_free(ex[e]);
     free(t); free(ex); free(x); free(xr); free(yr); free(ones); free(sel);
 }
@@ -3885,6 +3957,8 @@ int main(int argc, char **argv) {
         test_attn_hk(3, 250, 16, 2, 256, 0); test_attn_hk(1, 299, 4, 2, 128, 0);
         test_attn_win(4, 900, 8, 2, 128, 128, 0, 0, 1, 0); test_attn_win(1, 2000, 4, 2, 64, 64, 512, 512, 0, 1);
         test_attn_win(2, 3000, 16, 4, 64, 96, 0, 0, 0, 0);
+        test_attn_rows_bits(3, 700, 16, 2, 256); test_attn_rows_bits(6, 700, 16, 2, 256);
+        test_attn_rows_bits(6, 125, 16, 2, 128); test_attn_rows_bits(6, 4093, 16, 2, 128);
         VkcStats ad; vkc_stats(&ad); printf("  decode attentions in blocks of positions: %llu\n", ad.attn_dec);
         rng = rng_was;
     }

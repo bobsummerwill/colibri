@@ -97,6 +97,8 @@ shader_formats() {
   tail -1 vk_test.log | grep -qx PASS || fail "qmatmul format cases"
   ./tests/test_vk_tier shaders/qmatmul.spv | tee vk_tier.log
   tail -1 vk_tier.log | grep -qx PASS || fail "routed-expert tier"
+  ./tests/test_vk_tier shaders/qmatmul.spv host-pairs | tee vk_tier_hp.log
+  tail -1 vk_tier_hp.log | grep -qx PASS || fail "routed-expert tier, the CPU's host pool pairs in the integer form"
   ./tests/test_glm53_vk_f32
   COLI_VK_GEMM_MIN_S=0 ./tests/test_glm53_vk_f32
 }
@@ -847,9 +849,11 @@ family_mimo_qwenimage() {
     echo "OK mimo MIMO_DENSE_BITS=$bits: the CPU's tokens, text and image, experts on the CPU and on the tier, trunk on the device and on the CPU"
   done
   # MIMO_VK_EXPERTS=N sizes the tier at N experts: at 2 it must evict as the routing
-  # moves, and still give the CPU's tokens
+  # moves, and still give the CPU's tokens. A fresh history and no fill, as tier_gate's
+  # EVICT: the runs above wrote mimo_tiny's, whose hottest two the warm start would keep.
   MIMO_DENSE_BITS=32 COLI_TEMP=0 ./mimo mimo_tiny --ids "$(ids long)" --ngen 6 > mimo-cpu.txt 2>/dev/null
-  COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 MIMO_VK_EXPERTS=2 MIMO_DENSE_BITS=32 COLI_TEMP=0 \
+  rm -f mimo-evict.usage
+  COLI_USAGE=mimo-evict.usage COLI_VK_TIER_FILL=0 COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 MIMO_VK_EXPERTS=2 MIMO_DENSE_BITS=32 COLI_TEMP=0 \
     ./mimo mimo_tiny --ids "$(ids long)" --ngen 6 > mimo-vk.txt 2> mimo-vk.err
   cmp -s mimo-cpu.txt mimo-vk.txt || { cat mimo-vk.err; fail "mimo MIMO_VK_EXPERTS=2 differs from the CPU"; }
   grep -q 'budget [0-9.]* KiB = 2 experts' mimo-vk.err || { grep '\[VK\]' mimo-vk.err; fail "mimo MIMO_VK_EXPERTS=2: not a budget of two experts"; }
@@ -1088,6 +1092,11 @@ PY
   v4_tier "trunk on the device too" deepseek_v4_tiny_t long COLI_VK_DENSE=1
   v4_tier "the GEMM route from 2 rows" deepseek_v4_tiny_t long COLI_VK_TIER_GEMM_ROWS=2
   WARM=1 v4_tier "warm start from the CPU run's history" deepseek_v4_tiny_e8 long
+  # the host pool (a budget of three experts on the device, the rest in system RAM the
+  # device reads): the CPU computes its experts' pairs in place with the device's
+  # roundings (the hybrid), here in the float form (GQ_EXACT=1)
+  v4_tier "the host pool, its pairs on the CPU" deepseek_v4_tiny_t long COLI_VK_TIER_HOST=1 COLI_VK_TIER_GB=0.00009 GQ_EXACT=1
+  grep -q "host pool pairs computed by the CPU in place" v4-vk.err || { grep '\[VK\] tier' v4-vk.err; fail "deepseek_v4 tier the host pool: no pair on the CPU"; }
   # A served prompt with every routed expert on the device (warm start from the CPU
   # run's history): its per-position logprob echoes against the CPU's. Measured on
   # Lavapipe they are the same bytes; the gate allows 1e-3, for an exp() that rounds
@@ -1318,6 +1327,38 @@ mimo_chain_gate() {  # <tag> <case> <env...>   (CHAINMODE: COLI_VK_CHAIN's value
   lg=$(logits_close cpu.f32 vk.f32) || { echo "$lg"; fail "$tag $c: logits"; }
   echo "OK $tag $c: tokens = CPU, $lg, $fw chain forwards"
 }
+# A GGUF's block types (tests/test_gguf_import.py write_mimo2: Q4_K and IQ2_XXS experts with
+# Q5_K and Q6_K down, a Q8_0 and Q4_K trunk, a Q6_K head): the dense chain's block GEMVs and
+# GEMMs and the tier's experts as the file has them, against the CPU's float form
+# (GQ_EXACT=1). COLI_VK_IDOT=0 keeps the device's float form where it has the integer one
+# too: the integer forms' codes move at a tie when their inputs are an ulp apart, and a bf16
+# embedding's rows are full of ties. COLI_VK_CHAIN_GEMM=0 keeps the prompt's GEMM in fp32.
+mimo_gguf_tiny() {   # mimo_gguf_tiny/, imported
+  $PY - <<'PY' || fail "gguf-py (pip install gguf) is needed for the GGUF gates"
+import sys
+sys.path.insert(0, "tests")
+import numpy as np
+from test_gguf_import import write_mimo2
+write_mimo2("mimo_gguf_tiny.gguf", np.random.default_rng(5))
+PY
+  rm -rf mimo_gguf_tiny
+  $PY tools/gguf_import.py mimo_gguf_tiny.gguf mimo_gguf_tiny > /dev/null
+}
+mimo_gguf_gate() {  # <tag> <env...>
+  local tag=$1 lg fw ids="5 6 7 8 20 21 22 23" full="5 6 7 8 20 21 22 23 30 31 32 33"; shift
+  local vk=(GQ_EXACT=1 COLI_VK_IDOT=0 COLI_VK_CHAIN_GEMM=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1)
+  env "$@" GQ_EXACT=1 COLI_TEMP=0 ./mimo mimo_gguf_tiny --ids "$ids" --ngen 6 > mimo-cpu.txt 2>/dev/null
+  env "$@" "${vk[@]}" COLI_TEMP=0 ./mimo mimo_gguf_tiny --ids "$ids" --ngen 6 > mimo-vk.txt 2> mimo-vk.err
+  [ -s mimo-cpu.txt ] && cmp -s mimo-cpu.txt mimo-vk.txt || { cat mimo-cpu.txt mimo-vk.txt mimo-vk.err; fail "$tag: the tokens differ from the CPU"; }
+  fw=$(chain_count mimo mimo-vk.err)
+  [ "$fw" -gt 0 ] || { cat mimo-vk.err; fail "$tag: the chain never ran"; }
+  cp mimo-vk.err mimo-gguf-vk.err
+  rm -f cpu.f32 vk.f32
+  env "$@" GQ_EXACT=1 MIMO_LOGITS=cpu.f32 ./mimo mimo_gguf_tiny --ids "$full" --ngen 0 > /dev/null 2>&1
+  env "$@" "${vk[@]}" MIMO_LOGITS=vk.f32 ./mimo mimo_gguf_tiny --ids "$full" --ngen 0 > /dev/null 2> mimo-vk.err
+  lg=$(logits_close cpu.f32 vk.f32) || { echo "$lg"; fail "$tag: logits"; }
+  echo "OK $tag: tokens = CPU, $lg, $fw chain forwards"
+}
 # mimo_lost_gate <tag> <case> <back> <env...>: the device "lost" (COLI_VK_CHAIN_FAULT) at
 # the chain frame <back> frames before the end of the same run without a fault (the
 # frames a device spends setting up differ: on Lavapipe its memory needs no zeroing
@@ -1390,6 +1431,14 @@ family_mimo_chain() {
   done
   # COLI_VK_CHAIN=2: prompts on the device, decode on the CPU, the caches moving between them
   for c in short long image; do CHAINMODE=2 mimo_chain_gate "chain mimo prompts only" $c MIMO_DENSE_BITS=32; done
+  # a GGUF's block types: the trunk on the chain, the experts in the tier, as the file has them
+  mimo_gguf_tiny
+  mimo_gguf_gate "chain mimo GGUF"
+  grep -q "tier mimo: the GGUF experts' blocks go to the device" mimo-gguf-vk.err && [ "$(tier_count mimo mimo-gguf-vk.err)" -gt 0 ] ||
+    { cat mimo-gguf-vk.err; fail "chain mimo GGUF: the tier took no expert as the file has it"; }
+  mimo_gguf_gate "chain mimo GGUF, one token at a time" MIMO_CHUNK=1
+  mimo_gguf_gate "chain mimo GGUF, the experts on the CPU" MIMO_VK_EXPERTS=0
+  mimo_gguf_gate "chain mimo GGUF, a budget of two experts" MIMO_VK_EXPERTS=2
   # the device lost (frames counted back from the end of the run: 5 decode steps of 6
   # frames follow the prompt): inside the last decode step; inside the first block of
   # a prompt split in chunks of 3 rows (the CPU takes the step's remaining rows); inside
@@ -1587,11 +1636,11 @@ family_glm() {
   # discrete GPU): its experts f32 and quantized at load, two drafts; Lavapipe shares the
   # RAM, where the default keeps them on the CPU
   $PY tools/make_glm_mtp_tiny.py --src glm_tiny --out glm_tiny_mtp > /dev/null && cp ref_glm.json glm_tiny_mtp/
-  glm_tier "colibri MTP head on the tier, f32" glm_tiny_mtp glm_tiny_mtp/ref_glm.json DRAFT=2 COLI_VK_TIER_MTP=1 -- 64 16 16
+  glm_tier "colibri MTP head on the tier, f32" glm_tiny_mtp glm_tiny_mtp/ref_glm.json COLI_SPEC_GATE=0 DRAFT=2 COLI_VK_TIER_MTP=1 -- 64 16 16
   mtp_on_device "colibri MTP head on the tier, f32"
-  glm_tier "colibri MTP head on the tier, 4-bit" glm_tiny_mtp glm_tiny_mtp/ref_glm.json DRAFT=2 IDOT=0 COLI_VK_TIER_MTP=1 -- 2 4 4
+  glm_tier "colibri MTP head on the tier, 4-bit" glm_tiny_mtp glm_tiny_mtp/ref_glm.json COLI_SPEC_GATE=0 DRAFT=2 IDOT=0 COLI_VK_TIER_MTP=1 -- 2 4 4
   mtp_on_device "colibri MTP head on the tier, 4-bit"
-  glm_tier "colibri MTP head, shared RAM default" glm_tiny_mtp glm_tiny_mtp/ref_glm.json DRAFT=2 -- 64 16 16
+  glm_tier "colibri MTP head, shared RAM default" glm_tiny_mtp glm_tiny_mtp/ref_glm.json COLI_SPEC_GATE=0 DRAFT=2 -- 64 16 16
   ! grep -aq 'extra layers' vk.log || { grep -a '\[VK\] tier' vk.log; fail "colibri: the MTP head's layer went on the tier by default on shared RAM"; }
   echo "OK colibri shared RAM: the MTP head's experts on the CPU by default"
 
@@ -1645,7 +1694,7 @@ family_glm_sanitize() {
   gsan colibri "asan colibri int4 at load, PIPE=1" glm_tiny SNAP=glm_tiny REF=ref_glm.json PIPE=1 ./colibri 1 4 4
   gsan colibri "asan colibri int8 at load, PILOT=1" glm_tiny SNAP=glm_tiny REF=ref_glm.json PILOT=1 ./colibri 2 8 8
   $PY tools/make_glm_mtp_tiny.py --src glm_tiny --out glm_tiny_mtp > /dev/null && cp ref_glm.json glm_tiny_mtp/
-  gsan colibri "asan colibri MTP head on the tier" glm_tiny_mtp SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 IDOT=0 COLI_VK_TIER_MTP=1 ./colibri 2 4 4
+  gsan colibri "asan colibri MTP head on the tier" glm_tiny_mtp COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 IDOT=0 COLI_VK_TIER_MTP=1 ./colibri 2 4 4
   mtp_on_device "asan colibri MTP head on the tier" san.log
   local ids
   ids=$($PY -c "print(','.join(str((i*37+5)%120+2) for i in range(100)))")
@@ -1825,11 +1874,13 @@ family_qwen_chain() {
   dmoe_gate qwen36 "chain qwen36 the host's routing (COLI_VK_CHAIN_MOE=0)" none COLI_VK_CHAIN_MOE=0 COLI_DENSE_I8=0 \
     SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
   # the same budget with the host pool (COLI_VK_TIER_HOST=1: on a device that shares the
-  # host's RAM too): the experts the device leaves in system RAM it reads, every layer's
-  # routed experts in the frame again
-  dmoe_gate qwen36 "chain qwen36 the host pool" all COLI_VK_TIER_GB=0.00077 COLI_VK_TIER_HOST=1 COLI_DENSE_I8=0 \
+  # host's RAM too): the experts the device leaves in system RAM the CPU computes in place
+  # (the hybrid frame, its float form: GQ_EXACT=1, which the CPU run's int4 does not read),
+  # every layer's routed experts in the frame again
+  dmoe_gate qwen36 "chain qwen36 the host pool" all COLI_VK_TIER_GB=0.00077 COLI_VK_TIER_HOST=1 GQ_EXACT=1 COLI_DENSE_I8=0 \
     SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
   grep -q "host pool on, [1-9]" vk.log || { cat vk.log; fail "chain qwen36 the host pool: no expert in the host pool"; }
+  grep -q "hybrid layer steps, [1-9][0-9]* host pool pairs on the CPU" vk.log || { cat vk.log; fail "chain qwen36 the host pool: no int4 pair on the CPU"; }
   # the device lost mid-decode: the state rebuilt on the CPU, the run finishes there; in a
   # step's frames on the host's routing, and in a step that is one frame
   lost_late qwen36 "chain qwen36 device lost" 20 rebuild COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
@@ -2378,6 +2429,24 @@ PY
 # glm53 with f32, int8 and int4 trunks, streamed and resident experts, an image, prefill
 # chunks and chain chunks, swiglu_limit 0, a lost device whose KDA state is rebuilt on
 # the CPU, serve sessions, and its pin-branch harness with the chain on.
+# A GGUF's block types on colibri's chain (tests/test_gguf_import.py write_glmdsa: kv_b split as
+# k_b and v_b in Q8_0, the MLA core reading them as floats; a Q4_K and Q8_0 trunk with the DSA
+# indexer; Q4_K and IQ2_XXS experts with Q5_K and Q6_K down; a Q6_K head), against the CPU's
+# float form (GQ_EXACT=1; COLI_VK_IDOT=0 keeps the device's float form, COLI_VK_CHAIN_GEMM=0 the
+# prompt's GEMM in fp32: see mimo_gguf_tiny). The ref's tokens are none the model makes: the
+# gate compares the chain with the CPU.
+glm_gguf_tiny() {   # glm_gguf_tiny/, imported, and its ref.json (the prompt and 8 tokens)
+  $PY - <<'PY' || fail "gguf-py (pip install gguf) is needed for the GGUF gates"
+import sys
+sys.path.insert(0, "tests")
+import numpy as np
+from test_gguf_import import write_glmdsa
+write_glmdsa("glm_gguf_tiny.gguf", np.random.default_rng(9))
+PY
+  rm -rf glm_gguf_tiny
+  $PY tools/gguf_import.py glm_gguf_tiny.gguf glm_gguf_tiny > /dev/null
+  echo '{"prompt_ids": [5, 6, 7, 8, 20, 21, 22, 23], "full_ids": [5, 6, 7, 8, 20, 21, 22, 23, 1, 2, 3, 4, 5, 6, 7, 8]}' > glm_gguf_tiny/ref.json
+}
 family_glm_chain() {
   make colibri glm53 tests/test_vk_chain VK=1
   ./tests/test_vk_chain shaders/qmatmul.spv | tee vk_chain.log
@@ -2403,9 +2472,16 @@ family_glm_chain() {
   mla_gate colibri "chain colibri DSA_FORCE" 1 SNAP=glm_tiny REF=ref_glm.json DSA_FORCE=1 -- 64 16 16
   # drafts: n-gram, and the MTP head at depths 1 to 3 (accepted and rejected)
   mla_gate colibri "chain colibri n-gram drafts" 1 SNAP=glm_tiny REF=ref_glm.json DRAFT=3 -- 64 16 16
-  for d in 1 2 3; do mla_gate colibri "chain colibri MTP depth $d" 1 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=$d -- 64 16 16; done
-  mla_gate colibri "chain colibri MTP with DSA top-4" 1 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DSA_TOPK=4 -- 64 16 16
-  mla_gate colibri "chain colibri MTP, 4-bit" 1 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json IDOT=0 DRAFT=2 -- 2 4 4
+  for d in 1 2 3; do mla_gate colibri "chain colibri MTP depth $d" 1 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=$d -- 64 16 16; done
+  # a GGUF's block types, the experts on the tier as the file has them
+  glm_gguf_tiny
+  local gg=(SNAP=glm_gguf_tiny REF=glm_gguf_tiny/ref.json GQ_EXACT=1 COLI_VK_IDOT=0 COLI_VK_CHAIN_GEMM=0)
+  for cap in 64 1; do mla_gate colibri "chain colibri GGUF cap=$cap" 1 "${gg[@]}" -- $cap 16 16; done
+  grep -q "tier colibri: the GGUF experts' blocks go to the device" vk.log && [ "$(tier_count colibri vk.log)" -gt 0 ] ||
+    { cat vk.log; fail "chain colibri GGUF: the tier took no expert as the file has it"; }
+  mla_gate colibri "chain colibri GGUF, DSA top-4" 1 "${gg[@]}" DSA_TOPK=4 -- 64 16 16
+  mla_gate colibri "chain colibri MTP with DSA top-4" 1 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DSA_TOPK=4 -- 64 16 16
+  mla_gate colibri "chain colibri MTP, 4-bit" 1 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json IDOT=0 DRAFT=2 -- 2 4 4
   # around the chain: the tier off, the per-matrix trunk and core, the GEMM and GEMV choices
   mla_gate colibri "chain colibri tier off" 1 SNAP=glm_tiny REF=ref_glm.json COLI_VK_TIER=0 -- 64 16 16
   mla_gate colibri "chain colibri beside COLI_VK_DENSE=1 COLI_VK_ATTN=1" 1 SNAP=glm_tiny_i4 REF=glm_tiny_i4/ref_glm.json IDOT=0 COLI_VK_DENSE=1 COLI_VK_ATTN=1 -- 2 4 4
@@ -2421,7 +2497,7 @@ family_glm_chain() {
   # between MTP drafts
   FAULT_BACK=12 mla_gate colibri "chain colibri device lost mid-decode" 1 SNAP=glm_tiny REF=ref_glm.json -- 64 16 16
   FAULT_BACK=3 mla_gate colibri "chain colibri device lost in the prompt" 1 SNAP=glm_tiny REF=ref_glm.json TF=1 -- 64 16 16
-  FAULT_BACK=12 mla_gate colibri "chain colibri device lost with MTP" 1 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json -- 64 16 16
+  FAULT_BACK=12 mla_gate colibri "chain colibri device lost with MTP" 1 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json -- 64 16 16
   # serve sessions frame for frame: pins, the prompt cache, the prefill read-out, two KV slots
   CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0
   CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 DSA_TOPK=4 DRAFT=3
@@ -2493,7 +2569,7 @@ family_glm_chain_sanitize() {
   msan colibri "asan chain colibri f32 decode" SNAP=glm_tiny REF=ref_glm.json ./colibri 1 16 16
   msan colibri "asan chain colibri DSA top-4 prefill, chunks of 3" SNAP=glm_tiny REF=ref_glm.json TF=1 DSA_TOPK=4 COLI_VK_CHAIN_ROWS=3 ./colibri 64 16 16
   msan colibri "asan chain colibri i4 container" SNAP=glm_tiny_i4 REF=glm_tiny_i4/ref_glm.json IDOT=0 ./colibri 2 4 4
-  msan colibri "asan chain colibri MTP depth 2" SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 ./colibri 64 16 16
+  msan colibri "asan chain colibri MTP depth 2" COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 ./colibri 64 16 16
   msan colibri "asan chain colibri device lost" SNAP=glm_tiny REF=ref_glm.json COLI_VK_CHAIN_FAULT=30 ./colibri 64 16 16
   msan glm53 "asan chain glm53 decode" GLM53_BITS=32 ./glm53 --model glm53_stream-i4 --ids 5,7,9,11,13,17,19,23 --greedy 8
   msan glm53 "asan chain glm53 int4 trunk, chain chunks of 3" GLM53_BITS=4 COLI_VK_CHAIN_ROWS=3 ./glm53 --model glm53_stream-i4 --ids $ids --greedy 4
@@ -2579,6 +2655,36 @@ k3c_gate() {
     echo "OK $tag $c: tokens = CPU, $lg, $(chain_count kimi_k3 vk.log) chain forwards$(grep -o 'rebuilding the state of [0-9]* positions\|the host.s state is current' vk.log | sed 's/^/, /')"
   done
 }
+# A published kimi-k3 GGUF (tests/test_gguf_import.py write_kimik3: IQ1_S and IQ2_XXS
+# experts in the latent, a Q6_K and Q8_0 trunk, res_score, ssm_a and MLA's k_b and v_b as
+# the file has them), imported. k3g_gate <tag> <env...>: the CPU's tokens and every logits
+# row (within k3c_close) from the chain, in the float forms (GQ_EXACT=1, and kv_b rebuilt as
+# floats: K3_MLA_BITS=32), as k3c_gate does for the checkpoint.
+k3_gguf_tiny() {
+  $PY - <<'PY' || fail "gguf-py (pip install gguf) is needed for the GGUF gates"
+import sys
+sys.path.insert(0, "tests")
+import numpy as np
+from test_gguf_import import write_kimik3
+write_kimik3("k3_gguf_tiny.gguf", np.random.default_rng(6))
+PY
+  rm -rf k3_gguf_tiny
+  $PY tools/gguf_import.py k3_gguf_tiny.gguf k3_gguf_tiny > /dev/null
+}
+k3g_gate() {
+  local tag=$1 ids="5 6 7 8 20 21 22 23"; shift
+  rm -f k3g.usage cpu.f32 vk.f32
+  env "$@" COLI_USAGE=$PWD/k3g.usage USAGE_SAVE=0 K3_VAL_LOGITS=cpu.f32 ./kimi_k3 k3_gguf_tiny --ids "$ids" --ngen 8 \
+    2> cpu.log | sed 's/ *TUNE.*//' > cpu.tok
+  env "$@" COLI_USAGE=$PWD/k3g.usage USAGE_SAVE=0 K3_VAL_LOGITS=vk.f32 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 \
+    COLI_VK_CHAIN=${CHAINMODE:-1} ./kimi_k3 k3_gguf_tiny --ids "$ids" --ngen 8 2> vk.log | sed 's/ *TUNE.*//' > vk.tok
+  { [ -s cpu.tok ] && cmp -s cpu.tok vk.tok; } || { cat cpu.tok vk.tok; tail -20 vk.log; fail "$tag: the chain's tokens differ from the CPU"; }
+  [ "$(chain_count kimi_k3 vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: the chain never ran"; }
+  local lg; lg=$(k3c_close cpu.f32 vk.f32) || { echo "$lg"; fail "$tag: logits"; }
+  # the fit counts a GGUF's blocks: what the chain placed is what it counted
+  ptl_check_placed kimi_k3 vk.log "$tag"
+  echo "OK $tag: tokens = CPU, $lg, $(chain_count kimi_k3 vk.log) chain forwards, $(ptl_n kimi_k3 vk.log) of $(ptl_L kimi_k3 vk.log) layers on the device"
+}
 k3c_serve_fixture() {   # the tiny fixture with the tokenizer the serve tests speak through
   rm -rf kimi_k3_serve && mkdir kimi_k3_serve
   cp kimi_k3_tiny/config.json kimi_k3_tiny/model.safetensors kimi_k3_serve/
@@ -2634,6 +2740,18 @@ family_kimi_chain() {
   # in chain chunks of 5 rows (seven chunks a 32-row forward), the loss in the third
   # chunk of the second forward: the state its first chunks advanced is not used
   K3C_CASES=long FAULT_BACK=124 REBUILD=1 k3c_gate "chain kimi_k3 device lost inside a chunked forward" $O COLI_VK_CHAIN_ROWS=5
+  # a GGUF's blocks: the trunk on the chain, the experts in the tier, as the file has them
+  k3_gguf_tiny
+  local G="GQ_EXACT=1 COLI_VK_IDOT=0 COLI_VK_CHAIN_GEMM=0 K3_MLA_BITS=32 COLI_TEMP=0"
+  k3g_gate "chain kimi_k3 GGUF" $G
+  grep -q "tier kimi_k3: the GGUF experts' blocks go to the device" vk.log && [ "$(tier_count kimi_k3 vk.log)" -gt 0 ] ||
+    { cat vk.log; fail "chain kimi_k3 GGUF: the tier took no expert as the file has it"; }
+  k3g_gate "chain kimi_k3 GGUF, tier off" $G COLI_VK_TIER=0
+  k3g_gate "chain kimi_k3 GGUF, chain chunks of 3" $G COLI_VK_CHAIN_ROWS=3
+  k3g_gate "chain kimi_k3 GGUF, the dense weights on the device only" $G COLI_VK_DENSE_HOST=0
+  # a partial chain: two layers on the device, the rest and the head on the CPU's blocks
+  k3g_gate "chain kimi_k3 GGUF, a partial chain" $G COLI_VK_CHAIN_LAYERS=2
+  ptl_check_n kimi_k3 vk.log 2 "chain kimi_k3 GGUF, a partial chain"
   # serve sessions frame for frame, the KDA state across turns
   local S="K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 K3_PREFIX_LOG=1 USAGE_SAVE=0"
   export CHAIN_SERVE_TOL=2e-2
@@ -2739,6 +2857,32 @@ v41_gate() {  # <tag> <env...> -- <argv...>
 v41_chain_fixtures() {
   $PY tools/make_dsv41_tiny.py --out dsv41_tiny --emit-ref dsv41_tiny/ref.json > /dev/null
   $PY tools/make_dsv41_tiny.py --out dsv41_long --emit-ref dsv41_long/ref.json --prompt-len 40 --max-new 6 > /dev/null
+}
+# A published deepseek41 GGUF (tests/test_gguf_import.py write_deepseek41: IQ1_S experts
+# with IQ2_XXS, Q4_K and Q5_K in other layers, a Q5_K, Q6_K and Q8_0 trunk, BF16
+# compressors and indexers, every engram table in one IQ4_NL tensor) and its DSpark head
+# in a GGUF of its own (write_dflash: MXFP4 experts, Q8_0 projections), imported with
+# --mtp naming the head, with the CPU's own 8 tokens without drafts in the float form (GQ_EXACT=1) as
+# its reference (ds41_gguf_tiny/tokens.txt too): no oracle reads these weights. The gates
+# take the float forms, as mimo_gguf_gate does.
+v41_gguf_tiny() {
+  $PY - <<'PY' || fail "gguf-py (pip install gguf) is needed for the GGUF gates"
+import sys
+sys.path.insert(0, "tests")
+import numpy as np
+from test_gguf_import import write_deepseek41, write_dflash
+write_deepseek41("ds41_gguf_tiny.gguf", np.random.default_rng(3))
+write_dflash("dspark-ds41_gguf_tiny-Q8_0.gguf", np.random.default_rng(4))
+PY
+  rm -rf ds41_gguf_tiny
+  $PY tools/gguf_import.py ds41_gguf_tiny.gguf ds41_gguf_tiny --mtp dspark-ds41_gguf_tiny-Q8_0.gguf > /dev/null
+  local ids="5, 6, 7, 8, 20, 21, 22, 23, 30, 31, 32, 33" out
+  echo "{\"prompt_ids\": [$ids], \"output_ids\": [0, 0, 0, 0, 0, 0, 0, 0]}" > ds41_gguf_tiny/ref.json
+  grep -q '"dspark"' ds41_gguf_tiny/gguf.json || fail "deepseek_v41 GGUF: the import found no DSpark head"
+  out=$(GQ_EXACT=1 V41_DSPARK=0 SNAP=ds41_gguf_tiny ./deepseek_v41 8 ds41_gguf_tiny/ref.json 2> /dev/null) || true
+  [ -n "$out" ] || fail "deepseek_v41 GGUF: the CPU printed no tokens"
+  echo "{\"prompt_ids\": [$ids], \"output_ids\": [${out// /, }]}" > ds41_gguf_tiny/ref.json
+  echo "$out" > ds41_gguf_tiny/tokens.txt
 }
 
 # DeepSeek V4 (deepseek_v4) on the dense chain: the deepseek-chain family's V4 half. The
@@ -3108,6 +3252,21 @@ family_deepseek_chain() {
   FAULT_BACK=5 v41_gate "chain deepseek_v41 device lost mid-decode" SNAP=dsv41_long -- 8 dsv41_long/ref.json
   FAULT_BACK=100 v41_gate "chain deepseek_v41 device lost in the prompt" SNAP=dsv41_long COLI_VK_CHAIN_ROWS=7 -- 8 dsv41_long/ref.json
   FAULT_BACK=8 v41_gate "chain deepseek_v41 device lost between drafts" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=5 -- 8 dsv41_tiny/ref.json
+  # a GGUF's block types: the trunk on the chain, the experts in the tier, as the file has them
+  v41_gguf_tiny
+  local fl=(GQ_EXACT=1 COLI_VK_IDOT=0 COLI_VK_CHAIN_GEMM=0 SNAP=ds41_gguf_tiny)
+  v41_gate "chain deepseek_v41 GGUF" "${fl[@]}" -- 8 ds41_gguf_tiny/ref.json
+  grep -q "tier deepseek_v41: the GGUF experts' blocks go to the device" vk.log && [ "$(tier_count deepseek_v41 vk.log)" -gt 0 ] ||
+    { cat vk.log; fail "chain deepseek_v41 GGUF: the tier took no expert as the file has it"; }
+  v41_gate "chain deepseek_v41 GGUF, prompt in chunks of 3" "${fl[@]}" COLI_VK_CHAIN_ROWS=3 -- 8 ds41_gguf_tiny/ref.json
+  v41_gate "chain deepseek_v41 GGUF, the experts on the CPU" "${fl[@]}" COLI_VK_TIER=0 -- 8 ds41_gguf_tiny/ref.json
+  # the head's drafts: its own (all rejected, random weights), then the reference's next
+  # tokens accepted whole (1) or rejected part way (2), each the tokens without drafts
+  for f in 0 1 2; do
+    v41_gate "chain deepseek_v41 GGUF DSpark spec=$f" "${fl[@]}" V41_SPEC_FORCE=$f -- 8 ds41_gguf_tiny/ref.json
+    grep -q "DSpark on" vk.log && cmp -s <(tr -d '\n' < vk.txt) <(tr -d '\n' < ds41_gguf_tiny/tokens.txt) ||
+      { cat vk.txt; tail -20 vk.log; fail "chain deepseek_v41 GGUF DSpark spec=$f: not the tokens without drafts"; }
+  done
   $PY tests/vulkan_chain_serve.py ./deepseek_v41 dsv41_tiny V41_DSPARK=0
   $PY tests/vulkan_chain_serve.py ./deepseek_v41 dsv41_tiny V41_DSPARK=1
   COLI_VK_CHAIN=2 $PY tests/vulkan_chain_serve.py ./deepseek_v41 dsv41_tiny V41_DSPARK=1 COLI_VK_CHAIN_ROWS=3
@@ -4039,7 +4198,7 @@ kv_split_colibri() {
   kv_mla_gate colibri "kv colibri DSA_FORCE" 1 8 4 $G DSA_FORCE=1 -- 64 16 16
   # drafts: the verify rows over the split, rejected rows rewritten
   kv_mla_gate colibri "kv colibri n-gram drafts" 1 8 4 $G DRAFT=3 -- 64 16 16
-  kv_mla_gate colibri "kv colibri MTP depth 2" 1 8 4 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 -- 64 16 16
+  kv_mla_gate colibri "kv colibri MTP depth 2" 1 8 4 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 -- 64 16 16
   kv_mla_gate colibri "kv colibri tier off" 1 8 4 $G COLI_VK_TIER=0 -- 64 16 16
   # prompts only: the prompt and the drafts' verify rows on the device, decode on the CPU
   CHAINMODE=2 kv_mla_gate colibri "kv colibri prompts only, drafts" 1 8 4 $G DRAFT=3 -- 64 16 16
@@ -4069,7 +4228,7 @@ kv_split_colibri_sanitize() {
     kv_san colibri "asan kv colibri decode" $K SNAP=glm_tiny REF=ref_glm.json ./colibri 64 16 16
     COLI_VK_KV_PIN=1 kv_san colibri "asan kv colibri DSA top-4, pinned, chunks of 3" COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 USAGE_SAVE=0 SNAP=glm_tiny \
       REF=ref_glm.json DSA_TOPK=4 COLI_VK_CHAIN_ROWS=3 ./colibri 64 16 16
-    kv_san colibri "asan kv colibri MTP depth 2" $K SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 ./colibri 64 16 16
+    kv_san colibri "asan kv colibri MTP depth 2" $K COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 ./colibri 64 16 16
     CHAIN_SERVE_EXPECT='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=colibri \
       $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 KV_SLOTS=2 $K > san.log 2>&1 \
       || { cat san.log; fail "asan kv colibri serve"; }

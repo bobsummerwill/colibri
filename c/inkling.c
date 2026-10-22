@@ -1284,8 +1284,9 @@ static void ink_dho_place(Model *m, int layer_begin, int layer_end) {
                               );
 }
 
-/* 1 for a GGUF read in place (st_gguf.h): its matrices are ggml blocks, which the dense chain
- * does not read (the expert tier does, ink_vk_gguf_forms). */
+/* 1 for a GGUF read in place (st_gguf.h): its matrices are ggml blocks, which the per-matrix
+ * path does not read; the dense chain takes them as the device's block formats (inkc_tensor)
+ * and the expert tier its experts (ink_vk_gguf_forms). */
 static int ink_is_gguf(const Model *m) {
     for (int i = 0; i < m->S.n; i++) if (st_is_ggml(m->S.t[i].dtype)) return 1;
     return 0;
@@ -1306,7 +1307,7 @@ static void ink_vk_init_model(Model *m, int layer_begin, int layer_end) {
     /* COLI_VK_DENSE_HOST: with the dense part on the device (the per-matrix path, or the
      * chain: asked here silently, inkc_start says it after the tier), every matrix the
      * shaders read is marked and goes up now, its host copy given back */
-    int chain = !other_gpu && layer_begin == 0 && layer_end == m->c.n_layers && !ink_is_gguf(m) &&
+    int chain = !other_gpu && layer_begin == 0 && layer_end == m->c.n_layers &&
                 coli_vk_chain_decide(NULL, g_vk_tier_try, INKLING_CHAIN_IGPU) != COLI_VK_CHAIN_OFF;
     /* the chain's fit before any upload and before the expert cache is sized: the first n
      * layers on the device, the others (and lm_head, unless the tail went up) on the CPU
@@ -1314,7 +1315,8 @@ static void ink_vk_init_model(Model *m, int layer_begin, int layer_end) {
     if (chain) inkc_fit_start(m);
     int end = g_inkc_fit.L ? g_inkc_fit.n : layer_end, head = g_inkc_fit.L ? g_inkc_fit.tail : 1;
     int on_device = (coli_vk_dense() || chain) && !other_gpu && !(g_inkc_fit.L && !g_inkc_fit.n);
-    if (coli_vk_dense_host_decide("inkling", on_device, ink_dho_bytes(m, layer_begin, end, head))) {
+    /* a GGUF's blocks go up with the chain only (inkc_tensor), their host copies kept */
+    if (coli_vk_dense_host_decide("inkling", on_device && !ink_is_gguf(m), ink_dho_bytes(m, layer_begin, end, head))) {
         g_ink_dho = 1; g_ink_dho_model = m;
         if (g_inkc_fit.L) coli_vk_dense_host_layers(g_inkc_fit.n, g_inkc_fit.L);
         ink_vk_mark_dense(m, layer_begin, end, head);
@@ -1326,6 +1328,15 @@ static void ink_vk_init_model(Model *m, int layer_begin, int layer_end) {
          * themselves; the per-matrix path shares their copies where it runs */
         if (coli_vk_dense()) ink_vk_mark_dense(m, 0, end, 0);
         inkc_place_init(m, NULL);
+        return;
+    }
+    if (g_inkc_fit.L && ink_is_gguf(m)) {
+        /* a GGUF's whole chain: its layers up now too. ink_vk_dense_bytes' geometry has no
+         * block types, so the tier took their room and the chain went up beside it at its
+         * first forward (Inkling-Small UD-IQ2_XXS: 26.9 GB held on a 24 GB card); lm_head
+         * goes up at the chain's start, counted in ink_vk_dense_bytes */
+        inkc_place_init(m, NULL);
+        if (coli_vk_dense()) ink_vk_mark_dense(m, layer_begin, layer_end, 1);
         return;
     }
     if (!coli_vk_dense()) return;   /* nothing marked: the CPU computes the dense matrices */
@@ -2146,6 +2157,30 @@ static int ink_vk_in_ram(void *ctx, int layer, int e) {
     Slot *s = slot_indexed((Model *)ctx, layer, e);
     return s && s->filled;
 }
+/* The tier's host pool took `bytes` of the RAM the expert cache was sized from (vk_tier.h,
+ * ram_given): fewer slots a layer, top-k at least (COLI_VK_TIER_HOST_GB sizes the pool
+ * instead, and the cache keeps its size). */
+static size_t g_ink_vk_slot_bytes;
+static void ink_vk_ram_given(void *ctx, size_t bytes) {
+    Model *m = ctx;
+    const Cfg *c = &m->c;
+    int L = 0, was = 0, now = 0;
+    for (int i = 0; m->cache && i < c->n_layers; i++) L += m->cache[i].slots != NULL;
+    if (L < 1 || !g_ink_vk_slot_bytes) return;
+    const size_t per = g_ink_vk_slot_bytes * (size_t)L;
+    const int cut = (int)((bytes + per - 1) / per);
+    for (int i = 0; i < c->n_layers; i++) {
+        LCache *lc = &m->cache[i];
+        if (!lc->slots) continue;
+        int cap = lc->cap - cut;
+        if (cap < c->topk) cap = c->topk;
+        if (cap < lc->n) cap = lc->n;   /* slots filled already stay */
+        if (cap > lc->cap) cap = lc->cap;
+        was = lc->cap; now = cap; lc->cap = cap;
+    }
+    fprintf(stderr, "[VK] inkling: the tier's host pool took %.1f GiB of the RAM the expert cache was sized from: %d slots a layer, not %d\n",
+            bytes / 1073741824.0, now, was);
+}
 /* Bytes the dense matrices marked for the device will take there (the budget leaves
  * them room), from the geometry: int8 1 byte, int4-g64 0.5625, f32 4, bf16 2. */
 static size_t inkc_fit_later(const Model *m);   /* inkling_chain.h */
@@ -2154,6 +2189,8 @@ static size_t ink_vk_dense_bytes(const Model *m) {
     double b = 0;
     if (g_inkc_fit.L && vkc_fit_partial(&g_inkc_fit))   /* a partial chain: its layers placed already */
         return inkc_fit_later(m);
+    if (g_inkc_fit.L && ink_is_gguf(m))   /* a GGUF's whole chain, placed already: its layers' buffers and the head to come */
+        return inkc_fit_later(m) + (g_inkc_fit.tail ? g_inkc_fit.tail_b : 0);
     if (g_ink_dho) return 0;   /* placed already (ink_dho_place): the free memory the tier reads counts them */
     #define INK_VKB(w, n) do { const Wt *w_ = (w); int f_ = w_->vk ? ink_vk_fmt(w_) : 0; \
         b += (double)(n) * (f_ == 1 ? 1.0 : f_ == 4 ? 0.5625 : f_ == 10 ? 4.0 : f_ == 11 ? 2.0 : 0.0); } while (0)
@@ -2239,12 +2276,14 @@ static void ink_vk_tier_start(Model *m) {
         int64_t slotb = m->xq ? m->rb13*2*I + m->rb2*D + (2*I+D)*4
                       : m->quant_bits ? 3*I*D + (2*I+D)*4 : 3*I*D*4;
         if (!m->gx) fd = f;
+        g_ink_vk_slot_bytes = (size_t)slotb;
         VktConfig vc = {.engine = "inkling", .layers = c->n_layers, .experts = c->n_experts,
                         .hidden = c->hidden, .inter = c->moe_inter, .topk = c->topk,
                         .gate_up = f, .down = fd, .layer_gate_up = lgu, .layer_down = ldn,
                         .act = VKT_ACT_SWIGLU,
                         .max_rows = INK_VK_ROWS * c->topk,
                         .ram_reserve = (size_t)slotb * (size_t)m->cache[0].cap * (size_t)nsp,
+                        .ram_floor = (size_t)slotb * (size_t)c->topk * (size_t)nsp, .ram_given = ink_vk_ram_given,
                         .dense_bytes = ink_vk_dense_bytes(m),
                         .in_ram = ink_vk_in_ram, .ram_ctx = m,
                         .load = ink_vk_load, .release = ink_vk_unhold, .load_ctx = m, .load_batch = ink_vk_load_batch};

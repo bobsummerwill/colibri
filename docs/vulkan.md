@@ -6,6 +6,8 @@ That includes cards the vendor stacks have dropped (ROCm 7 removed Polaris:
 an RX 580 runs here via RADV) and, measured on an RX 9070 (RDNA4), it is
 *faster* than the ROCm/HIP backend on the same card.
 
+The same models on the CPU, Vulkan and CUDA, one machine and one build: [gpu-parity.md](gpu-parity.md).
+
 ```bash
 cd c
 make glm VK=1                # needs the Vulkan headers + glslc (shaderc) for the shaders
@@ -420,6 +422,79 @@ of them on the device the way a GPU-equipped PC should use its card:
   than 1.25 x their heat + 4). A promotion copies the expert's bytes once on the engine thread
   (at most `COLI_VK_TIER_RATE` per token, 16) and an uploader thread writes it to
   the device; it serves from the next layer step on.
+- **Also when the device computes every expert.** With the host pool (system RAM the
+  device reads over PCIe, below) the device computes every routed expert and the CPU
+  none, so no expert passes by the CPU any more and the set on the device would stay
+  the warm start's. Where RAM holds every expert, the host pool now takes the device's
+  experts too (the warm start puts each in both places). After a decode step or a
+  verify (up to 8 rows: a prompt chunk routes nearly every expert once), a routed expert
+  the device read from the pool moves up into a free place on the device or the coldest
+  resident's, when it beats that one by two routings, up to `COLI_VK_TIER_PROMOTE` (32) a
+  forward. The resident goes back to its pool copy at once and nothing is copied back;
+  the newcomer is copied up by the device's copy engine from the pool
+  (`coli_vk_tensor_copy`: no byte through the CPU) while the engine goes on, and takes
+  its place in the tables at the next frame's start (`vkt_settle`). The tier logs which
+  entries each change touched (`vkt_dev_changes`), and the dense chain rewrites those
+  entries only: read whole at every change, the tables cost Qwen3.8's decode a fifth
+  (the code prompt below: 37.5-40.3 tok/s).
+  Measured on an RTX PRO 4000 with Qwen3.8-Flash-Next IQ2_XS (34.6 GiB of experts in
+  the pool, 10443 places on the card), each server on a copy of one history, three
+  runs:
+
+  | prompt | decode, `COLI_VK_TIER_PROMOTE=0` | decode, the default | the decode's experts in VRAM |
+  |---|---|---|---|
+  | code (not in the history) | 30.3-31.6 tok/s | 46.4-48.0 tok/s | 66.7% -> 92.7% |
+  | Italian prose (not in the history) | 54.4-56.1 tok/s | 61.7-64.0 tok/s | 79.9% -> 93.2% |
+  | the meeting report that wrote the history | 49.6-50.8 tok/s | 48.7-51.4 tok/s | 93.9% -> 93.3% |
+
+  Without the two routings' margin the last one lost 4% to swaps that found nothing
+  more on the card; at 16 a forward the code prompt reached 89% in VRAM, not 93%. The
+  greedy text is the same with and without (Qwen3.8 IQ2_XS, Qwen3.6 Q4_K_M with
+  `COLI_VK_TIER_GB=8`, where the second took 8.6 s against 11.1 s for 400 tokens).
+  Without the RAM for every expert, or beside a second device, the tier keeps the warm
+  start's set as before.
+- **The host pool and the engine's RAM cache share the RAM.** When the pool cannot hold
+  every expert the device leaves (a model bigger than RAM and VRAM together), the CPU
+  computes the others from the engine's own RAM cache, which the engine sized from the
+  same free RAM before the tier started. The pool now takes that cache's least
+  (`VktConfig.ram_floor`, top-k slots a layer) out of its room, and once sized hands the
+  engine its bytes (`VktConfig.ram_given`): every engine but DeepSeek V4 lowers its cache
+  by as much, to no less than top-k slots a layer; one without the callback keeps its
+  `ram_reserve` and the pool takes what is left. On GLM-5.3 Flash UD-IQ2_XXS (95 GB) with
+  62 GB of RAM the two had asked for 52.8 and 48 GB, and a 711-token prompt was killed by
+  the OOM killer; the pool now takes 45 GiB and the cache 10 slots a layer instead of 127,
+  and the same prompt runs at 11.2 tok/s with the process at 58 GB. The pool beats the
+  cache there: with `COLI_VK_TIER_HOST=0` (every free byte the cache's) the decode ran at
+  0.7-1.4 tok/s against 3.2-3.3. DeepSeek V4's expert store keeps its `ram_reserve` on
+  purpose: its CPU computes a step's cold experts fast enough that the split helps, and
+  on DeepSeek V4 Flash 0731 UD-IQ2_XXS (85 GB) a pool of 41 GiB with the store cut to 22
+  slots a layer decoded at 5.5-5.6 tok/s against 5.9-6.2 with the store whole and a pool
+  of 5 GiB. `COLI_VK_TIER_HOST_GB` sizes the pool and leaves the
+  cache as it was.
+- **A GGUF's few bigger layers keep their own rooms.** Published GGUFs type a few expert
+  layers bigger than the rest, and the tier takes each layer's experts in its own types
+  (`VktConfig.layer_gate_up`, `layer_down`). Every expert used to take the room of the
+  biggest form, so that a freed expert's place held any other: on the files below, 9.4
+  MiB for experts of 7.3 (IQ2_XXS gate and up, IQ3_XXS down in all but two or three
+  layers). Now the layers of the form most layers have keep their experts at their own
+  size, and only the others take the room of the biggest among them. A newcomer
+  displaces a resident of its own class first, and one of the other class only when
+  that one's room holds it: a smaller form's expert in a bigger form's room, never the
+  other way. The device and the host pool hold 25-31% more experts. Measured on an
+  RTX PRO 4000 (24 GB) with 62 GB of RAM, each server on a copy of one history, 128
+  tokens, a warm-up and a run:
+
+  | model | experts in VRAM, in the pool | routed experts on the device | disk loads | decode | prompt |
+  |---|---|---|---|---|---|
+  | GLM-5.3 Flash UD-IQ2_XXS (95 GB), before | 1707, 4808 | 89.4% | 13198 | 2.50, 3.14 tok/s | 8.3, 9.2 tok/s |
+  | the same, now | 2167, 6064 | 95.0% | 6502 | 2.92, 3.40 tok/s | 9.3, 9.3 tok/s |
+  | DeepSeek V4 Flash 0731 UD-IQ2_XXS (85 GB), before | 1721, 465 | 69.4% | 3367 | 5.25, 5.35 tok/s | 9.3, 17.3 tok/s |
+  | the same, now | 2250, 580 | 74.1% | 1469 | 6.18, 6.25 tok/s | 19.7, 20.4 tok/s |
+  | Inkling-Small UD-IQ2_XXS (77 GB), before | 2375, 5431 | 99.8% | 186 | 7.87, 8.11 tok/s | 12.2, 22.8 tok/s |
+  | the same, now | 3098, 7003 | 100.0% | 14 | 11.53, 10.92 tok/s | 15.1, 33.1 tok/s |
+
+  The startup line says `N layers in M forms other than most layers', their experts in
+  the room of the biggest of those, the rest at their own size`.
 - **A fresh install starts warm.** A model downloaded a minute ago has no history,
   so its first runs would fill the tier one routing at a time. `coli setup` copies a
   starting history into the model folder when it has none, for the catalog models
@@ -479,7 +554,7 @@ order its CPU-only run does, and keeps a history for the warm start where it has
 | inkling | int4 container `I4U_PAIRS_ROW` (fmt 2); int8 container `I8_ROW` (fmt 1); runtime int8 rows, `I8_AS_I4_ROW` at 2 to 4 bits (fmt 2) and `I8_ROW` above; `F32` at `bits=0` (fmt 10). Gate and up come from the fused `gate_up` tensor, up I rows in | SwiGLU | `<snap>/.coli_usage` or `PIN=<path>`, in the generate and serve modes; the ref.json oracle reads none | [Inkling and OLMoE](#inkling-and-olmoe) |
 | olmoe | int8 rows `I8_ROW` (fmt 1), gate, up and down as the merged container holds them | SwiGLU | `COLI_USAGE` only | [Inkling and OLMoE](#inkling-and-olmoe) |
 | kimi_k3 (Kimi K3) | the checkpoint's MXFP4 with ue8m0 scales `MXFP4_E8M0` 32 (fmt 7): gate `w1`, up `w3`, down `w2`, in the latent space | SiTU-GLU (`VKT_ACT_SITU`) | `COLI_USAGE` (default `<snap>/.coli_usage`) | [Kimi K3 and MiMo](#kimi-k3-and-mimo) |
-| mimo (MiMo-V2.6 Flash and Pro) | the release's MXFP4 `MXFP4_E8M0` 32 (fmt 7) | SwiGLU | none: the tier fills as experts pass by | [Kimi K3 and MiMo](#kimi-k3-and-mimo) |
+| mimo (MiMo-V2.6 Flash and Pro) | the release's MXFP4 `MXFP4_E8M0` 32 (fmt 7); a GGUF's other block types as the file has them (100 + the ggml type), each layer its own | SwiGLU | `COLI_USAGE` (default `<snap>/.coli_usage`) | [Kimi K3 and MiMo](#kimi-k3-and-mimo) |
 | deepseek_v41 (DeepSeek V4.1 Flash) | MXFP4 `MXFP4_E8M0` 32 (fmt 7), as the checkpoint stores it | SwiGLU with `swiglu_limit` | `COLI_USAGE` (default `<snap>/.coli_usage`), kept only while the tier is on | the backbone's layers; the DSpark stages, with caches of their own, are extra layers ([below](#the-mtp-heads-layer-on-the-tier-coli_vk_tier_mtp)) |
 | deepseek_v4 (DeepSeek V4 Flash) | MXFP4 `MXFP4_E8M0` 32 (fmt 7); pinned experts unpacked from rows16 | `VKT_ACT_SWIGLU_V4` | the store's own `<model>/.coli_usage` | [DeepSeek V4's activation](#deepseek-v4s-activation) |
 | colibri (GLM-5.2) | `F32` (fmt 10), int8 `I8_ROW` (fmt 1), int4 per row `I4U_PAIRS_ROW` (fmt 2), int4-gs `I4U_PAIRS_GS` (fmt 4), int3-g64 `I3_G64` (fmt 5); down may have its own | SwiGLU | `<snap>/.coli_usage` | [GLM-5.2 and GLM-5.3 Flash](#glm-52-and-glm-53-flash-on-the-tier) |
@@ -496,6 +571,9 @@ the device, since no Vulkan tier runs.
 | `COLI_VK_TIER_GB` | measured | The tier's budget in GiB, within what the device can hold. Unset: below. |
 | `COLI_VK_TIER_RESERVE_GB` | `1` | Device memory left to everything else (scratch, KV mirrors, the driver) on top of the dense weights the engine still has to place and, on qwen38, the chain's KV mirror and a prompt chunk. |
 | `COLI_VK_TIER_RATE` | `16` | Promotions per token at most (a prompt's forward gets this many per prompt token): each copies one expert on the engine thread. |
+| `COLI_VK_TIER_HOST` | on (a discrete GPU) | `0`: no host pool. The pool shares system RAM with the engine's RAM expert cache (below). |
+| `COLI_VK_TIER_HOST_GB` | from free RAM | The host pool's size in GiB; the engine's cache keeps its size then. |
+| `COLI_VK_TIER_PROMOTE` | `32` | With a host pool that holds every expert: the most routed experts that move up from it to the device a forward (below). `0`: the warm start's set. |
 | `COLI_VK_TIER_BALANCE` | on | `0`: the device takes every resident expert of a step even when it is the slower side (see below). |
 | `COLI_VK_TIER_WARM` | on | `0`: no warm start; the tier fills as experts pass by. |
 | `COLI_VK_TIER_FILL` | on | The warm start fills the device: the history's experts first (hottest first), then the room left with the experts no history named, one of each layer in turn. A first run used to start with an empty device and fill it at the promotion rate (Qwen3.6 on a 3090 Ti: 16.5% of the routed experts on the device and the CPU's speed, then 97% and three times it from the second run, #2081). A model whose experts all fit now goes up whole at start. `0`: the history's experts only. |
@@ -1030,7 +1108,8 @@ integrated GPU that made the dense part slower on the device than on the CPU (se
 command buffer instead, and keeps the residual stream on the device from one layer
 to the next. qwen36 (Qwen3.6, Qwen3-Coder, Qwen3.8-27B) and qwen38 (Qwen3.8 Flash
 Next) run it: by default on a discrete GPU, and for qwen36 on an integrated one with
-the expert tier (see [the default](#the-chain-on-a-radeon-780m)); `COLI_VK_CHAIN=1`
+the expert tier, and for qwen38 on one with 32 or more compute units too (see [the
+default](#the-chain-on-a-radeon-780m)); `COLI_VK_CHAIN=1`
 anywhere. `COLI_VK_DENSE=0` keeps it off too, unless `COLI_VK_CHAIN` says otherwise: the
 chain's copy of the trunk would take the expert tier's budget (on an 8 GB RTX 4070
 Laptop with qwen38, disk-bound, the tier got 1.87 GiB instead of 6.00 and decode went
@@ -1183,7 +1262,7 @@ f32 throughout, as the CPU's f32 path.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `COLI_VK_CHAIN` | on for a discrete GPU; on an integrated GPU with the expert tier, what the engine measured (qwen36 and olmoe on, qwen38 off; mimo, inkling, colibri, glm53, kimi_k3, deepseek_v41 and deepseek_v4 off: not measured); off on a CPU device | `1`: every layer's dense chain on the device; `2`: prompts only (forwards of more than two rows that are not a speculative verify; decode and verifies on the per-matrix path, the state moving between the two); `0`: the per-matrix path. The `[VK] <engine>: dense chain ...` line says which and why. |
+| `COLI_VK_CHAIN` | on for a discrete GPU; on an integrated GPU with the expert tier, what the engine measured (qwen36 and olmoe on, qwen38 on with 32 or more compute units and off with fewer; mimo, inkling, colibri, glm53, kimi_k3, deepseek_v41 and deepseek_v4 off: not measured); off on a CPU device | `1`: every layer's dense chain on the device; `2`: prompts only (forwards of more than two rows that are not a speculative verify; decode and verifies on the per-matrix path, the state moving between the two); `0`: the per-matrix path. The `[VK] <engine>: dense chain ...` line says which and why. |
 | `COLI_VK_CHAIN_ROWS` | from the budget, up to 8192 | Prompt rows per chunk: a longer prompt runs every layer chunk by chunk (the device's scratch is sized for one chunk). Unset or `auto`: the most rows whose buffers fit half the free device memory, up to `COLI_VK_CHAIN_ROWS_MAX` (8192); see [big prompt chunks](#big-prompt-chunks-and-expert-streaming). It was 512 before. |
 | `COLI_VK_CHAIN_LAYERS` | what fits | The engines on [the partial chain](#a-partial-chain): the first N layers on the device, the CPU the rest and the head. Unset or `auto`: the most layers the device's free memory holds (every layer when they fit, the chain as before); `n`: n layers; `0`: the chain off. |
 | `COLI_VK_CHAIN_FLASH` | `16` | Rows from which a forward's plain causal attention runs on the matrix units (`chain_attn_flash.comp`: query heads of one kv head folded into 16-row tiles, K/V staged once per block as f16, two passes); `0` never. Needs cooperative matrices at subgroup size 64 or 32 (at 32 the first four of the workgroup's eight subgroups take the matrix work, all of them stage and run the softmax); otherwise, and for a selection list, a window, a ring or a sink, the blocked shader or `chain_attn.comp`. On a Radeon 8060S (Qwen3.6, 1011-token prompt) the attention went from 186 ms (`chain_attnb`) to 22 ms, the first token from 2.08 to 1.85 s, perplexity unchanged (7.65). On an RTX PRO 4000 (Qwen3.6 int4-g64, 467-token prompt) the prefill went from 1413-1477 to 1521-1580 tok/s. |
@@ -1266,15 +1345,39 @@ What the numbers say:
 
 **The default** (`coli_vk_chain_decide`, next to `coli_vk_dense_decide`): on a discrete
 GPU the chain is on. On an integrated GPU with the expert tier on, each engine passes
-what it measured here: qwen36 on, qwen38 off (decode, a chat's steady state, is slower
-in both modes; `COLI_VK_CHAIN=2` is the choice for long prompts). Without the tier, and
-on a CPU device such as Lavapipe, it is off. An engine not timed on an integrated GPU
-passes `COLI_VK_CHAIN_UNMEASURED`: off there, and the line says "not measured". The
-startup line says which and why:
+what it measured here: qwen36 on, qwen38 off with fewer than 32 compute units (decode, a
+chat's steady state, is slower in both modes; `COLI_VK_CHAIN=2` is the choice for long
+prompts) and on with 32 or more. Without the tier, and on a CPU device such as Lavapipe, it
+is off. An engine not timed on an integrated GPU passes `COLI_VK_CHAIN_UNMEASURED`: off
+there, and the line says "not measured". The startup line says which and why:
 
 ```
 [VK] qwen36: dense chain on (an integrated GPU with the expert tier: measured faster on decode and prefill; COLI_VK_CHAIN=0 off, 1 on, 2 prompts only)
 ```
+
+**Compute units.** An integrated GPU reports its active compute units in
+`VK_AMD_shader_core_properties2`. From 32 units on, qwen38 turns the chain on by default. With
+the MTP head on beside the chain and the expert tier, qwen38 also drafts one token per verify
+and gives the expert cache of the head a slot for every expert. The tier reserves RAM for that
+cache. `Q38_MTP_DRAFTS` and `Q38_MTP_CAP` set either. A chain that holds every layer leaves the
+head off unless `Q38_MTP=1` asks for it ([speculative.md](speculative.md)). `coli plan` reads
+the units through the Vulkan loader. Where only `vulkaninfo` is available, it warns and prices
+fewer than 32 units.
+
+A verify of two drafts is three rows and took 1.67 times a one-row forward, against 1.22 for
+one draft. It returned 2.20 tokens per forward against 1.76. A cache of 32 slots misses the FP8
+experts of the head, which are then read from disk on every draft (2,707 to 3,111 loads a run
+against 614 with a slot for every expert). Qwen3.8 Flash Next with the int4-g64 sidecar on a Radeon 8060S (40 compute
+units), `COLI_VULKAN=1`, the head's layer on the CPU (`Q38_MTP_CHAIN=0` keeps it there), an 84-token prompt and 300 new
+tokens, greedy, single runs:
+
+| Arm | tok/s |
+|---|---|
+| trunk on the CPU, 2 drafts, head cache 32 | 8.3 |
+| chain on, 2 drafts, head cache 32 | 17.4 |
+| chain on, 1 draft, head cache 32 | 19.8 |
+| chain on, 2 drafts, head cache 512 | 20.0 |
+| chain on, 1 draft, head cache 512 | 22.2 to 23.4 |
 
 **What was not measured.** No discrete GPU was available. On one the trunk sits in
 VRAM, read at several times the CPU's bandwidth, the clock is not held at a floor
@@ -1320,6 +1423,31 @@ caches only when the step's last frame has completed: a device lost in the middl
 step loses nothing the host holds, and the CPU runs the step's remaining rows from where
 the caches end. Nothing is rebuilt, and a turn with a picture recovers too. The line is
 `[VK] mimo chain: the device was lost at position P; ...`.
+
+**A GGUF of block types** (ggml-org's MiMo-V2.6-Flash Q2_K_S, say: K-quant experts and
+trunk). The engine used to take a GGUF only with MXFP4 experts and a BF16 trunk. A trunk
+matrix of a ggml block type now stays the file's rows (`DW_GQ`): the CPU multiplies it in
+its integer form (`ggml_quants.h`), the chain uploads it as the device's block format, and
+the per-matrix path leaves it to the CPU. The experts are read as the file has them (a slot
+`[down | gate | up]`, each layer its types), computed on the CPU with the same kernels and
+taken by the tier as their blocks, the commonest pair of types as the main form. A block
+embedding becomes the bf16 rows the engine keeps.
+
+**The expert history.** mimo now counts its routing (`route_trace.h`) and keeps it in
+`COLI_USAGE` (default `<model>/.coli_usage`), and the tier starts warm from it
+(`vkt_plan`, `vkt_put`). Before, every start had the tier empty, filling as experts passed
+by. On MiMo-V2.6-Flash Q2_K_S (106 GB) with an RTX PRO 4000 and 62 GB of RAM, three
+120-word prompts of 128 tokens on one server: decode 2.0, 2.9, 3.8 tok/s cold, then 7.8 from
+the first request once a run had written the history (85% of the routed experts on the
+device, about 1230 disk loads a turn instead of about 21500).
+
+**A prompt chunk's scratch.** The chain reserved its scratch for each prompt's rows, so a
+longer prompt than the first had to grow it after the tier's promotions had filled the
+budget: on the server above the second request's 172 rows were refused and the chain was
+off for the rest of the session (decode 7.9 then 3.4-3.9 tok/s, prefill 7.9 then 6.0 and 3.9). The
+first prompt now reserves the whole chunk (`mc_chunk_rows`, sized from the room free at
+the first forward), and a refused growth runs the prompt in chunks of the rows the chain
+holds instead of turning it off: prefill 8.1-8.2 and decode 7.8-7.9 tok/s on every request.
 
 **What stays off the device.** The router's top-k and the routed experts the tier does
 not hold, the embedding gather, the vision tower (on the device only with
@@ -1384,7 +1512,15 @@ turns it on) and on a CPU device:
 ### OLMoE and Inkling
 
 olmoe (`olmoe_chain.h`) and inkling (`inkling_chain.h`) run the chain too, with the same
-knobs, default rule and `[VK] <engine> chain: ...` line as qwen36.
+knobs, default rule and `[VK] <engine> chain: ...` line as qwen36. A GGUF's matrices go up
+as the file's blocks (`olc_gq_tensor`, `inkc_tensor`: 100 + the ggml type, rows the
+loader interleaved by 16 back to the file's first, whole groups of them for Inkling's
+head, whose unpadded vocabulary stops inside the last one), OLMoE's experts in the frame
+with their block decoders; outside the chain (the per-matrix path, the dense weights on
+the device only) a GGUF's dense part stays on the CPU. Before, both chains were off for a
+GGUF. On an RTX PRO 4000: OLMoE-1B-7B Q4_K_M decode 71-73 -> 210 tok/s and a 176-token
+prompt 549 -> 2454 tok/s (the CPU's greedy text); Inkling-Small UD-IQ2_XXS (77 GB, 62 GB
+of RAM) decode 6.9-7.1 -> 9.4-10.4 tok/s and a 173-token prompt 22.2-22.7 -> 17.6-29.2.
 
 | | olmoe | inkling |
 |---|---|---|
@@ -1573,6 +1709,37 @@ layer:
 | device, frame A2 (not waited for) | the shared expert | the shared expert (clamped SwiGLU) |
 | after the last layer | the final rows back to the host, which runs the final norm and lm_head as before | the final streams back to the host, which collapses them and runs the final norm and the head as before |
 
+**A GGUF (glm53).** GLM-5.3 Flash's matrices from a GGUF go up as the file's blocks
+(100 + the ggml type, the device's block formats; rows the CPU keeps interleaved by 16
+go back to the file's first), as qwen36's and qwen38's chains take them. The MLA's
+per-head `k_b` and `v_b`, which the absorbed core reads a head at a time
+(`vkc_mla_hgemv`, no block form), go up dequantized as floats. Before, a GGUF's chain
+stopped at "a matrix with no device form" and the whole trunk ran on the CPU (UD-IQ2_XXS
+on an RTX PRO 4000: 63% of the CPU's time in its Q5_K/Q6_K rows). Now every layer is on
+the device (5.96 GiB): decode 0.8-1.1 -> 2.8-3.2 tok/s, a 171-token prompt 2.2 -> 4.8-6.3
+tok/s, with 62 GB of RAM and two NVMe drives for the 95 GB the RAM and VRAM do not hold.
+This model's greedy text forks at near ties where the CPU's own two forms fork too: on
+an 8-token prompt the CPU's integer and float sums (`GQ_EXACT=1`) put the logits 28 to
+37% apart, and the chain against the CPU's float sums 2e-3 on the first row and up to 8%
+after it.
+
+**A GGUF (colibri).** GLM-5.2's matrices from a GGUF go up the same way: the file's blocks
+(100 + the ggml type), rows the CPU keeps interleaved by 16 back to the file's first
+(`glmc_gq_rows`). A GGUF splits `kv_b` into the per-head `k_b` and `v_b`, which are the
+absorbed core's `k_abs` and `v_abs`: they go up dequantized as floats, as glm53's, and the
+per-matrix path never takes them for a whole `kv_b`. Before, the chain had no form for
+either and every layer stayed on the CPU. UD-IQ1_S (202 GB) on an RTX PRO 4000 with 62 GB
+of RAM and two NVMe drives, a 166-token prompt and 128 tokens: the trunk on the CPU with
+the tier on the whole card (2165 experts) gave 2.6 tok/s of prompt and 0.67-0.68 of
+decode, the trunk on the device (78 layers, 16 GiB) with the tier on the rest (580
+experts) 2.8-2.9 and 0.72-0.74 (the CPU alone 1.9 and 0.46). The model is three times the
+RAM: the CPU's share of the experts read from the disk is the cost either way, and
+giving the tier more of the card measured no better (39 layers on the device and 1313
+experts: 2.7 and 0.67-0.85; 20 layers and 1685 experts: 2.5-2.7 and 0.62-0.68). With
+the device's float form (`GQ_EXACT=1 COLI_VK_IDOT=0 COLI_VK_CHAIN_GEMM=0`) the greedy
+text is the CPU's float form's for 40 tokens, and the first 4 tokens' top-10 logprobs
+agree within 1e-4; the integer forms fork at a tie, as the CPU's own two forms do.
+
 **The state.** The KV caches (GLM-5.2's latent, rope keys and index keys; GLM-5.3's
 latent, index keys and pool gates) stay the host's: each step copies its new rows back,
 and the device mirror has a watermark that every host write lowers (the CPU's attention,
@@ -1759,11 +1926,32 @@ engram layer's projection, its state) before its host pages are given back, so a
 that does not reach the device reads nothing back from disk. DSpark's stages take the
 means of their target layers from whichever side ran them.
 
+**A GGUF.** The published deepseek41 GGUFs' matrices go up as the file's blocks (100 +
+the ggml type), rows the CPU keeps interleaved by 16 back to the file's first
+(`v41c_gq`), and their BF16 compressors and indexers as bf16 (fmt 11). The grouped
+output projection `wo_a` runs on `vkc_mla_hgemv`, which reads no blocks: it goes up as
+int8 with a scale per 32 inputs (fmt 13) from Q8_0 and as floats (fmt 10) from the other
+types. Before, the chain refused a GGUF and every layer stayed on the CPU. UD-IQ1_S (233
+GB) on an RTX PRO 4000 (24 GB) with 62 GB of RAM, a 163-token prompt and 128 tokens, a
+warm-up and three runs, each server on a copy of one expert history:
+
+| | prompt | decode |
+|---|---|---|
+| the CPU | 6.0-6.7 tok/s | 2.21-2.23 tok/s |
+| the chain off (the per-matrix path holds 60 matrices, the rest of the trunk on the CPU), the tier on the card (2893 experts) | 16.6-16.9 tok/s | 2.91-3.16 tok/s |
+| the chain (40 layers, 9.5 GiB), the tier on the rest (1631 experts) | 17.3-18.6 tok/s | 5.00-5.23 tok/s |
+
+The greedy text is the CPU's for 40 tokens in both forms: the integer forms, and the
+device's float form (`GQ_EXACT=1 COLI_VK_IDOT=0 COLI_VK_CHAIN_GEMM=0`) against the CPU's.
+`tests/vulkan_engines.sh deepseek-chain` runs a small file of the same types and shapes
+(`tests/test_gguf_import.py` `write_deepseek41`) against the CPU's float form: the logits
+within 1.4e-6 of the largest on the 780M.
+
 **The default**: `COLI_VK_CHAIN_UNMEASURED`, so the chain is off on an integrated GPU
 (`COLI_VK_CHAIN=1` turns it on, `2` for prompts only) and on a discrete GPU follows the
-rule above. No DeepSeek checkpoint was run on the chain: none is on the 780M box, and
-V4.1 Flash is 510 GB. Speed is not measured; the tests prove the tokens on the tiny
-fixtures, on Lavapipe, the 780M and the Iris Xe:
+rule above. No DeepSeek checkpoint fits the 780M box (V4.1 Flash is 510 GB, the
+published UD-IQ1_S 233 GB): there the tests prove the tokens on the tiny fixtures, on
+Lavapipe, the 780M and the Iris Xe:
 
 ```
 [VK] deepseek_v41: dense chain off (an integrated GPU with the expert tier: not measured; COLI_VK_CHAIN=0 off, 1 on, 2 prompts only)
@@ -1785,7 +1973,23 @@ where, per layer:
 
 The matrices are the per-matrix path's device copies, found in the same map (fp8 as
 fmt 12, bf16 as fmt 11), and the mHC mixes in f32 (fmt 10), which only the chain
-multiplies. Every matrix takes the per-row GEMV, never the tiled GEMM: a row's bits then
+multiplies. A GGUF's go up in their own types (`v4c_gq_fmt`): the device's block
+formats as the file has them (rows the loader interleaved by 16 back to the file's
+first), a float view as stored; the grouped `wo_a`, which `vkc_mla_hgemv` reads a group
+at a time and which has no block form there, goes up as int8 with a scale per 32 from a
+Q8_0 (fmt 13, the same numbers) and as floats from any other type. Before, a GGUF's chain
+was off and the trunk ran on the CPU: on DeepSeek V4 Flash 0731 UD-IQ2_XXS (85 GB, an RTX
+PRO 4000 with 62 GB of RAM) decode 2.2-2.5 -> 5.6-6.2 tok/s and a 163-token prompt 6-10 ->
+16-19 tok/s, a 703-token one at 20-21.5; the logits within the model's own spread (its
+CPU's integer and float sums 6-9% apart, the chain 4-9% from the floats, the same greedy
+tokens). `make deepseek-v4 VK=1` on its own builds the block formats' shaders too now (the
+target depends on the parent's `VK_SPV`): its own list had no `qmatmul_bd.spv`, and such a
+build ran DeepSeek V4 Flash UD-IQ1_S (82.5 GB) with the chain and the tier off, 0 matmuls on
+the GPU. Built whole, on the same card: the CPU 7.9 tok/s of a 163-token prompt and 2.77-2.79
+of decode, the chain (43 layers, 6.0 GiB) and the tier (2382 experts) 20-22 and 6.62-6.94,
+the same greedy text. A whole chain (every layer and the head) gives the tier no dense bytes still to
+come: its matrices were counted twice before, and the tier's budget went from 10.3 to
+16.5 GiB. Every matrix takes the per-row GEMV, never the tiled GEMM: a row's bits then
 do not depend on how a forward is cut into chunks, nor on whether the row is a prompt
 row, a decode step or a verify row, which is what the CPU gives (its batched and
 per-token kernels agree bit for bit), and what makes a reused prefix give the bits of a
@@ -2059,6 +2263,12 @@ every expert on the card:
 The int4-g64 row's teacher-forced loss after a 600-token prompt (125 tokens scored,
 `PPL=1`) is 3.2181 nats a token either way.
 
+Measured again on the same card once the matrix units ran at subgroups of 32 and the
+frame took the experts' grouped GEMMs, two series alternated, the same 467-token prompt and
+every expert on the card: colibri's int4-g64 container 1796-1902 tok/s of prefill and
+83.8-84.6 of decode, the GGUF Q4_K_M 1412-1556 and 73.7-81.9. Our container (22 GB) now leads
+the GGUF (21 GB) in both phases.
+
 The matrix units at subgroups of 32 then took the same prompt further, each step started
 on its own server twice, three runs a start (prefill / decode):
 
@@ -2123,8 +2333,12 @@ computes the ones it holds:
 A round trip of the two timelines measured 7 us on the card. The host pool is cached
 system RAM (it was write-combined, which made the CPU's reads 25 times slower; the
 device reads both at the same speed). A prompt chunk keeps the full table and reads the
-host pool over PCIe. Only a GGUF's block types take it (colibri's formats keep the
-device's reads); `COLI_VK_HYBRID=0` turns it off, `COLI_VK_HYBRID_THREADS` sizes the
+host pool over PCIe. A GGUF's block types take it, and colibri's int8 (a scale per row
+or per group), int4 pairs (per row or per group), int3-g64, MXFP4 and FP8 formats, with
+the CPU's kernels for them in `vk_tier.c` (int8 activations per 32 and integer dots, as
+`ggml_quants.h`'s; FP8, and MXFP4 past 2048 groups a row, against the float row; the
+float reference of every one with `GQ_EXACT=1`). The low-bit formats (fmt 200 to 203)
+keep the device's reads. `COLI_VK_HYBRID=0` turns it off, `COLI_VK_HYBRID_THREADS` sizes the
 worker's team (OpenMP's by default). The chain's line says how many steps and pairs it
 took and the CPU's time. A share of the host pool's experts (`COLI_VK_HYBRID_PCIE`, 0.3,
 by a hash of layer and expert) stays with the device over PCIe, so a step with several
@@ -2137,6 +2351,38 @@ started one after the other): decode 42.2/42.5 against 40.4/41.0 tok/s with the 
 OpenMP's 14 threads, 44 to 45 with the regions' rows in chunks; the same greedy tokens
 (160 of them) on and off. The CPU spends about 155 us a pair (IQ2_S gate and up 86 us,
 Q2_0 down 28 us): the device's own experts take less, so a step waits for the CPU.
+
+**The tier's own steps take the hybrid too.** Where a model does not fit the card whole
+(GLM-5.3, Inkling), a layer's routed experts run in the tier's batch, outside the chain's
+frame, and the device read the host pool's experts of that batch over the bus: 8 GB/s for GLM-5.3's (7.5 ms a layer of 8 against 0.25 ms from
+VRAM, `COLI_VK_CHAIN_BENCH=xb` with `COLI_VK_BENCH_HOST=1`). In a step of up to 8 rows the
+tier now leaves those of a GGUF's block types or of colibri's formats above out of the device's batch and the CPU computes
+them in place at the join (`vkt_host_pairs`, the same code as the chain's worker), while the
+device computes the ones it holds; the join hands their rows back as the device's, so no
+engine changes. The same share stays with the device over PCIe, a prompt step keeps them
+all on the device, and `COLI_VK_HYBRID=0` turns it off. DeepSeek V4's expert takes it with
+the device's roundings (`hy_act_v4`, as `shaders/expert_act_v4.comp`: gate and up to bf16,
+the clamped SwiGLU, times the route weight and to bf16, E4M3 per 128, then down), the weight
+in the row as in the device's; the tier copies a CPU pair's input row at the issue, since
+that engine frees its rounded rows as the issue returns. Kimi K3's SiTU stays on the device.
+The run's line adds `hybrid: N steps,
+P host pool pairs computed by the CPU in place (T ms, U us a pair)`. Measured on the RTX PRO
+4000 with the i5-13500, each server on a copy of one history, 128 tokens, a warm-up and a run:
+
+| model | decode, `COLI_VK_HYBRID=0` | decode, the default | the CPU a pair |
+|---|---|---|---|
+| GLM-5.3 Flash UD-IQ2_XXS (95 GB) | 3.22, 3.31 tok/s | 3.53, 4.97 tok/s | 508 us |
+| the same, 199 tokens after a 59-token prompt, two runs | 3.22, 3.20 tok/s | 5.06, 5.24 tok/s | 494 us |
+| Inkling-Small UD-IQ2_XXS (77 GB) | 11.10, 10.54 tok/s | 15.06, 15.75 tok/s | 862 us |
+| GLM-5.3 int4-g64, colibri's (391 GB), a warm-up and three runs, twice in each order | 0.50 to 0.63 tok/s (0.56 on average) | 0.59 to 0.66 tok/s (0.62) | 852 to 882 us |
+| DeepSeek V4 Flash UD-IQ1_S (82.5 GB), a warm-up and four runs, twice in each order | 6.62 to 6.88 tok/s | 6.62 to 6.94 tok/s | 382 to 385 us |
+
+The prompts are unchanged (GLM-5.3 int4-g64: 1.4 to 1.7 tok/s off, 1.6 to 1.8 on, the model three times the RAM, so the disk decides); GLM-5.3 Flash's warm-up still overlaps the warm start's uploads. With GLM-5.3 int4-g64 the device's time over the runs went from 277 to 108 s. DeepSeek V4 Flash's host pool is 4 GiB of its 76 GB of experts, its pairs one or two a step: the same either way. GLM-5.3
+gave the same greedy text (40 tokens) on and off, in 17.7 s against 26.7 s; with the device's
+share of the pool at 0, 0.3 and 0.5 its 199-token runs decoded at 5.01/4.96, 5.06/5.24 and
+3.92/4.02 tok/s. Alone (the bench
+above), the CPU takes 300 to 340 us a pair of GLM-5.3's at 12 to 20 threads, the device 700
+to 940 over the bus.
 
 **A prompt chunk's host pool experts in VRAM.** A prompt chunk routes nearly every expert
 of a layer, and the grouped GEMMs of a GGUF's block types read the host pool in place at
@@ -2538,6 +2784,55 @@ engine has them. For a step of at least `COLI_VK_TIER_GEMM_ROWS` rows (16),
   tier's own byte work (`convert`). A group the engine loaded together converts in
   parallel, one expert per thread; a lone one converts with its rows split over the
   threads (`COLI_VK_TIER_STREAM_PAR=0` keeps it on the engine thread).
+- **The host pool's experts through the slots too.** A resident of the host pool is not
+  cold, so a big step's GEMMs read it in place over PCIe, a GGUF's block types at about 4
+  GB/s; on GLM-5.3, where a layer's step routes 100 to 140 of them, those reads were most
+  of the device's 115.7 s over three prompts. With the host pool on, a big step's host pool experts of
+  block types now go through the slots like the streamed ones: each is copied from the
+  pool into a slot at the head of the batch that first reads it, a barrier between the
+  copies and its dispatches (`coli_vk_xb_sub_copy`: the slot takes the expert's format
+  first; with mapped memory the CPU copies through the mapping), so the bytes cross the
+  bus once, at its rate, and the engine thread goes on to the step's cold experts. A slot
+  that does not take one leaves it to be read in place, never to the CPU. `COLI_VK_TIER_POOL_COPY=0` reads them in place.
+  Measured on the RTX PRO 4000 (PCIe 4.0 x8), a 700-token prompt, a warm-up and a run,
+  each server on a copy of one history:
+
+  | model | prefill, `COLI_VK_TIER_POOL_COPY=0` | prefill, the default | the copies |
+  |---|---|---|---|
+  | GLM-5.3 Flash UD-IQ2_XXS (95 GB) | 11.9, 12.3 tok/s | 17.9, 18.2 tok/s | 110 GiB a prompt |
+  | Inkling-Small UD-IQ2_XXS (77 GB) | 65.9, 70.2 tok/s | 97.2, 111.1 tok/s | 17 GiB a prompt |
+  | DeepSeek V4 Flash 0731 UD-IQ2_XXS (85 GB) | 19.5, 23.4 tok/s | 22.4, 23.3 tok/s | 4.5 GiB a prompt |
+
+  Copied by the copy engine and waited for, before each batch, the same bytes moved at 12.3
+  to 12.5 GB/s and GLM-5.3's prompt ran at 15.2 and 17.4 tok/s, Inkling's at 94.0 and 107.6:
+  the engine thread then waited for the copies instead of reading the step's cold experts.
+  On GLM-5.3 the bus is now the floor (a layer step copies about 0.94 GB); DeepSeek V4's CPU share
+  of a step (the cold experts its store reads) was the longer side already. GLM-5.3's greedy text after a long prompt is the same with and without (40 tokens in 39.3 s against 46.9);
+  Inkling's forks at a near tie after 36 words ("beautification" against "initiatives"):
+  a pool expert's rows now run in the slots' batches, where the backend may pick another
+  of its GEMM routes for them than in the residents' batch, as for a streamed expert.
+- **A pool expert of a row or two stays on the CPU.** A prompt step's host pool experts of
+  block types with at most `COLI_VK_HYBRID_BIG_ROWS` rows (2) are computed by the CPU in
+  place at the join (`vkt_host_pairs`, as the decode's hybrid steps), while the device
+  computes the step's batches, instead of crossing the bus for a row or two. An expert's
+  pairs go together: its rows are read once for all of them and each pair keeps the bits
+  it has on its own (the kernels of `ggml_quants.h` take each activation row apart). The
+  tier's line adds `, and S prompt steps' P pairs` to its hybrid part. Measured on the RTX
+  PRO 4000, MiMo-V2.6-Flash Q2_K_S (106 GB), a 464-token prompt, three runs each on a copy
+  of one history:
+
+  | `COLI_VK_HYBRID_BIG_ROWS` | prefill | the device's time | the CPU waiting for it | the prompt's pairs on the CPU |
+  |---|---|---|---|---|
+  | 0 | 36.9-37.8 tok/s | 27.9 s | 25.3 s | 0 |
+  | 2 (the default) | 38.5-39.4 tok/s | 23.7 s | 21.2 s | 6756 |
+  | 4 | 38.3-39.1 tok/s | 21.2 s | 18.8 s | 16145 |
+  | 8 | 37.0-37.8 tok/s | 18.2 s | 16.0 s | 37030 |
+  | 16 | 28.3-29.4 tok/s | 13.8 s | 11.6 s | 102413 |
+
+  Past 4 rows the CPU becomes the longer side. Grouped, a pair costs 290-380 us against
+  410 for a decode step's (each pair its own rows). On GLM-5.2 UD-IQ1_S, whose prompt the
+  CPU's cold experts hold (230 s of CPU against 26 s of device time), 0, 1, 2 and 4 rows
+  gave the same 2.9-3.5 tok/s.
 - **Nothing pollutes the resident set.** A streamed expert is not offered for promotion:
   a prompt's whole working set passes through the slots and would otherwise flush the
   residents. Its routings count as heat, as every routing does, and the slots are free
@@ -2578,6 +2873,10 @@ The run's line counts what streamed:
 [VK] tier qwen36 run: ... | stream: 40 steps, 2188 cold experts (3.61 GiB, 10.72 GB/s) and 796154 rows streamed in 742 sub-batches, prefetched 0 (0 used), 929 cold experts (5548 rows) kept on the CPU
 ```
 
+and, with the host pool's experts copied into the slots, `, N host pool experts copied into
+the slots (S, R GB/s)` after it. The forward's stream line says how many of a layer's streamed
+experts came from the host pool (`135 streamed (135 of them copied from the host pool)`).
+
 | Engine | Its loads (`load` / `load_batch`) | The step the tier sees |
 |---|---|---|
 | qwen36 | `expert_hold` (and the int8 copy for the int8-slot kernel), one at a time | `moe_vk_run`'s block becomes the chunk |
@@ -2603,6 +2902,8 @@ The run's line counts what streamed:
 | `COLI_VK_TIER_STREAM_ROWS` | the rule | Fix R, the rows from which a cold expert streams (tests). |
 | `COLI_VK_TIER_STREAM_HALF` | x rows within 32 MiB | Rows of a sub-batch (tests: small ones cut experts into parts). |
 | `COLI_VK_TIER_STREAM_PAR` | on | `0`: a streamed expert's conversion on the engine thread alone. |
+| `COLI_VK_TIER_POOL_COPY` | on with the host pool and streaming | `0`: a big step's host pool experts of block types are read in place over PCIe again, not copied into the slots. |
+| `COLI_VK_HYBRID_BIG_ROWS` | `2` | A big step's host pool experts of block types with at most this many rows are computed by the CPU in place; `0` none. |
 
 ### Validation and timing
 
@@ -2867,8 +3168,10 @@ in short:
    pairs signed or `v+8`, `expert_ffn.h`'s planar int4-g64, int3-g64, MXFP4 with f32
    or ue8m0 scales, fp8 per group or in square blocks, bf16, f32), the activation
    (`VKT_ACT_SWIGLU` with an optional clamp, `VKT_ACT_SITU`, `VKT_ACT_SWIGLU_V4`), the most assignments a
-   step carries, the RAM the expert cache may still take and the dense bytes still to
-   come to the device; optionally `.max_experts`, a count the engine's users already
+   step carries, the RAM the expert cache may still take (and, so the host pool can
+   share that RAM, the least the cache needs and a callback that lowers it:
+   `.ram_floor`, `.ram_given`) and the dense bytes still to come to the device;
+   optionally `.max_experts`, a count the engine's users already
    size its device tier in (GLM-5.2's `COLI_VK_EXPERTS`), and `.extra_layers` with
    their own `VktFmt` for layers past the model's whose experts RAM holds in another
    form (an MTP head's: [above](#the-mtp-heads-layer-on-the-tier-coli_vk_tier_mtp)). `atexit(coli_vk_shutdown)`,
@@ -2894,14 +3197,24 @@ in short:
 
 Resident data (the dense weights, the routed-expert tier, the MLA KV mirror) is written
 by the host once and read by the device for the rest of the run. The mapped path puts it
-in the HOST_VISIBLE|DEVICE_LOCAL memory type and writes it through a mapping. On an
-integrated GPU, a CPU device (Lavapipe) or a discrete card with Resizable BAR, that type
-covers the device's memory. A discrete card without Resizable BAR (every Turing card,
-every Ampere card on its launch VBIOS, older AMD cards with the option off) exposes it
-as a window of about 256 MB of 8 GB or more. NVIDIA's driver refuses allocations past the
-window: on an RTX 3070 with its launch VBIOS the backend warned "only 246 of 8192 MB VRAM
-is host-visible", placed no matrix, every tier upload failed and the chain stopped at its
-first matrix. RADV places them in system RAM instead, where every access crosses PCIe.
+in the memory type for what the CPU writes (HOST_VISIBLE|DEVICE_LOCAL, or system memory
+on an integrated GPU) and writes it through a mapping. On an integrated GPU, a CPU device
+(Lavapipe) or a discrete card with Resizable BAR, that type covers the device's memory. A
+discrete card without Resizable BAR (every Turing card, every Ampere card on its launch
+VBIOS, older AMD cards with the option off) exposes it as a window of about 256 MB of 8 GB
+or more. NVIDIA's driver refuses allocations past the window: on an RTX 3070 with its
+launch VBIOS the backend warned "only 246 of 8192 MB VRAM is host-visible", placed no
+matrix, every tier upload failed and the chain stopped at its first matrix. RADV places
+them in system RAM instead, where every access crosses PCIe.
+
+**Memory types by use.** The backend chooses the memory type of a buffer by what the buffer
+is used for: only the GPU uses it, the CPU writes it, or the CPU reads it back. A discrete
+GPU and Lavapipe get device-local memory where the use allows it, and a host-cached type
+for what the CPU reads back. An integrated GPU with a heap of system memory gets
+host-visible system memory for all three uses, so no buffer is placed in the VRAM
+carve-out reserved by the BIOS. An allocation that runs out of memory there is retried in a
+device-local type. `COLI_VK_DEVICE_CAP_MB`, the budget and the expert batch count the
+device memory: the device-local heaps, and every heap of an integrated GPU.
 
 **Staged uploads** put resident data in a DEVICE_LOCAL memory type the host does not map
 and copy it there from a host staging buffer with `vkCmdCopyBuffer`.
@@ -3244,7 +3557,7 @@ predict a layer more than the engine places.
 | deepseek_v41 | the hc_mult streams and the last site's mix; the candidate mask and the published index list a chain layer made for the CPU's layers; DSpark's target means from whichever side ran them | yes |
 | kimi_k3 | the AttnRes prefix, the block snapshots and their count; with every layer but not the head, the final rows for the CPU's head | yes |
 
-**`COLI_VK_DEVICE_CAP_MB=n`** (tests) makes the device hold at most n MiB of device-local
+**`COLI_VK_DEVICE_CAP_MB=n`** (tests) limits the device to n MiB of device
 memory (a fraction is taken): every allocation of the backend and the chain (tensors, the
 tier's pool, the chain's buffers, staging, the second device's) is counted, one past the
 cap fails as out of device memory would, and every budget the engines read reports the cap.

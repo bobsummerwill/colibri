@@ -777,8 +777,8 @@ void coli_v4_expert_store_note_vram(ColiExpertStore *store, int layer,
 extern void (*coli_v4_expert_store_vram_held)(ColiExpertStore *store, int layer,
                                               unsigned char *held, int experts);
 
-#ifdef COLI_VULKAN
-/* The Vulkan routed-expert tier (vk_tier.c, Makefile.deepseek-v4 VK=1). The MoE
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+/* The routed-expert tier (vk_tier.c, Makefile.deepseek-v4 VK=1; cu_tier.c on a CUDA device). The MoE
  * units reach it through this table, which the engine's own unit fills when
  * COLI_VULKAN=1 started the tier (GENERATE_STATS, the one unit that links the
  * backend); it stays NULL in every other link of the units, the parent's tests
@@ -818,6 +818,8 @@ int coli_v4_expert_store_read_private(ColiExpertStore *store, ColiExpertKey key,
                                       unsigned char *buffer, ColiExpertView *view);
 extern int (*coli_v4_expert_store_device_tier)(int layer, int expert);
 
+#endif /* COLI_VULKAN || COLI_CUDA */
+#ifdef COLI_VULKAN
 /* The dense chain (deepseek_v4_chain.h, COLI_VK_CHAIN): a layer's attention state as its
  * units keep it, so the chain can mirror it on the device and write back what a forward
  * changed, as the CPU would have left it. The views point into the live state.
@@ -1074,6 +1076,7 @@ int coli_v4_gpu_matvec_grouped(const ColiTensorView *w, float *output,
  * Every entry returns non-zero on any refusal so the caller can fall back to
  * the CPU reference for the whole chunk. */
 int coli_v4_gpu_attn_batch_wanted(void);
+extern int coli_v4_gpu_attn_default;   /* COLI_CUDA_ATTN_BATCH unset: on for a GGUF on the CUDA tier */
 /* Runs both bf16 projection matrices (wkv_key/wgate_key mirrors) over the
  * whole chunk: kv_proj/gate_proj receive [batch][rows-of-mirror]. */
 int coli_v4_gpu_compressor_project_batch(

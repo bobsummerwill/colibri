@@ -84,6 +84,9 @@ void qt_trunk_withdraw(const char *why);
 /* The experts back to the CPU as well (the same probe; #2211), when the allowance is
  * automatic (CUDA_EXPERT_GB unset or auto). Before the warm start: nothing resident yet. */
 void qt_experts_withdraw(const char *why);
+/* Bytes the engine will put on the device after the tier sizes itself (the CUDA chain's own
+ * router, b|a and gate rows), kept out of the automatic allowance. Call before qt_init. */
+void qt_reserve(size_t bytes);
 
 /* DeltaNet input projections, qkv ++ z fused into one resident tensor per
  * layer: one GEMV instead of two, and the engine's qkv/z buffers are laid out
@@ -181,10 +184,15 @@ uint32_t qt_issue(int layer, const int *eids, int K, const float *x);
  * Returns 0 on collection failure, leaving out unchanged. The caller must
  * stop inference: experts selected by qt_issue were not computed on CPU. */
 int qt_take(uint32_t mask, const float *val, int K, float *out);
+/* qt_take with Muse Spark's norm on every expert's row first: out += w * row*s / rms(row*s),
+ * eps inside the root (the CPU path's products, in its order) */
+int qt_take_scaled(uint32_t mask, const float *val, int K, float *out, const float *s, float eps);
 
 /* Warmstart: plan the full fill set (heat order, budget reserved), then any
  * number of loader threads may call qt_note_planned per planned expert. */
 int  qt_plan_fill(int *layers, int *eids, int max);
+/* A layer that routes nothing (Flint's dense layers): qt_plan_fill skips it. */
+void qt_layer_off(int layer);
 void qt_note_planned(int layer, int eid,
              const uint8_t *g4, const uint8_t *u4, const uint8_t *d4,
              const float *gs, const float *us, const float *ds);
@@ -237,6 +245,10 @@ void qt_chain_hold(int on);
 void qt_chain_count(int layer, const int *eids, int K);
 int  qt_chain_format(int *fmt, int *gs);
 int  qt_chain_layer_format(int layer, int *fmt, int *fmt_d);
+/* a GGUF's arena for a chain that moves the experts itself (qwen36_tier.c's comment) */
+int  qt_chain_arena(void **base, size_t *slot, size_t *off_u, size_t *off_d, int *nslots);
+int  qt_chain_slot(int layer, int eid);
+void qt_chain_own(void);
 /* copy mode: 1 when a qt_note of the expert now would copy it (convert the bytes only then);
  * qt_note_heat counts a pass of one the engine does not hand over */
 /* the warm start's order from an engine's expert history (counts[l][e], nl x ne) */
@@ -266,6 +278,7 @@ static inline void qt_trunk_offer(const char*a,int b,size_t c){(void)a;(void)b;(
 static inline int  qt_place_is_auto(void){return 0;}
 static inline void qt_trunk_withdraw(const char*a){(void)a;}
 static inline void qt_experts_withdraw(const char*a){(void)a;}
+static inline void qt_reserve(size_t b){(void)b;}
 static inline int  qt_dnproj_init(int a,const int8_t*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dnproj_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_dnproj_ready(int a){(void)a;return 0;}
@@ -294,6 +307,9 @@ static inline void qt_chain_hold(int a){(void)a;}
 static inline void qt_chain_count(int a,const int*b,int c){(void)a;(void)b;(void)c;}
 static inline int  qt_chain_format(int*a,int*b){(void)a;(void)b;return 0;}
 static inline int  qt_chain_layer_format(int a,int*b,int*c){(void)a;(void)b;(void)c;return 0;}
+static inline int  qt_chain_arena(void**a,size_t*b,size_t*c,size_t*d,int*e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
+static inline int  qt_chain_slot(int a,int b){(void)a;(void)b;return -1;}
+static inline void qt_chain_own(void){}
 static inline void qt_heat_order(uint32_t*const*a,int b,int c){(void)a;(void)b;(void)c;}
 static inline int  qt_note_wanted(int a,int b){(void)a;(void)b;return 0;}
 static inline void qt_note_heat(int a,int b){(void)a;(void)b;}
@@ -309,7 +325,9 @@ static inline void qt_shutdown(void){}
 static inline void qt_note(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
 static inline uint32_t qt_issue(int a,const int*b,int c,const float*d){(void)a;(void)b;(void)c;(void)d;return 0;}
 static inline int qt_take(uint32_t a,const float*b,int c,float*d){(void)b;(void)c;(void)d;return a==0;}
+static inline int qt_take_scaled(uint32_t a,const float*b,int c,float*d,const float*s,float e){(void)b;(void)c;(void)d;(void)s;(void)e;return a==0;}
 static inline int  qt_plan_fill(int*a,int*b,int c){(void)a;(void)b;(void)c;return 0;}
+static inline void qt_layer_off(int a){(void)a;}
 static inline void qt_note_planned(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
 static inline int  qt_fill_next(int*a,int*b){(void)a;(void)b;return 0;}
 static inline void qt_note_block(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}

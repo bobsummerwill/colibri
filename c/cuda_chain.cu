@@ -38,6 +38,7 @@ extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float 
 struct CcBuf { int kind, dev; size_t bytes; float *d; void *h; };
 
 namespace {
+#define CC_UP_MARKS 1024   /* host_up's marks in flight (three a promoted expert) */
 struct CcCtx {
     int device, up, lost, in_frame;
     int major;   /* the device's compute capability: cc_attn_fk's tensor cores from 7 */
@@ -45,6 +46,8 @@ struct CcCtx {
     cudaEvent_t ev; int ev_ok, ev_pending;
     /* staging (cc_fetch): the copy stream, its copies' event and the buffer's last reader's */
     cudaStream_t cs; cudaEvent_t ev_fetched, ev_free; int cs_ok;
+    /* host_up: the copies' marks, a ring of CC_UP_MARKS events on the copy stream */
+    cudaEvent_t up_ev[CC_UP_MARKS]; unsigned up_seq, up_made; cudaEvent_t up_after;
     float *adec; size_t adec_bytes;   /* cc_attn_dec_k's blocks */
 };
 CcCtx g_cc[COLI_CUDA_MAX_DEVICES];
@@ -88,7 +91,8 @@ __global__ static void cc_norm_k(const float *__restrict__ x, const float *__res
     int wb = p.w_off + (p.w_mod > 0 ? (j % p.w_mod) * p.D : 0);
     int tid = threadIdx.x;
     float acc = 0.f;
-    for (int i = tid; i < p.D; i += 256) { float v = x[xb + i]; acc += v * v; }
+    const bool pre = (p.flags & 8) != 0;
+    for (int i = tid; i < p.D; i += 256) { float v = pre ? x[xb + i] * w[wb + i] : x[xb + i]; acc += v * v; }
     red[tid] = acc;
     __syncthreads();
     for (int off = 128; off > 0; off >>= 1) {
@@ -98,7 +102,7 @@ __global__ static void cc_norm_k(const float *__restrict__ x, const float *__res
     float r = (p.flags & 4) ? 1.f / sqrtf(red[0] + p.eps) : 1.f / sqrtf(red[0] / (float)p.D + p.eps);
     for (int i = tid; i < p.D; i += 256) {
         float wv = (p.flags & 2) ? 1.f : ((p.flags & 1) ? 1.f + w[wb + i] : w[wb + i]);
-        y[yb + i] = x[xb + i] * r * wv * p.post;
+        y[yb + i] = x[xb + i] * (pre ? w[wb + i] : wv) * r * p.post;
     }
 }
 __global__ static void cc_rope_k(float *__restrict__ x, const float *__restrict__ cs, CcRope p) {
@@ -115,8 +119,11 @@ __global__ static void cc_rope_k(float *__restrict__ x, const float *__restrict_
 }
 /* one block of 128 per (head, row); K and V rows read once per tile of 128 positions;
  * hd <= 256: two dims per thread */
+/* win > 0: a sliding window, the row's last win positions; snk: a sink logit per head at
+ * snk[sink_off + h], in the denominator only (CcAttnW) */
 __global__ static void __launch_bounds__(128) cc_attn_k(const float *__restrict__ q, const float *__restrict__ kc,
-        const float *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, const int *__restrict__ sel, CcAttn p) {
+        const float *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, const int *__restrict__ sel, CcAttn p,
+        int win = 0, const float *__restrict__ snk = nullptr, int sink_off = 0) {
     __shared__ float qs[256];
     __shared__ float pe[128];
     __shared__ int   pt[128];
@@ -136,7 +143,8 @@ __global__ static void __launch_bounds__(128) cc_attn_k(const float *__restrict_
     __syncthreads();
     float m = -3.0e38f, l = 0.f, acc0 = 0.f, acc1 = 0.f;
     int kbase = kvh * p.cap;
-    for (int t0 = 0; t0 < n; t0 += 128) {
+    int first = win > 0 && !list && n > win ? n - win : 0;
+    for (int t0 = first; t0 < n; t0 += 128) {
         int i = t0 + tid;
         float sv = -3.0e38f;
         if (i < n) {
@@ -177,6 +185,11 @@ __global__ static void __launch_bounds__(128) cc_attn_k(const float *__restrict_
         m = mn;
         __syncthreads();
     }
+    if (snk) {   /* the sink: one more term of the denominator, with no value */
+        float sv = snk[sink_off + h], mn = fmaxf(m, sv), corr = expf(m - mn);
+        l = l * corr + expf(sv - mn);
+        acc0 *= corr; acc1 *= corr;
+    }
     float inv = l > 0.f ? 1.f / l : 0.f;
     int ob = p.o_off + s * p.o_row + h * p.hd;
     int gb = p.g_off + s * p.g_row + h * p.g_seg;
@@ -206,7 +219,8 @@ __global__ static void __launch_bounds__(128) cc_attn_k(const float *__restrict_
 #endif
 template<int HD>
 __global__ static void __launch_bounds__(128) cc_attn_fk(const float *__restrict__ q, const float *__restrict__ kc,
-        const float *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, CcAttn p, int GQ) {
+        const float *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, CcAttn p, int GQ,
+        int win = 0, const float *__restrict__ snk = nullptr, int sink_off = 0) {   /* CcAttnW's window and sinks */
 #if CC_FA_BODY
     using namespace nvcuda;
     constexpr int LD = HD + 8, NDT = HD / 16, NDS = NDT / 4, LS = CC_FA_BC + 4, LP = CC_FA_BC + 8;
@@ -218,6 +232,8 @@ __global__ static void __launch_bounds__(128) cc_attn_fk(const float *__restrict
     int TPW = 16 / GQ, g = blockIdx.y, t0 = blockIdx.x * TPW, S = p.S;
     int tlast = min(t0 + TPW, S) - 1, nt = p.pos_base + S;
     int nkb = (p.pos_base + tlast) / CC_FA_BC + 1;
+    /* a window: the blocks before the first row's first position hold no key of any row here */
+    int kb_lo = win > 0 && p.pos_base + t0 - win + 1 > 0 ? (p.pos_base + t0 - win + 1) / CC_FA_BC : 0;
     /* Q, scaled, into the fragments (staged through skv) */
     for (int e = tid; e < 16 * HD; e += 128) {
         int r = e / HD, d = e - r * HD, tk = t0 + r / GQ, h = g * GQ + r % GQ;
@@ -240,11 +256,16 @@ __global__ static void __launch_bounds__(128) cc_attn_fk(const float *__restrict
         #pragma unroll
         for (int u = 0; u < NDS; u++) wmma::fill_fragment(Oa[u], 0.f);
         if (pass == 1) {
+            if (snk) {   /* the head's sink: one more term of the denominator, with no value */
+                float sv = snk[sink_off + g * GQ + row % GQ], mn = fmaxf(m, sv);
+                l = l * __expf(m - mn) + __expf(sv - mn);
+                m = mn;
+            }
             if ((tid & 7) == 0) { sm[row] = m; sl[row] = l; }
             __syncthreads();
             m = sm[row];
         }
-        for (int kb = 0; kb < nkb; kb++) {
+        for (int kb = kb_lo; kb < nkb; kb++) {
             int k0 = kb * CC_FA_BC;
             for (int e = tid; e < CC_FA_BC * HD; e += 128) {   /* K of keys k0 .. k0 + 63, zero past nt */
                 int kl = e / HD, d = e - kl * HD, key = k0 + kl;
@@ -265,7 +286,7 @@ __global__ static void __launch_bounds__(128) cc_attn_fk(const float *__restrict
                 #pragma unroll
                 for (int i = 0; i < 8; i++) {
                     int key = k0 + cl + i;
-                    sv[i] = key <= qpos ? ss[row * LS + cl + i] : -3.0e38f;
+                    sv[i] = key <= qpos && (win <= 0 || key > qpos - win) ? ss[row * LS + cl + i] : -3.0e38f;
                     bm = fmaxf(bm, sv[i]);
                 }
                 for (int off = 4; off > 0; off >>= 1) bm = fmaxf(bm, __shfl_xor_sync(0xffffffffu, bm, off, 8));
@@ -282,7 +303,7 @@ __global__ static void __launch_bounds__(128) cc_attn_fk(const float *__restrict
             for (int i = 0; i < 8; i++) {
                 int key = k0 + cl + i;
                 float sv = ss[row * LS + cl + i];
-                sp[row * LP + cl + i] = __float2half(key <= qpos ? __expf(sv - m) : 0.f);
+                sp[row * LP + cl + i] = __float2half(key <= qpos && (win <= 0 || key > qpos - win) ? __expf(sv - m) : 0.f);
             }
             __syncthreads();   /* P complete, K consumed */
             for (int e = tid; e < CC_FA_BC * HD; e += 128) {   /* V of the same keys */
@@ -704,6 +725,11 @@ __global__ static void cc_ew_k(float *__restrict__ y, const float *__restrict__ 
         y[p.y_off + i] = a[p.a_off + i] * p.fc;
     } else if (p.op == 8) {
         y[p.y_off + i] = a[p.a_off + i] + e[p.e_off + (int)(i % p.D)] * b[p.b_off + i];
+    } else if (p.op == 9) {
+        y[p.y_off + i] = a[p.a_off + i] * cc_sig(b[p.b_off + i]);
+    } else if (p.op == 10) {
+        int d = (int)(i % p.D);
+        y[p.y_off + i] = e[p.e_off + d] * a[p.a_off + i] + c[p.c_off + d] * b[p.b_off + i];
     }
 }
 
@@ -854,6 +880,8 @@ static void cc_shutdown(void) {
                 if (!c->lost) cudaStreamSynchronize(c->cs);
                 cudaEventDestroy(c->ev_fetched); cudaEventDestroy(c->ev_free); cudaStreamDestroy(c->cs);
             }
+            if (c->up_made) { for (int i = 0; i < CC_UP_MARKS; i++) cudaEventDestroy(c->up_ev[i]); cudaEventDestroy(c->up_after); }
+            c->up_made = 0; c->up_seq = 0;
             if (c->adec) cudaFree(c->adec);
         }
         c->adec = nullptr; c->adec_bytes = 0;
@@ -1077,16 +1105,26 @@ static int cc_rope(CcBuf *x, CcBuf *cs, const CcRope *p) {
  * of exp(score - m) and acc[d] = sum exp(score - m) V[t][d] into the scratch; mode 1: a
  * block a (head, row): the blocks joined, acc / l, the gate. COLI_CUDA_ATTN_DEC=0 never. */
 #define CC_ATTN_DEC_MIN 128
+/* the positions a block of cc_attn_dec_k takes for a row of n positions over H heads, as a
+ * decode step of that row alone chooses it: 64, doubled to 256 at most while there would be
+ * more than 1024 blocks */
+__host__ __device__ static inline int cc_attn_dec_len(int n, int H) {
+    int L = 64, nb = (n + L - 1) / L;
+    while (L < 256 && H * nb > 1024) { L *= 2; nb = (n + L - 1) / L; }
+    return L;
+}
+#define CC_ATTN_DEC_ROWS 8   /* a decode step's or a verify's rows (every engine's verify) */
 __global__ static void __launch_bounds__(256) cc_attn_dec_k(const float *__restrict__ q, const float *__restrict__ kc,
         const float *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, float *__restrict__ xs,
-        CcAttn p, int mode, int L, int nb) {
+        CcAttn p, int mode, int nb, int win = 0, const float *__restrict__ snk = nullptr, int sink_off = 0) {
     __shared__ float qs[256];
     __shared__ float sc[256];
     __shared__ float red[8];
     int tid = threadIdx.x, wp = tid >> 5, lane = tid & 31, h = blockIdx.x, hd = p.hd, stride = hd + 2;
     if (mode == 0) {
         int b = blockIdx.y, s = blockIdx.z, kvh = h / (p.H / p.KVH);
-        int n = p.pos_base + s + 1, t0 = b * L, cnt = min(L, n - t0);
+        int n = p.pos_base + s + 1, first = win > 0 && n > win ? n - win : 0;   /* a window: its last win positions */
+        int L = cc_attn_dec_len(n - first, p.H), t0 = first + b * L, cnt = min(L, n - t0);
         size_t xo = ((size_t)(s * p.H + h) * nb + b) * stride;
         if (cnt <= 0) {   /* past the row's positions: an empty block */
             if (tid == 0) { xs[xo] = -3.0e38f; xs[xo + 1] = 0.f; }
@@ -1128,11 +1166,12 @@ __global__ static void __launch_bounds__(256) cc_attn_dec_k(const float *__restr
         if (tid == 0) { xs[xo] = M; xs[xo + 1] = l; }
         return;
     }
-    int s = blockIdx.y, n = p.pos_base + s + 1, nbr = (n + L - 1) / L;
+    int s = blockIdx.y, n = p.pos_base + s + 1, first = win > 0 && n > win ? n - win : 0;
+    int L = cc_attn_dec_len(n - first, p.H), nbr = (n - first + L - 1) / L;
     size_t xo = (size_t)(s * p.H + h) * nb * stride;
-    float M = -3.0e38f;
+    float M = snk ? snk[sink_off + h] : -3.0e38f;   /* the sink joins the max and the sum, with no value */
     for (int b = 0; b < nbr; b++) M = fmaxf(M, xs[xo + (size_t)b * stride]);
-    float Lt = 0.f;
+    float Lt = snk ? expf(snk[sink_off + h] - M) : 0.f;
     for (int b = 0; b < nbr; b++) Lt += xs[xo + (size_t)b * stride + 1] * expf(xs[xo + (size_t)b * stride] - M);
     float inv = Lt > 0.f ? 1.f / Lt : 0.f;
     int ob = p.o_off + s * p.o_row + h * hd, gb = p.g_off + s * p.g_row + h * p.g_seg;
@@ -1176,9 +1215,22 @@ static int cc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf 
 #if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
     fk = fl > 0 && c->major >= 7 && 16 % G == 0 && (p->hd == 64 || p->hd == 128 || p->hd == 256);
 #endif
-    if (dec && fk && p->S <= 4 && p->sel_row <= 0 && last >= CC_ATTN_DEC_MIN) {
-        int L = 64, nb = (last + L - 1) / L;
-        while (L < 256 && p->H * nb > 1024) { L *= 2; nb = (last + L - 1) / L; }
+    if (dec && fk && p->S <= CC_ATTN_DEC_ROWS && p->sel_row <= 0 && last >= CC_ATTN_DEC_MIN) {
+        /* each row as a decode step of it alone: its own blocks of positions (cc_attn_dec_len),
+         * and the rows whose positions are fewer than CC_ATTN_DEC_MIN through cc_attn_k */
+        int k = CC_ATTN_DEC_MIN - (p->pos_base + 1);
+        if (k > 0) {
+            CcAttn a = *p; a.S = k;
+            cc_attn_k<<<dim3((unsigned)p->H, (unsigned)k), 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), nullptr, a);
+            if (!launched(c, "attn")) return 0;
+            CcAttn b = *p; b.S -= k; b.pos_base += k; b.q_off += k * p->q_row; b.o_off += k * p->o_row; b.g_off += k * p->g_row;
+            return cc_attn(q, kc, vc, o, gate, sel, &b);
+        }
+        int nb = 1;
+        for (int r = 0; r < p->S; r++) {
+            int n = p->pos_base + r + 1, L = cc_attn_dec_len(n, p->H), m = (n + L - 1) / L;
+            if (m > nb) nb = m;
+        }
         size_t need = (size_t)p->S * p->H * nb * (p->hd + 2) * sizeof(float);
         if (need > c->adec_bytes) {   /* rare: the context past what it was; the frames before done first */
             if (c->adec) { if (!cc_ok(c, cudaStreamSynchronize(c->stream), "attn scratch")) return 0; cudaFree(c->adec); }
@@ -1189,9 +1241,9 @@ static int cc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf 
         }
         if (c->adec) {
             cc_attn_dec_k<<<dim3((unsigned)p->H, (unsigned)nb, (unsigned)p->S), 256, 0, c->stream>>>(
-                fp(q), fp(kc), fp(vc), fpw(o), fp(gate), c->adec, *p, 0, L, nb);
+                fp(q), fp(kc), fp(vc), fpw(o), fp(gate), c->adec, *p, 0, nb);
             cc_attn_dec_k<<<dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream>>>(
-                fp(q), fp(kc), fp(vc), fpw(o), fp(gate), c->adec, *p, 1, L, nb);
+                fp(q), fp(kc), fp(vc), fpw(o), fp(gate), c->adec, *p, 1, nb);
             return launched(c, "attn (positions in blocks)");
         }
     }
@@ -1357,8 +1409,108 @@ static int cc_fetch_done(void) {
     if (!c || !c->cs_ok) return 0;
     return cc_ok(c, cudaEventRecord(c->ev_free, c->stream), "fetch done");
 }
+static int cc_host_up(void *dst, const void *src, size_t bytes, unsigned *ticket) {
+    CcCtx *c = live();
+    if (!c || !dst || !src || !ticket) return 0;
+    if (!cc_copy_stream(c)) return 0;
+    if (!c->up_made) {
+        if (cudaEventCreateWithFlags(&c->up_after, cudaEventDisableTiming) != cudaSuccess) return cc_ok(c, cudaErrorMemoryAllocation, "host up event");
+        for (int i = 0; i < CC_UP_MARKS; i++)
+            if (cudaEventCreateWithFlags(&c->up_ev[i], cudaEventDisableTiming) != cudaSuccess) {
+                for (int j = 0; j < i; j++) (void)cudaEventDestroy(c->up_ev[j]);
+                (void)cudaEventDestroy(c->up_after);
+                return cc_ok(c, cudaErrorMemoryAllocation, "host up event");
+            }
+        c->up_made = 1;
+    }
+    unsigned t = ++c->up_seq;
+    cudaEvent_t ev = c->up_ev[t % CC_UP_MARKS];
+    if (t > CC_UP_MARKS && !cc_ok(c, cudaEventSynchronize(ev), "host up ring")) return 0;   /* the mark it reuses landed */
+    if (!cc_ok(c, cudaEventRecord(c->up_after, c->stream), "host up after") ||
+        !cc_ok(c, cudaStreamWaitEvent(c->cs, c->up_after, 0), "host up wait") ||
+        !cc_ok(c, cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, c->cs), "host up") ||
+        !cc_ok(c, cudaEventRecord(ev, c->cs), "host up mark")) return 0;
+    g_st.bytes_up += bytes;
+    *ticket = t;
+    return 1;
+}
+static int cc_host_up_done(unsigned ticket) {
+    CcCtx *c = live();
+    if (!c || !c->up_made || !ticket || ticket > c->up_seq) return 0;
+    if (c->up_seq - ticket >= CC_UP_MARKS) return 1;   /* its mark reused: waited for then */
+    cudaError_t e = cudaEventQuery(c->up_ev[ticket % CC_UP_MARKS]);
+    if (e == cudaErrorNotReady) { (void)cudaGetLastError(); return 0; }
+    return cc_ok(c, e, "host up done");
+}
 static const void *cc_dev_addr(const CcBuf *b) { return b ? (const void *)b->d : nullptr; }   /* a mapped UP/DOWN buffer's: where the device reads it */
+/* cc_attn with a window and sinks (Flint), the same three forms cc_attn picks: a prompt chunk
+ * on the tensor cores (cc_attn_fk), a decode's or a verify's rows split over their positions
+ * (cc_attn_dec_k, only where a prompt takes cc_attn_fk, as in cc_attn), else cc_attn_k; each
+ * row's positions the window's, the sink in each softmax's denominator. */
+static int cc_attn_w(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *w) {
+    CcCtx *c = live();
+    if (!w) return 0;
+    const CcAttn *p = &w->a;
+    if (!c || !q || !kc || !vc || !o || p->S < 1 || p->H < 1 || p->KVH < 1 || p->H % p->KVH || p->hd < 1 || p->hd > 256 ||
+        p->sel_row > 0 || w->win < 0 || (w->sink && !snk) || (p->has_gate && !gate)) return 0;
+    if (!w->win && !w->sink) return cc_attn(q, kc, vc, o, gate, nullptr, p);
+    const float *sk = w->sink ? fp(snk) : nullptr;
+    const int win = w->win, so = w->sink_off;
+    static int fl = -1, dec = -1;
+    if (fl < 0) { const char *e = getenv("COLI_CUDA_CHAIN_FLASH"); fl = e && *e ? atoi(e) : 16; if (fl < 0) fl = 0; }
+    if (dec < 0) { const char *e = getenv("COLI_CUDA_ATTN_DEC"); dec = !(e && *e == '0'); }
+    int G = p->H / p->KVH, fk = 0;
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+    fk = fl > 0 && c->major >= 7 && 16 % G == 0 && (p->hd == 64 || p->hd == 128 || p->hd == 256);
+    if (fk && p->S >= fl) {
+        dim3 fg((unsigned)((p->S + 16 / G - 1) / (16 / G)), (unsigned)p->KVH);
+        if (p->hd == 64) cc_attn_fk<64><<<fg, 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), *p, G, win, sk, so);
+        else if (p->hd == 128) cc_attn_fk<128><<<fg, 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), *p, G, win, sk, so);
+        else cc_attn_fk<256><<<fg, 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), *p, G, win, sk, so);
+        return launched(c, "attn (tensor cores, window, sinks)");
+    }
+#endif
+    /* a row's positions: the window's at most */
+    #define CC_WPOS(r) (win > 0 && p->pos_base + (r) + 1 > win ? win : p->pos_base + (r) + 1)
+    if (dec && fk && p->S <= CC_ATTN_DEC_ROWS && CC_WPOS(p->S - 1) >= CC_ATTN_DEC_MIN) {
+        int k = 0;   /* the rows with fewer than CC_ATTN_DEC_MIN positions: cc_attn_k, as in cc_attn */
+        while (k < p->S && CC_WPOS(k) < CC_ATTN_DEC_MIN) k++;
+        if (k > 0) {
+            CcAttn a = *p; a.S = k;
+            cc_attn_k<<<dim3((unsigned)p->H, (unsigned)k), 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), nullptr, a,
+                                                                                win, sk, so);
+            if (!launched(c, "attn (window, sinks)")) return 0;
+            CcAttnW b = *w; b.a.S -= k; b.a.pos_base += k; b.a.q_off += k * p->q_row; b.a.o_off += k * p->o_row; b.a.g_off += k * p->g_row;
+            return cc_attn_w(q, kc, vc, o, gate, snk, &b);
+        }
+        int nb = 1;
+        for (int r = 0; r < p->S; r++) {
+            int n = CC_WPOS(r), L = cc_attn_dec_len(n, p->H), m = (n + L - 1) / L;
+            if (m > nb) nb = m;
+        }
+        size_t need = (size_t)p->S * p->H * nb * (p->hd + 2) * sizeof(float);
+        if (need > c->adec_bytes) {   /* the frames before done first, as in cc_attn */
+            if (c->adec) { if (!cc_ok(c, cudaStreamSynchronize(c->stream), "attn scratch")) return 0; cudaFree(c->adec); }
+            c->adec = nullptr; c->adec_bytes = 0;
+            size_t want = need + need / 2;
+            if (cudaMalloc((void **)&c->adec, want) == cudaSuccess) c->adec_bytes = want;
+            else { c->adec = nullptr; (void)cudaGetLastError(); }
+        }
+        if (c->adec) {
+            cc_attn_dec_k<<<dim3((unsigned)p->H, (unsigned)nb, (unsigned)p->S), 256, 0, c->stream>>>(
+                fp(q), fp(kc), fp(vc), fpw(o), fp(gate), c->adec, *p, 0, nb, win, sk, so);
+            cc_attn_dec_k<<<dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream>>>(
+                fp(q), fp(kc), fp(vc), fpw(o), fp(gate), c->adec, *p, 1, nb, win, sk, so);
+            return launched(c, "attn (positions in blocks, window, sinks)");
+        }
+    }
+    #undef CC_WPOS
+    cc_attn_k<<<dim3((unsigned)p->H, (unsigned)p->S), 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), nullptr, *p,
+                                                                         win, sk, so);
+    return launched(c, "attn (window, sinks)");
+}
 
+static int cc_muse(void) { return 1; }   /* the norm's PRESCALE, ew's SIGMUL and RESGATE */
 static const ColiCudaChainOps g_cc_ops = {
     sizeof(ColiCudaChainOps),
     cc_init, cc_ready, cc_lost_, cc_shutdown, cc_device, cc_device_now,
@@ -1370,6 +1522,8 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_qsa, cc_ple,
     cc_route, cc_moe, cc_signal, cc_wait_host, coli_cuda_tensor_dev,
     cc_fetch, cc_fetch_wait, cc_fetch_done, cc_dev_addr,
-    cc_moe_stage_op,
+    cc_moe_stage_op, cc_host_up, cc_host_up_done,
+    cc_attn_w,
+    cc_muse,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

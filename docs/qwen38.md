@@ -251,7 +251,17 @@ representation, the bytes of one expert, what the cache costs full at the
 given cap, and how many experts per layer the RAM available at that moment
 would hold. `coli plan` and `--auto-tier` size the cache cap with the
 sidecar's records and plan no VRAM for them: the CUDA expert tier streams FP8
-experts only, and with int4 experts it stays off, trunk included. The Segment and Edge adapters keep the snapshot's
+experts only, and with int4 experts it stays off, trunk included. A build with
+Vulkan too (`VK=1 CUDA=1`, what `coli setup` builds on an NVIDIA card) hands the
+sidecar's experts (int4-g64 and the low-bit ones) to the Vulkan tier and its dense
+chain, on the same card, when `COLI_CUDA=1` and `COLI_VULKAN` is unset;
+`COLI_VULKAN=0` keeps them on the CPU. On an RTX PRO 4000 (24 GB) with 62 GB of
+RAM, the release with the int4-g64 sidecar (64 GiB of experts), a 215-token prompt
+and 128 tokens, runs 2 to 4: 100-102 / 23.7-24.9 tok/s (prefill / decode) with the
+handoff, as with `COLI_VULKAN=1`; 9-18 / 6.3-6.8 with the experts on the CPU; and
+7.2-7.4 / 3.1-3.2 with the snapshot's FP8 experts on the CUDA tier
+(`Q38_EXPERT_INT4=0`), where 3098 of them fit the card and the rest of the
+176 GB comes from the disk. The Segment and Edge adapters keep the snapshot's
 experts.
 
 `make -C c qwen38-tiny-int4-check` converts the FP8 tiny fixture (experts
@@ -304,7 +314,9 @@ Tokens are the decode tokens after the prompt and forwards the forwards that
 produced them. The head's routed experts stay the snapshot's FP8 with or
 without the int4-g64 sidecar (one layer read for at most two rows per draft is
 a small share of the expert traffic); their cache holds `Q38_MTP_CAP` experts,
-by default the cap every layer has, and the startup line prints what it costs.
+by default the cap every layer has, or every expert of the head on an integrated GPU with
+32 or more compute units, the expert tier and the dense chain on
+([vulkan.md](vulkan.md#the-chain-on-a-radeon-780m)). The startup line prints what it costs.
 
 ### Measured
 
@@ -352,7 +364,7 @@ rejection after row `k` restores the state after row `k`. `Q38_MTP_DRAFTS=0` let
 pick the depth per verify from the measured acceptance by position and the measured
 cost of a verify by its rows. Prompt lookup (on by default) adds drafts (up to 5, from
 the context's n-grams), and a verify carries whichever proposal is worth more. The
-output stays that of plain decoding. Measured on the release with the int4-g64 sidecar: 4.94 tok/s at two drafts against 4.71 at one and 4.12 without MTP on the CPU (2.75 tokens per forward), 4.55 against 4.39 and 3.91 with the Vulkan tier and chain on a Radeon 780M, so two drafts is the default. The details, the settings and the
+output stays that of plain decoding. Measured on the release with the int4-g64 sidecar: 4.94 tok/s at two drafts against 4.71 at one and 4.12 without MTP on the CPU (2.75 tokens per forward), 4.55 against 4.39 and 3.91 with the Vulkan tier and chain on a Radeon 780M, so two drafts is the default (one on an integrated GPU with 32 or more compute units, the tier and the chain on). The details, the settings and the
 tests are in [speculative.md](speculative.md).
 
 `make -C c qwen38-tiny-mtp-check` adds a head with random weights under the

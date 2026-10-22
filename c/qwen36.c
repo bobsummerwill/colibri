@@ -77,6 +77,8 @@ static int qwen36_max_ctx(void) {
 #include "decode_batch.h" /* ColiSubmit + coli_submit_ext: le chiavi key=value di SUBMIT */
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
 #include "tok_unicode.h"        /* is_S/is_L/is_N: the exact pre-tokenizer classes (Clef) */
+#include "tok_unicode_o200k.h"  /* is_U/is_X: the case classes of o200k's letter rules (Flint) */
+#include "tok_unicode_flint.h"  /* is_PS: [\p{P}\p{S}] (Flint) */
 #include "qwen38_nfc.h"         /* NFC, the tokenizer.json normalizer (Clef) */
 #include "qwen36_tier.h"   /* optional CUDA VRAM expert tier */
 #include "vk_tier.h"       /* optional Vulkan routed-expert tier (COLI_VULKAN=1; stubs without VK=1) */
@@ -292,6 +294,12 @@ static void push_id(int **ids,int *n,int *cap,int v){
     (*ids)[(*n)++]=v;
 }
 
+/* The special tokens a reply is written in (Muse Spark's messages: <|start|>assistant
+ * to=...<|message|>...<|eom|>): they decode to their text so the gateway can read the
+ * messages apart (openai_server.py MuseChannels); every other special decodes to nothing. */
+static int q36_special_shown(const char *s){
+    return s && (!strcmp(s,"<|start|>") || !strcmp(s,"<|message|>") || !strcmp(s,"<|eom|>"));
+}
 static int try_special(const char *s,int i,int n,int *id_out){
     int best_len=0,best_id=-1;
     for(int k=0;k<g_nspecial;k++){
@@ -347,8 +355,135 @@ static int pretok_end(const char *s,int i,int n){
     }
     return i+adv;
 }
+static void bpe_piece(const char *piece,int len,int **ids,int *n,int *cap);
+/* Flint's pre-tokenizer (its tokenizer.json): a Sequence of three Splits, each Isolated,
+ * every one on the pieces the one before left:
+ *   1. \p{N}{1,3}
+ *   2. [\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+
+ *   3. A: [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+ *      B: [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+ *      D: ' ?[\p{P}\p{S}]+[\r\n]*'   E: \s*[\r\n]+   F: \s+(?!\S)   G: \s+
+ * So a digit group and a CJK run are pieces of their own, the regex never reaches across
+ * them, and what it matches nowhere (a control character) is a piece up to its next match.
+ * The letter rules replay the regex's backtracking order as tok.h's o200k splitter does. */
+static int g_pretok_flint = 0;
+static int fl_cjk(uint32_t c){ return (c>=0x4E00&&c<=0x9FA5)||(c>=0x3040&&c<=0x309F)||(c>=0x30A0&&c<=0x30FF); }
+#define FL_S1(c) (is_U(c)||is_X(c))
+#define FL_S2(c) (is_X(c)||(is_L(c)&&!is_U(c)))
+static int fl_contraction(const uint32_t *cp,int n,int k){
+    if(k<n && cp[k]=='\'' && k+1<n){
+        uint32_t d=cp[k+1]>='A'&&cp[k+1]<='Z'?cp[k+1]+32:cp[k+1];
+        if(k+2<n){ uint32_t e=cp[k+2]>='A'&&cp[k+2]<='Z'?cp[k+2]+32:cp[k+2];
+            if((d=='r'&&e=='e')||(d=='v'&&e=='e')||(d=='l'&&e=='l')) return k+3; }
+        if(d=='s'||d=='t'||d=='m'||d=='d') return k+2;
+    }
+    return k;
+}
+static int fl_letters(const uint32_t *cp,int n,int i){
+    for(int branch=0;branch<2;branch++)
+        for(int pfx=1;pfx>=0;pfx--){
+            int j0=i;
+            if(pfx){ uint32_t c=cp[i]; if(c=='\r'||c=='\n'||is_L(c)||is_N(c)||i+1>=n) continue; j0=i+1; }
+            int m1=j0; while(m1<n && FL_S1(cp[m1])) m1++;
+            if(branch==0){   /* A: S1* given back until S2+ takes one */
+                for(int sp=m1;sp>=j0;sp--)
+                    if(sp<n && FL_S2(cp[sp])){ int k=sp+1; while(k<n && FL_S2(cp[k])) k++; return fl_contraction(cp,n,k); }
+            } else if(m1>j0){   /* B */
+                int k=m1; while(k<n && FL_S2(cp[k])) k++; return fl_contraction(cp,n,k);
+            }
+        }
+    return -1;
+}
+/* the end of the third Split's match at i in cp[0..n), or -1 */
+static int fl_match(const uint32_t *cp,int n,int i){
+    int e=fl_letters(cp,n,i); if(e>i) return e;
+    int j=i;
+    if(cp[i]==' ' && j+1<n && is_PS(cp[j+1])) j++;
+    if(j<n && is_PS(cp[j])){
+        while(j<n && is_PS(cp[j])) j++;
+        while(j<n && (cp[j]=='\r'||cp[j]=='\n')) j++;
+        return j;
+    }
+    int r=i; while(r<n && is_S(cp[r])) r++;
+    if(r>i){
+        int last=-1; for(int k=i;k<r;k++) if(cp[k]=='\r'||cp[k]=='\n') last=k;
+        if(last>=0) return last+1;
+        int end=r<n?r-1:r; return end>i?end:i+1;
+    }
+    return -1;
+}
+/* o200k's pre-tokenizer (GPT-4o, Llama 4's tiktoken pattern; Muse Spark's l4_200k_base, a
+ * GGUF's tokenizer.ggml.pre "gpt-4o"), as tok.h's pretok_chunk_o200k splits:
+ *   A|B: Flint's letter rules (fl_letters)   C: \p{N}{1,3}
+ *   D: ' ?[^\s\p{L}\p{N}]+[\r\n/]*'   E: \s*[\r\n]+   F: \s+(?!\S)   G: \s+
+ * g_ignore_merges: a piece that is a token of its own is that token (tiktoken's rule, HF's
+ * ignore_merges), the merges only for the others. */
+static int g_pretok_o200k = 0, g_ignore_merges = 0;
+static void o200k_encode_span(const char *s,int a,int b,int **ids,int *n,int *cap){
+    int nb=b-a; if(nb<=0) return;
+    uint32_t *cp=malloc((size_t)(nb+1)*sizeof(uint32_t)); int *off=malloc((size_t)(nb+2)*sizeof(int));
+    if(!cp||!off){ fprintf(stderr,"qwen36: OOM pre-tokenizing\n"); exit(1); }
+    int m=0;
+    for(int i=a;i<b;){ int adv; cp[m]=utf8_decode(s,i,b,&adv); if(adv<1) adv=1; off[m++]=i; i+=adv; }
+    off[m]=b;
+    #define O2NL(c) ((c)=='\r'||(c)=='\n')
+    for(int i=0;i<m;){
+        int j=fl_letters(cp,m,i);
+        if(j<=i && is_N(cp[i])){ j=i; while(j<m && j-i<3 && is_N(cp[j])) j++; }
+        if(j<=i){   /* D */
+            int k=i;
+            if(cp[i]==' ' && k+1<m && !is_S(cp[k+1]) && !is_L(cp[k+1]) && !is_N(cp[k+1])) k++;
+            if(k<m && !is_S(cp[k]) && !is_L(cp[k]) && !is_N(cp[k])){
+                while(k<m && !is_S(cp[k]) && !is_L(cp[k]) && !is_N(cp[k])) k++;
+                while(k<m && (O2NL(cp[k]) || cp[k]=='/')) k++;
+                j=k;
+            }
+        }
+        if(j<=i){   /* E, F, G */
+            int r=i; while(r<m && is_S(cp[r])) r++;
+            if(r>i){
+                int last=-1; for(int k=i;k<r;k++) if(O2NL(cp[k])) last=k;
+                if(last>=0) j=last+1;
+                else { int end=r<m?r-1:r; j=end>i?end:i+1; }
+            }
+        }
+        if(j<=i) j=i+1;
+        bpe_piece(s+off[i],off[j]-off[i],ids,n,cap);
+        i=j;
+    }
+    #undef O2NL
+    free(cp); free(off);
+}
+static void flint_encode_span(const char *s,int a,int b,int **ids,int *n,int *cap){
+    int nb=b-a; if(nb<=0) return;
+    uint32_t *cp=malloc((size_t)(nb+1)*sizeof(uint32_t)); int *off=malloc((size_t)(nb+2)*sizeof(int));
+    if(!cp||!off){ fprintf(stderr,"qwen36: OOM pre-tokenizing\n"); exit(1); }
+    int m=0;
+    for(int i=a;i<b;){ int adv; cp[m]=utf8_decode(s,i,b,&adv); if(adv<1) adv=1; off[m++]=i; i+=adv; }
+    off[m]=b;
+    for(int i=0;i<m;){
+        int j;
+        if(is_N(cp[i])){ j=i; while(j<m && j-i<3 && is_N(cp[j])) j++; }
+        else if(fl_cjk(cp[i])){ j=i; while(j<m && fl_cjk(cp[j])) j++; }
+        else {
+            int seg=i; while(seg<m && !is_N(cp[seg]) && !fl_cjk(cp[seg])) seg++;
+            j=fl_match(cp+0,seg,i);
+            if(j<=i){ j=i+1; while(j<seg && fl_match(cp,seg,j)<0) j++; }
+        }
+        bpe_piece(s+off[i],off[j]-off[i],ids,n,cap);
+        i=j;
+    }
+    free(cp); free(off);
+}
 static void bpe_piece(const char *piece,int len,int **ids,int *n,int *cap){
     if(len<=0) return;
+    if(g_ignore_merges){   /* the piece whole, when the vocabulary has it */
+        size_t tl=0; for(int b=0;b<len;b++) tl+=strlen(byte_sym_utf8[(unsigned char)piece[b]]);
+        char *whole=malloc(tl+1); if(!whole){ fprintf(stderr,"qwen36: OOM in BPE\n"); exit(1); }
+        whole[0]=0; for(int b=0;b<len;b++) strcat(whole,byte_sym_utf8[(unsigned char)piece[b]]);
+        int id=smap_get(&g_rev,whole); free(whole);
+        if(id>=0){ push_id(ids,n,cap,id); return; }
+    }
     int sc=0,scap=16; char **syms=malloc(scap*sizeof(char*));
     for(int b=0;b<len;b++){
         const char *sym=byte_sym_utf8[(unsigned char)piece[b]];
@@ -415,6 +550,8 @@ static void encode_text(const char *text,int **out_ids,int *out_n){
             }
             free(norm); i=end; continue;
         }
+        if(g_pretok_flint){ flint_encode_span(text,i,end,&ids,&n,&cap); i=end; continue; }
+        if(g_pretok_o200k){ o200k_encode_span(text,i,end,&ids,&n,&cap); i=end; continue; }
         while(i<end){
             int j=pretok_end(text,i,end); if(j<=i) j=i+utf8_adv(text,i,end);
             if(j>end) j=end;
@@ -441,6 +578,26 @@ static void load_tokenizer(const char *path){
     if (!vocab) vocab = json_get(model, "tokens");
     if (!vocab) { fprintf(stderr, "[tok] no model.vocab/tokens in %s\n", path); free(buf); return; }
     jval *adds = json_get(root, "added_tokens");
+    {   /* Flint's pre-tokenizer: a Split of \p{N}{1,3} first, and the punctuation class later */
+        jval *pt = json_get(root, "pre_tokenizer"), *seq = pt ? json_get(pt, "pretokenizers") : NULL;
+        int digits = 0, ps = 0;
+        for (int k = 0; seq && seq->t == J_ARR && k < seq->len; k++) {
+            jval *pat = json_get(seq->kids[k], "pattern"), *rx = pat ? json_get(pat, "Regex") : NULL;
+            if (!rx || rx->t != J_STR) continue;
+            if (k == 0 && !strcmp(rx->str, "\\p{N}{1,3}")) digits = 1;
+            if (strstr(rx->str, "[\\p{P}\\p{S}]") && strstr(rx->str, "\\p{Lu}")) ps = 1;
+        }
+        g_pretok_flint = digits && ps;
+        if (g_pretok_flint) fprintf(stderr, "[tok] Flint's pre-tokenizer (digits by three, CJK runs, o200k letters)\n");
+        /* o200k's one regex (its letter rules and the "[\r\n/]*" tail of its punctuation rule) */
+        for (int k = 0; !g_pretok_flint && seq && seq->t == J_ARR && k < seq->len; k++) {
+            jval *pat = json_get(seq->kids[k], "pattern"), *rx = pat ? json_get(pat, "Regex") : NULL;
+            if (rx && rx->t == J_STR && strstr(rx->str, "\\p{Lu}") && strstr(rx->str, "[\\r\\n/]*")) g_pretok_o200k = 1;
+        }
+        jval *im = json_get(model, "ignore_merges");
+        g_ignore_merges = im && im->t == J_BOOL && im->boolean;
+        if (g_pretok_o200k) fprintf(stderr, "[tok] o200k's pre-tokenizer%s\n", g_ignore_merges ? ", whole pieces first" : "");
+    }
 
     int mx = 0;
     if (vocab->t == J_OBJ){
@@ -472,7 +629,7 @@ static void load_tokenizer(const char *path){
              * (<|im_start|>, <|endoftext|>, ...) keep decoding to nothing,
              * as reference decoding does with skip_special_tokens. */
             jval *sp = json_get(t,"special");
-            if (sp && sp->t==J_BOOL && sp->boolean) continue;
+            if (sp && sp->t==J_BOOL && sp->boolean && !q36_special_shown(c)) continue;
             if (c && id>=0 && id<=mx && !g_tok[id])
                 g_tok[id]=strdup(c);
         }
@@ -548,6 +705,9 @@ static int load_tokenizer_gguf(const gguf_ctx *g){
     if (model && strcmp(model, "gpt2")) {
         fprintf(stderr, "[tok] GGUF tokenizer model is '%s', not byte-level BPE (gpt2): refusing\n", model); return -1;
     }
+    const char *pre = gguf_get_str(g, "tokenizer.ggml.pre");
+    g_pretok_flint = pre && !strcmp(pre, "flint");
+    g_pretok_o200k = g_ignore_merges = pre && (!strcmp(pre, "gpt-4o") || !strcmp(pre, "llama4"));   /* tiktoken's split and rule */
     int n = (int)tk->n;
     const int32_t *types = (ty && ty->type == GGUF_T_ARRAY && (ty->atype == GGUF_T_I32 || ty->atype == GGUF_T_U32) && ty->n == tk->n)
                            ? (const int32_t *)ty->arr : NULL;
@@ -557,7 +717,7 @@ static int load_tokenizer_gguf(const gguf_ctx *g){
     for (int i = 0; i < n; i++) {
         int t = types ? types[i] : 1;
         if (t == 3 || t == 4) nsp++;
-        if (t == 3) continue;
+        if (t == 3 && !q36_special_shown(tk->strs[i])) continue;
         g_tok[i] = strdup(tk->strs[i] ? tk->strs[i] : "");
     }
     g_tok_n = n;
@@ -874,7 +1034,28 @@ typedef struct {
      * j % 3 == 1 and j < 3*sec[1], by the width one when j % 3 == 2 and
      * j < 3*sec[2], else by the temporal one. Text has all three equal. */
     int mrope_section[3];
+    /* Flint (RecursiveSI/flint, tools/make_flint_tiny.py): sigmoid routing (the top-k of
+     * sigmoid(logits), renormalised), a sink logit per attention head, sliding-window
+     * layers that see `window` rows (their own included), layers without RoPE, and dense
+     * layers (one SwiGLU MLP of dense_inter, no router) in a model with experts. All zero
+     * for the Qwen checkpoints. */
+    int router_sigmoid, attn_sinks, window, dense_inter;
+    uint8_t *win_layer, *nope_layer, *dense_layer;   /* [n_layers], NULL when none */
+    /* Muse Spark (muse-spark GGUF, tools/make_muse_tiny.py): Flint's window and layers
+     * without RoPE, plus an RMSNorm without a weight on the embedding, on every attention
+     * head's output (times sigmoid(attn_gate(x)) then) and on the attention branch
+     * (post_eps); residual gates (x = alpha * x + beta * branch) after attention and after
+     * the feed-forward; the router's logits times logit_scale, the top-k chosen on
+     * sigmoid + bias and weighted by the sigmoid; the experts at their own width `ehid`
+     * between two projections (ffn_latent_down / up), normalised in front, and every
+     * expert's output scaled then normalised (post_eps), as is the whole branch; the
+     * logits times logit_scale and capped at softcap * tanh(x / softcap). ehid is the
+     * experts' width for every model: hidden but on Muse. */
+    int muse, ehid;
+    float post_eps, logit_scale, softcap;
 } Cfg;
+/* the experts' width: ehid, or hidden for a Cfg built without it (the tests' hand-made ones) */
+static inline int q36_eh(const Cfg *c) { return c->ehid > 0 ? c->ehid : c->hidden; }
 
 /* ---- Dense int8: a dense matrix that is quantized to int8 during load
  * (load_tq, below matmul_d) instead of loaded as f32 and quantized in a
@@ -918,6 +1099,15 @@ typedef struct {
     float *in_ln, *post_ln, *qn, *kn, *gate_bias;
     QW q, k, v, o, gate;
     QW sh_g, sh_u, sh_d; float *sh_gate;   /* shared expert (dense, int8-during-load) + shared_expert_gate */
+    int sh_I;                              /* its width: shared_inter, or dense_inter on a Flint dense layer */
+    float *sinks;                          /* Flint: a sink logit per attention head (self_attn.softmax_offset) */
+    /* Muse Spark: the attention's output gate (attn_gate), the residual gates' alpha and
+     * beta after attention (ra_*) and after the feed-forward (rf_*), the projections to
+     * and from the experts' width, the norm in front of the experts (pre_en, applied as
+     * rmsnorm_row does), and the scales of the two "scale, then normalise" norms: every
+     * expert's output (post_en) and the branch (post_fn). */
+    QW ag, lat_d, lat_u;
+    float *ra_a, *ra_b, *rf_a, *rf_b, *pre_en, *post_en, *post_fn;
     /* Gated DeltaNet (linear_attention) dense weights (f16->f32 via st_read_f32). */
     QW dn_qkv, dn_z; float *dn_b, *dn_a;   /* in_proj_qkv/z (int8-during-load), b/a (not dense-matmul'd) */
     float *dn_conv;                        /* conv1d.weight [conv_dim, convk] (groups=conv_dim) */
@@ -929,6 +1119,7 @@ typedef struct {
      * three matrices. Offered per layer as "dnout", "attnproj", "shexp";
      * see trunk_offer_dense / trunk_place_dense. */
     int qth_dnout, qth_q, qth_k, qth_v, qth_o, qth_shg, qth_shu, qth_shd;
+    int qth_ag, qth_ld, qth_lu;   /* Muse Spark's attention gate (with "attnproj") and latent projections ("shexp") */
 } Layer;
 
 /* ---------- LRU expert cache (int8 weights + per-row float scales) ---------- */
@@ -1368,7 +1559,7 @@ static int xf_mode(Model *m) {
     const char *e = getenv("QWEN_EXPERT_KERNEL");
     int on = !(e && *e == '0');
     Cfg *c = &m->c;
-    if (c->expert_gs != XF_BLOCK || !xf_layout_ok(c->hidden) || !xf_layout_ok(c->inter)) on = 0;
+    if (c->expert_gs != XF_BLOCK || !xf_layout_ok(q36_eh(c)) || !xf_layout_ok(c->inter)) on = 0;
     if (on) {
         int probe = -1;
         for (int l = 0; l < c->n_layers && probe < 0; l++) {
@@ -1391,7 +1582,7 @@ static int xf_a32(Model *m) {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("Q36_ILV16");
-        v = !(e && !strcmp(e, "0")) && xf_mode(m) && xf_act_mode() == 1 && m->c.hidden % 16 == 0 && m->c.inter % 16 == 0;
+        v = !(e && !strcmp(e, "0")) && xf_mode(m) && xf_act_mode() == 1 && q36_eh(&m->c) % 16 == 0 && m->c.inter % 16 == 0;
     }
     return v;
 #else
@@ -1973,11 +2164,53 @@ static void rmsnorm_row(float *out, const float *x, const float *w, int D, float
     for (int i = 0; i < D; i++) out[i] = x[i] * r * (1.0f + w[i]);
 }
 
+/* Muse Spark's norms without a weight: x / rms(x) (the embedding, every attention head's
+ * output, the attention branch), and "scale, then normalise": x * s / rms(x * s) (every
+ * expert's output, the feed-forward branch). */
+static void rmsnorm_plain(float *out, const float *x, int D, float eps) {
+    double ms = 0; for (int i = 0; i < D; i++) ms += (double)x[i]*x[i];
+    float r = 1.f / sqrtf((float)(ms / D) + eps);
+    for (int i = 0; i < D; i++) out[i] = x[i] * r;
+}
+static void rmsnorm_scaled(float *out, const float *x, const float *s, int D, float eps) {
+    double ms = 0; for (int i = 0; i < D; i++) { double v = (double)x[i] * s[i]; ms += v * v; }
+    float r = 1.f / sqrtf((float)(ms / D) + eps);
+    for (int i = 0; i < D; i++) out[i] = x[i] * s[i] * r;
+}
+/* the residual after a branch: x += branch, or Muse Spark's gate x = alpha * x + beta * branch */
+static void q36_residual(float *x, const float *br, const float *a, const float *b, int S, int D) {
+    if (!a) { for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += br[j]; return; }
+    for (int s = 0; s < S; s++) {
+        float *xs = x + (int64_t)s*D; const float *bs = br + (int64_t)s*D;
+        for (int d = 0; d < D; d++) xs[d] = a[d] * xs[d] + b[d] * bs[d];
+    }
+}
+/* the logits as the model gives them: Muse Spark's times logit_scale and capped at
+ * softcap * tanh(x / softcap); every other model's as lm_head leaves them */
+static void q36_logits_out(const Cfg *c, float *lo, int64_t n) {
+    if (!c->muse) return;
+    const float sc = c->logit_scale, cap = c->softcap;
+    #pragma omp parallel for schedule(static) if (n > 65536)
+    for (int64_t i = 0; i < n; i++) lo[i] = cap > 0.f ? cap * tanhf(lo[i] * sc / cap) : lo[i] * sc;
+}
+
 static void softmax_row(float *x, int n) {
     float m = -1e30f; for (int i = 0; i < n; i++) if (x[i] > m) m = x[i];
     float s = 0; for (int i = 0; i < n; i++) { x[i] = expf(x[i]-m); s += x[i]; }
     for (int i = 0; i < n; i++) x[i] /= s;
 }
+
+/* The router's scores over E experts, in place: the softmax of the Qwen checkpoints, or
+ * Flint's sigmoid of each logit (scoring_func sigmoid). The top-k is taken from them and
+ * renormalised to sum to one either way. */
+static void router_probs(const Cfg *c, float *x, int n) {
+    if (!c->router_sigmoid) { softmax_row(x, n); return; }
+    const float sc = c->muse ? c->logit_scale : 1.f;   /* Muse Spark: the logits times logit_scale first */
+    for (int i = 0; i < n; i++) x[i] = 1.f / (1.f + expf(-x[i] * sc));
+}
+
+/* A Flint dense layer: one MLP, no router, no routed experts. */
+static inline int q36_dense_l(const Cfg *c, int layer) { return c->dense_layer && c->dense_layer[layer]; }
 
 /* softplus(z) = log(1+exp(z)), stable for large z (HF GatedDeltaNet g_rule). */
 static float softplus_f(float z) { return z > 20.f ? z : log1pf(expf(z)); }
@@ -1987,6 +2220,37 @@ static double req_num(jval *r, const char *k){
     jval *v=json_get(r,k);
     if(!v||v->t!=J_NUM){ fprintf(stderr,"config.json: missing or non-numeric \"%s\"\n",k); exit(1); }
     return v->num;
+}
+/* The tokens the model ends a turn with, as it declares them: config.json's and
+ * generation_config.json's eos_token_id (a number or a list), a GGUF's
+ * tokenizer.ggml.eog_token_ids, eos, eot and eom. serve_eos_ids adds them to the ones it
+ * knows by name: Flint ends a turn with <|observation|> before a tool's answer, and with
+ * <|user|>, and without them the engine wrote the tool's answer itself and went on. */
+#define Q36_MAX_EOS 16
+static int g_model_eos[Q36_MAX_EOS], g_n_model_eos;
+static void model_eos_add(long id) {
+    if (id < 0 || id > 0x7fffffff) return;
+    for (int k = 0; k < g_n_model_eos; k++) if (g_model_eos[k] == (int)id) return;
+    if (g_n_model_eos < Q36_MAX_EOS) g_model_eos[g_n_model_eos++] = (int)id;
+}
+static void model_eos_json(const jval *v) {
+    if (!v) return;
+    if (v->t == J_NUM) model_eos_add((long)v->num);
+    else if (v->t == J_ARR)
+        for (int k = 0; k < v->len; k++) if (v->kids[k] && v->kids[k]->t == J_NUM) model_eos_add((long)v->kids[k]->num);
+}
+/* generation_config.json beside config.json, when there is one */
+static void model_eos_file(const char *snap, const char *name) {
+    char path[2048]; snprintf(path, sizeof(path), "%s/%s", snap, name);
+    FILE *f = fopen(path, "rb"); if (!f) return;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    if (n <= 0 || n > (16L << 20)) { fclose(f); return; }
+    char *buf = malloc((size_t)n + 1);
+    if (!buf || fread(buf, 1, (size_t)n, f) != (size_t)n) { free(buf); fclose(f); return; }
+    buf[n] = 0; fclose(f);
+    char *arena = NULL; jval *r = json_parse(buf, &arena);
+    if (r) model_eos_json(json_get(r, "eos_token_id"));
+    free(buf); free(arena);
 }
 static void load_cfg(Cfg *c, const char *snap) {
     char path[2048]; snprintf(path, sizeof(path), "%s/config.json", snap);
@@ -2001,7 +2265,9 @@ static void load_cfg(Cfg *c, const char *snap) {
     c->vocab     = (int)req_num(r,"vocab_size");
     c->eps       = (float)req_num(r,"rms_norm_eps");
     jval *th = json_get(r,"rope_theta"); c->theta = th ? (float)th->num : 10000.f;
+    model_eos_json(json_get(r,"eos_token_id"));
     free(buf); free(arena);
+    model_eos_file(snap, "generation_config.json");
     /* Phase-1 defaults; overridden by qwen36_meta.json in load_meta.
      * Clamped so a missing meta file can never produce a divide-by-zero. */
     c->q_heads = (c->hidden >= 16) ? (c->hidden / 16) : 1;
@@ -2019,6 +2285,9 @@ static void load_cfg(Cfg *c, const char *snap) {
     c->n_group = 1; c->topk_group = 1; c->norm_topk = 1; c->has_qk_norm = 1; c->has_bias = 0;
     c->attn_output_gate = 1; c->n_active = 0; c->zero_centered_norms = 1;
     c->vis_depth = 0; c->image_token = -1;
+    c->router_sigmoid = c->attn_sinks = c->window = c->dense_inter = 0;
+    c->win_layer = c->nope_layer = c->dense_layer = NULL;
+    c->muse = 0; c->ehid = c->hidden; c->post_eps = c->logit_scale = c->softcap = 0.f;
     c->mrope_section[0] = 11; c->mrope_section[1] = 11; c->mrope_section[2] = 10;
     if (c->n_layers <= 0 || c->n_layers > 512) { fprintf(stderr, "load_cfg: n_layers=%d out of range 1..512\n", c->n_layers); exit(1); }
     c->is_attn = calloc((size_t)c->n_layers, sizeof(uint8_t));
@@ -2196,8 +2465,37 @@ static void load_meta(Cfg *c, const char *snap) {
             for (int i=0;i<lt->len && i<c->n_layers;i++){
                 const char *s = (lt->kids[i]->t==J_STR)? lt->kids[i]->str : "";
                 if (s && strcmp(s,"full_attention")==0) { c->is_attn[i]=1; c->n_active++; }
+                if (s && strcmp(s,"sliding_attention")==0) {   /* Flint: attention over a window */
+                    c->is_attn[i]=1; c->n_active++;
+                    if (!c->win_layer) c->win_layer = calloc((size_t)is_attn_len, 1);
+                    if (c->win_layer) c->win_layer[i] = 1;
+                }
             }
         }
+        if((v=json_get(r,"scoring_func"))&&v->t==J_STR) {
+            if (!strcmp(v->str,"sigmoid")) c->router_sigmoid = 1;
+            else CFG_NEED(!strcmp(v->str,"softmax"), "scoring_func %s: softmax or sigmoid", v->str);
+        }
+        if((v=json_get(r,"attn_sinks"))&&v->t==J_BOOL) c->attn_sinks=v->boolean;
+        if((v=json_get(r,"sliding_window"))&&v->t==J_NUM) c->window=(int)v->num;
+        if((v=json_get(r,"dense_inter"))&&v->t==J_NUM) c->dense_inter=(int)v->num;
+        {   /* Flint's per-layer lists: indices into the layers, each checked */
+            const char *keys[2] = {"no_rope_layers", "mlp_only_layers"};
+            uint8_t **into[2] = {&c->nope_layer, &c->dense_layer};
+            for (int k = 0; k < 2; k++) {
+                jval *a = json_get(r, keys[k]);
+                if (!a || a->t != J_ARR || a->len == 0) continue;
+                *into[k] = calloc((size_t)is_attn_len, 1);
+                if (!*into[k]) { fprintf(stderr, "OOM %s\n", keys[k]); exit(1); }
+                for (int j = 0; j < a->len; j++) {
+                    CFG_NEED(a->kids[j]->t == J_NUM && a->kids[j]->num >= 0 && a->kids[j]->num < is_attn_len,
+                             "%s: entry %d is not a layer index below %d", keys[k], j, is_attn_len);
+                    (*into[k])[(int)a->kids[j]->num] = 1;
+                }
+            }
+        }
+        CFG_NEED(!c->win_layer || c->window > 0, "sliding_attention layers need sliding_window > 0 (got %d)", c->window);
+        CFG_NEED(!c->dense_layer || c->dense_inter > 0, "mlp_only_layers need dense_inter > 0 (got %d)", c->dense_inter);
     }
     free(buf); free(arena);
     fprintf(stderr, "[meta] loaded: q_heads=%d kv_heads=%d head_dim=%d q_head_dim=%d k_head_dim=%d v_head_dim=%d "
@@ -2339,6 +2637,18 @@ static const char *gg_name(const char *hf, char *out, size_t cap) {
         { "mlp.gate.e_score_correction_bias", "exp_probs_b.bias" },
         { "self_attn.q_norm.weight", "attn_q_norm.weight" },
         { "self_attn.k_norm.weight", "attn_k_norm.weight" },
+        { "self_attn.softmax_offset", "attn_sinks.weight" },   /* flint */
+        /* muse-spark (names of this engine's own for the gates' folded alpha and beta) */
+        { "self_attn.gate_proj.weight", "attn_gate.weight" },
+        { "post_attention_residual_gate.alpha", "attn_resid_alpha.weight" },
+        { "post_attention_residual_gate.beta", "attn_resid_beta.weight" },
+        { "post_feedforward_residual_gate.alpha", "ffn_resid_alpha.weight" },
+        { "post_feedforward_residual_gate.beta", "ffn_resid_beta.weight" },
+        { "mlp.pre_expert_proj.weight", "ffn_latent_down.weight" },
+        { "mlp.pre_expert_norm.weight", "ffn_pre_exp_norm.weight" },
+        { "mlp.experts.post_expert_norm.weight", "ffn_post_exp_norm.weight" },
+        { "mlp.post_expert_proj.weight", "ffn_latent_up.weight" },
+        { "post_feedforward_layernorm.weight", "post_ffw_norm.weight" },
         { "mlp.shared_expert.gate_proj.weight", "ffn_gate_shexp.weight" },
         { "mlp.shared_expert.up_proj.weight", "ffn_up_shexp.weight" },
         { "mlp.shared_expert.down_proj.weight", "ffn_down_shexp.weight" },
@@ -2462,13 +2772,15 @@ static int qwen_dense_list(const Cfg *c, QwenDenseList *l) {
     int vd = c->dn_vheads * c->dn_vdim;
     #define QDL_ADD(I_, O_, ...) do { char *nm = l->name[l->count]; snprintf(nm, QDF_NAME, __VA_ARGS__); \
         l->spec[l->count++] = (QdfSpec){nm, (I_), (O_)}; } while (0)
-    const char *shp = c->n_experts ? "mlp.shared_expert." : "mlp.";
     for (int i = 0; i < c->n_layers; i++) {
-        if (c->n_experts) QDL_ADD(c->hidden, c->n_experts, "model.layers.%d.mlp.gate.weight", i);
-        if (c->shared_inter > 0) {
-            QDL_ADD(c->hidden, c->shared_inter, "model.layers.%d.%sgate_proj.weight", i, shp);
-            QDL_ADD(c->hidden, c->shared_inter, "model.layers.%d.%sup_proj.weight", i, shp);
-            QDL_ADD(c->shared_inter, c->hidden, "model.layers.%d.%sdown_proj.weight", i, shp);
+        const int dense_l = c->dense_layer && c->dense_layer[i];   /* Flint: one MLP, no router */
+        const char *shp = c->n_experts && !dense_l ? "mlp.shared_expert." : "mlp.";
+        const int SI = dense_l ? c->dense_inter : c->shared_inter;
+        if (c->n_experts && !dense_l) QDL_ADD(c->hidden, c->n_experts, "model.layers.%d.mlp.gate.weight", i);
+        if (SI > 0) {
+            QDL_ADD(c->hidden, SI, "model.layers.%d.%sgate_proj.weight", i, shp);
+            QDL_ADD(c->hidden, SI, "model.layers.%d.%sup_proj.weight", i, shp);
+            QDL_ADD(SI, c->hidden, "model.layers.%d.%sdown_proj.weight", i, shp);
         }
         if (c->is_attn[i]) {
             QDL_ADD(c->hidden, qr, "model.layers.%d.self_attn.q_proj.weight", i);
@@ -2586,6 +2898,34 @@ static int qwen_dense_read(Model *m, const char *name, int I, int O, QW *out) {
  * model_init_range/load_t_n, never main()'s dense-i8 block) -- passing it
  * through keeps their f32-only behavior exactly as it was; `tag` is unused
  * on that path. */
+/* A GGUF whose q and k rows are in the interleaved rotary order: within each head the rows of the
+ * two halves interleaved (file row 2i + j = checkpoint row j * hd/2 + i), so that a rotation of
+ * adjacent pairs is the checkpoint's of the two halves. Put back in the checkpoint's order at
+ * load (rows are whole blocks: a byte copy), every kernel then rotates the halves as for every
+ * other model. q36_gguf_rope_perm: 1 for such a file (muse-spark, Q36_GGUF_ROPE_PERM=0/1 sets it). */
+static int g_q36_rope_perm = 0;
+static int q36_rope_heads(const Model *m, const char *name) {
+    if (!g_q36_rope_perm || !name) return 0;
+    size_t L = strlen(name);
+    if (L > 23 && !strcmp(name + L - 23, "self_attn.q_proj.weight")) return m->c.q_heads;
+    if (L > 23 && !strcmp(name + L - 23, "self_attn.k_proj.weight")) return m->c.kv_heads;
+    if (L > 23 && !strcmp(name + L - 23, "self_attn.q_norm.weight")) return 1;
+    if (L > 23 && !strcmp(name + L - 23, "self_attn.k_norm.weight")) return 1;
+    return 0;
+}
+static void q36_rope_unpermute(void *rows, size_t row_bytes, int heads, int hd) {
+    if (heads <= 0 || hd < 2 || hd % 2) return;
+    const int half = hd / 2;
+    uint8_t *tmp = malloc(row_bytes * (size_t)hd), *base = (uint8_t *)rows;
+    if (!tmp) { fprintf(stderr, "OOM un-permuting rotary rows\n"); exit(1); }
+    for (int h = 0; h < heads; h++) {
+        uint8_t *hb = base + (size_t)h * hd * row_bytes;
+        memcpy(tmp, hb, row_bytes * (size_t)hd);
+        for (int i = 0; i < half; i++) for (int j = 0; j < 2; j++)
+            memcpy(hb + (size_t)(j * half + i) * row_bytes, tmp + (size_t)(2 * i + j) * row_bytes, row_bytes);
+    }
+    free(tmp);
+}
 static void load_tq(Model *m, const char *name, int I, int O, int quantize, const char *tag, QW *out) {
     if (g_gguf) {
         /* the matrix as the file stores it: rows along I, one ggml type */
@@ -2596,12 +2936,18 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
             fprintf(stderr, "GGUF %s: shape [%lld x %lld], config implies [%d x %d] -- refusing\n",
                     t->name, (long long)t->ne[0], (long long)(gg_numel(t) / t->ne[0]), I, O); exit(1);
         }
-        if (t->type == GQ_F32 || t->type == GQ_F16 || t->type == GQ_BF16) { out->w = load_t_n(m, name, (int64_t)I * O); return; }
+        const int rheads = q36_rope_heads(m, name) > 1 ? q36_rope_heads(m, name) : 0;
+        if (t->type == GQ_F32 || t->type == GQ_F16 || t->type == GQ_BF16) {
+            out->w = load_t_n(m, name, (int64_t)I * O);
+            if (rheads && out->w) q36_rope_unpermute((void *)out->w, (size_t)I * sizeof(float), rheads, O / rheads);
+            return;
+        }
         if (!gq_blk_decoder(t->type)) { fprintf(stderr, "GGUF %s: type %s is not supported\n", t->name, gq_type_name(t->type)); exit(1); }
         if (!gg_scale(t, 1, &out->gs)) out->gs = 1.f;
         if (g_gguf_dry) { out->gq_type = t->type; return; }
         out->gq = malloc((size_t)t->nbytes); out->gq_type = t->type;
         if (!out->gq || gguf_read(&g_gg, t, out->gq, 0, t->nbytes)) { fprintf(stderr, "GGUF %s: read failed\n", t->name); exit(1); }
+        if (rheads) q36_rope_unpermute(out->gq, (size_t)gq_row_bytes(t->type, I), rheads, O / rheads);
         const int ht = q36_gq_held(t->type, O, I);
         if (ht != t->type) {   /* interleaved by 16 for the CPU's kernels */
             const int64_t rb = gq_row_bytes(t->type, I), hb = gq_row_bytes(ht, I);
@@ -2827,6 +3173,7 @@ static int q36_vision_attach(Model *m, const float *patches, int grid_h, int gri
 static float *load_norm_n(Model *m, const char *name, int64_t want) {
     float *w = load_t_n(m, name, want);
     if (!w) return NULL;   /* GGUF_CHECK=1: shapes checked, nothing read */
+    if (g_gguf && q36_rope_heads(m, name) == 1) q36_rope_unpermute(w, sizeof(float), 1, (int)want);   /* a head's q/k norm, as its rows */
     if (!m->c.zero_centered_norms)
         for (int64_t i = 0; i < want; i++) w[i] -= 1.0f;
     return w;
@@ -2834,8 +3181,30 @@ static float *load_norm_n(Model *m, const char *name, int64_t want) {
 
 /* Cfg from a qwen35moe GGUF: the same fields load_cfg + load_meta read from
  * config.json + qwen36_meta.json, and the tensor shapes checked against them. */
+/* A GGUF's integer array element, whatever width it was written in */
+static long q36_kv_arr_int(const gguf_kv *kv, uint64_t k) {
+    switch (kv->atype) {
+    case GGUF_T_U8:  return ((const uint8_t *)kv->arr)[k];
+    case GGUF_T_I8:  return ((const int8_t *)kv->arr)[k];
+    case GGUF_T_U16: return ((const uint16_t *)kv->arr)[k];
+    case GGUF_T_I16: return ((const int16_t *)kv->arr)[k];
+    case GGUF_T_U32: return (long)((const uint32_t *)kv->arr)[k];
+    case GGUF_T_I32: return ((const int32_t *)kv->arr)[k];
+    case GGUF_T_U64: return (long)((const uint64_t *)kv->arr)[k];
+    case GGUF_T_I64: return (long)((const int64_t *)kv->arr)[k];
+    default: return -1;
+    }
+}
+static void gguf_model_eos(const gguf_ctx *g) {
+    const gguf_kv *eog = gguf_get(g, "tokenizer.ggml.eog_token_ids");
+    if (eog && eog->type == GGUF_T_ARRAY && eog->arr)
+        for (uint64_t k = 0; k < eog->n; k++) model_eos_add(q36_kv_arr_int(eog, k));
+    const char *keys[3] = { "tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id" };
+    for (int k = 0; k < 3; k++) model_eos_add((long)gguf_get_int(g, keys[k], -1));
+}
 static void gguf_load_cfg(Cfg *c) {
     const gguf_ctx *g = &g_gg;
+    gguf_model_eos(g);
     const char *arch = gguf_get_str(g, "general.architecture");
     const char *gtype = gguf_get_str(g, "general.type");
     if (!arch && ((gtype && !strcmp(gtype, "imatrix")) || gguf_get(g, "imatrix.datasets") || gguf_get(g, "imatrix.chunk_count"))) {
@@ -2846,11 +3215,17 @@ static void gguf_load_cfg(Cfg *c) {
      * qwen3moe: Qwen3 MoE (Qwen3-30B-A3B, Qwen3-Coder), every layer attention, no output
      * gate, no shared expert, full rotary, plain RMSNorm (stored as is, so the 1 still comes off);
      * qwen3: the dense Qwen3 (0.6B to 32B), qwen3moe's layers with qwen35's dense MLP */
+    /* flint: Flint (RecursiveSI/flint), qwen3moe's layer with a sink per head, sliding-window
+     * layers, layers without RoPE, dense layers in front and sigmoid routing */
+    /* muse-spark: Muse Spark (meta-models/Muse-Spark-Open), every layer attention, the
+     * layer of the Cfg comment */
     const int dense = arch && (!strcmp(arch, "qwen35") || !strcmp(arch, "qwen3"));
-    const int plain = arch && (!strcmp(arch, "qwen3moe") || !strcmp(arch, "qwen3"));
+    const int flint = arch && !strcmp(arch, "flint");
+    const int muse = arch && !strcmp(arch, "muse-spark");
+    const int plain = arch && (!strcmp(arch, "qwen3moe") || !strcmp(arch, "qwen3") || flint || muse);
     if (!arch || (strcmp(arch, "qwen35moe") && !dense && !plain)) {
         fprintf(stderr, "GGUF architecture '%s' is not one of qwen35moe (Qwen3.5 / 3.6 MoE), qwen35 (their dense models), "
-                        "qwen3moe (Qwen3 MoE) or qwen3 (dense Qwen3): this engine cannot run it\n", arch ? arch : "?"); exit(1);
+                        "qwen3moe (Qwen3 MoE), qwen3 (dense Qwen3), flint or muse-spark: this engine cannot run it\n", arch ? arch : "?"); exit(1);
     }
     g_gguf_plain = plain;
     char key[128];
@@ -2882,6 +3257,40 @@ static void gguf_load_cfg(Cfg *c) {
         c->n_experts = 0; c->topk = 0; c->inter = 0;
         c->shared_inter = (int)gguf_get_int(g, GK("feed_forward_length"), 0);
         CFG_NEED(c->shared_inter > 0, "GGUF %s.feed_forward_length %d", arch, c->shared_inter);
+    }
+    int flint_lead = 0;
+    if (flint) {
+        /* expert_gating_func 2: sigmoid; the first leading_dense_block_count layers carry one
+         * MLP of feed_forward_length; sliding_window_pattern and rope_pattern by layer */
+        CFG_NEED(gguf_get_int(g, GK("expert_gating_func"), 2) == 2, "GGUF flint.expert_gating_func %lld: only sigmoid (2)",
+                 (long long)gguf_get_int(g, GK("expert_gating_func"), 2));
+        c->router_sigmoid = 1;
+        c->window = (int)gguf_get_int(g, GK("attention.sliding_window"), 0);
+        flint_lead = (int)gguf_get_int(g, GK("leading_dense_block_count"), 0);
+        c->dense_inter = (int)gguf_get_int(g, GK("feed_forward_length"), 0);
+        CFG_NEED(!flint_lead || c->dense_inter > 0, "GGUF flint.feed_forward_length %d", c->dense_inter);
+    }
+    c->ehid = c->hidden;
+    if (muse) {
+        CFG_NEED(gguf_get_int(g, GK("expert_gating_func"), 2) == 2, "GGUF muse-spark.expert_gating_func %lld: only sigmoid (2)",
+                 (long long)gguf_get_int(g, GK("expert_gating_func"), 2));
+        const gguf_kv *nrm = gguf_get(g, GK("expert_weights_norm"));
+        CFG_NEED(!nrm || (nrm->type == GGUF_T_BOOL && gguf_get_int(g, GK("expert_weights_norm"), 1)),
+                 "GGUF muse-spark.expert_weights_norm: the top-k weights are renormalised");
+        CFG_NEED(gguf_get_float(g, GK("expert_weights_scale"), 1.0) == 1.0, "GGUF muse-spark.expert_weights_scale %g: only 1",
+                 gguf_get_float(g, GK("expert_weights_scale"), 1.0));
+        c->muse = 1; c->router_sigmoid = 1;
+        { const char *e = getenv("Q36_GGUF_ROPE_PERM"); g_q36_rope_perm = e && *e ? atoi(e) != 0 : 1; }
+        c->window = (int)gguf_get_int(g, GK("attention.sliding_window"), 0);
+        c->ehid = (int)gguf_get_int(g, GK("moe_latent_size"), 0);
+        c->post_eps = (float)gguf_get_float(g, GK("post_norm_epsilon"), 1e-8);
+        c->logit_scale = (float)gguf_get_float(g, GK("logit_scale"), 1.0);
+        c->softcap = (float)gguf_get_float(g, GK("final_logit_softcapping"), 0.0);
+        const double swa = gguf_get_float(g, GK("rope.freq_base_swa"), gguf_get_float(g, GK("rope.freq_base"), 10000.0));
+        CFG_NEED(swa == gguf_get_float(g, GK("rope.freq_base"), 10000.0), "GGUF muse-spark.rope.freq_base_swa %g: one theta for every layer", swa);
+        CFG_NEED(q36_eh(c) > 0 && c->window > 0 && c->post_eps > 0.f && c->logit_scale > 0.f && c->softcap >= 0.f,
+                 "GGUF muse-spark: moe_latent_size %d, sliding_window %d, post_norm_epsilon %g, logit_scale %g, softcapping %g",
+                 q36_eh(c), c->window, c->post_eps, c->logit_scale, c->softcap);
     }
     #undef GK
     CFG_NEED(c->n_layers > 0 && c->n_layers <= 512 && c->hidden > 0 && c->q_heads > 0 && c->head_dim > 0 && interval > 0,
@@ -2919,14 +3328,58 @@ static void gguf_load_cfg(Cfg *c) {
     }
     snprintf(nm, sizeof nm, "blk.%d.attn_q_norm.weight", c->n_layers - 1);
     c->has_qk_norm = gguf_find(g, nm) != NULL;
+    if (flint) {
+        c->attn_sinks = gguf_find(g, "blk.0.attn_sinks.weight") != NULL;
+        c->win_layer = calloc((size_t)c->n_layers, 1); c->nope_layer = calloc((size_t)c->n_layers, 1);
+        c->dense_layer = calloc((size_t)c->n_layers, 1);
+        if (!c->win_layer || !c->nope_layer || !c->dense_layer) { fprintf(stderr, "OOM flint layers\n"); exit(1); }
+        const char *keys[2] = {"flint.attention.sliding_window_pattern", "flint.attention.rope_pattern"};
+        for (int k = 0; k < 2; k++) {
+            const gguf_kv *a = gguf_get(g, keys[k]);
+            CFG_NEED(a && a->type == GGUF_T_ARRAY && a->atype == GGUF_T_BOOL && a->n == (uint64_t)c->n_layers,
+                     "GGUF %s: a bool per layer (%d)", keys[k], c->n_layers);
+            for (int i = 0; i < c->n_layers; i++) {
+                const int on = ((const uint8_t *)a->arr)[i] != 0;
+                if (k == 0) c->win_layer[i] = (uint8_t)on;
+                else c->nope_layer[i] = (uint8_t)!on;   /* rope_pattern: 1 = the layer takes RoPE */
+            }
+        }
+        CFG_NEED(c->window > 0, "GGUF flint.attention.sliding_window %d", c->window);
+        CFG_NEED(flint_lead >= 0 && flint_lead <= c->n_layers, "GGUF flint.leading_dense_block_count %d", flint_lead);
+        for (int i = 0; i < flint_lead; i++) c->dense_layer[i] = 1;
+        int nwin = 0, nnope = 0;
+        for (int i = 0; i < c->n_layers; i++) { nwin += c->win_layer[i]; nnope += c->nope_layer[i]; }
+        fprintf(stderr, "[gguf] flint: %d sliding-window layers of %d rows, %d without RoPE, %d dense in front (MLP %d), "
+                        "sigmoid routing, %s\n", nwin, c->window, nnope, flint_lead, c->dense_inter,
+                c->attn_sinks ? "a sink per head" : "no sinks");
+    }
+    if (muse) {
+        /* the sliding layers take RoPE, the full-attention ones none (layer_rope_theta 0 on
+         * every full layer of the release; the GGUF keeps only the window's pattern) */
+        c->win_layer = calloc((size_t)c->n_layers, 1); c->nope_layer = calloc((size_t)c->n_layers, 1);
+        if (!c->win_layer || !c->nope_layer) { fprintf(stderr, "OOM muse layers\n"); exit(1); }
+        const gguf_kv *a = gguf_get(g, "muse-spark.attention.sliding_window_pattern");
+        CFG_NEED(a && a->type == GGUF_T_ARRAY && a->atype == GGUF_T_BOOL && a->n == (uint64_t)c->n_layers,
+                 "GGUF muse-spark.attention.sliding_window_pattern: a bool per layer (%d)", c->n_layers);
+        int nwin = 0;
+        for (int i = 0; i < c->n_layers; i++) {
+            c->win_layer[i] = ((const uint8_t *)a->arr)[i] != 0;
+            c->nope_layer[i] = !c->win_layer[i];
+            nwin += c->win_layer[i];
+        }
+        CFG_NEED(c->has_qk_norm && c->shared_inter == 0, "GGUF muse-spark: q/k norms and no shared expert");
+        fprintf(stderr, "[gguf] muse-spark: %d sliding-window layers of %d rows, %d full without RoPE, experts at %d "
+                        "between two projections, logits x %g capped at %g\n",
+                nwin, c->window, c->n_layers - nwin, q36_eh(c), c->logit_scale, c->softcap);
+    }
     snprintf(nm, sizeof nm, "blk.0.exp_probs_b.bias");
     c->has_bias = gguf_find(g, nm) != NULL;
     if (plain && dense)
         fprintf(stderr, "[gguf] qwen3 (dense): %d layers (all attention), hidden %d, MLP %d, vocab %d\n",
                 c->n_layers, c->hidden, c->shared_inter, c->vocab);
     else if (plain)
-        fprintf(stderr, "[gguf] qwen3moe: %d layers (all attention), hidden %d, %d experts top-%d, inter %d, vocab %d\n",
-                c->n_layers, c->hidden, c->n_experts, c->topk, c->inter, c->vocab);
+        fprintf(stderr, "[gguf] %s: %d layers (all attention), hidden %d, %d experts top-%d, inter %d, vocab %d\n",
+                muse ? "muse-spark" : flint ? "flint" : "qwen3moe", c->n_layers, c->hidden, c->n_experts, c->topk, c->inter, c->vocab);
     else if (dense)
         fprintf(stderr, "[gguf] qwen35 (dense): %d layers (%d attention), hidden %d, MLP %d, vocab %d, DeltaNet v/k heads %d/%d\n",
                 c->n_layers, c->n_active, c->hidden, c->shared_inter, c->vocab, c->dn_vheads, c->dn_kheads);
@@ -2950,7 +3403,7 @@ static void gguf_expert_scales(Model *m, int L) {
 
 /* Layer x's experts as a slot holds them (q36_gq_held) and the slot size that needs. */
 static void gguf_expert_held(Model *m, GqExp *x) {
-    const int D = m->c.hidden, I = m->c.inter;
+    const int D = q36_eh(&m->c), I = m->c.inter;
     x->hg = q36_gq_held(x->tg, I, D); x->hu = q36_gq_held(x->tu, I, D); x->hd = q36_gq_held(x->td, D, I);
     x->hb_g = x->hg == x->tg ? x->eb_g : gq_row_bytes(x->hg, D) * I;
     x->hb_u = x->hu == x->tu ? x->eb_u : gq_row_bytes(x->hu, D) * I;
@@ -2976,32 +3429,36 @@ static void gguf_map_experts(Model *m) {
         }
         const uint32_t *tt = (const uint32_t *)ty->arr; const uint64_t *bb = (const uint64_t *)by->arr, *ss = (const uint64_t *)st->arr;
         for (int i = 0; i < c->n_layers; i++) {
+            if (q36_dense_l(c, i)) continue;   /* Flint's dense layers carry no experts */
             GqExp *x = &m->gqx[i];
             snprintf(nm, sizeof nm, "blk.%d.ffn_exps_colibri", i);
             x->packed = gguf_mark(&g_gg, nm);
             x->tg = (int)tt[3 * i]; x->tu = (int)tt[3 * i + 1]; x->td = (int)tt[3 * i + 2];
             x->eb_g = (int64_t)bb[3 * i]; x->eb_u = (int64_t)bb[3 * i + 1]; x->eb_d = (int64_t)bb[3 * i + 2]; x->stride = (int64_t)ss[i];
             int ok = x->packed && x->packed->ne[0] == x->stride && x->packed->ne[1] == c->n_experts &&
-                     x->eb_g == gq_row_bytes(x->tg, c->hidden) * c->inter && x->eb_u == gq_row_bytes(x->tu, c->hidden) * c->inter &&
-                     x->eb_d == gq_row_bytes(x->td, c->inter) * c->hidden && x->eb_g + x->eb_u + x->eb_d <= x->stride;
+                     x->eb_g == gq_row_bytes(x->tg, q36_eh(c)) * c->inter && x->eb_u == gq_row_bytes(x->tu, q36_eh(c)) * c->inter &&
+                     x->eb_d == gq_row_bytes(x->td, c->inter) * q36_eh(c) && x->eb_g + x->eb_u + x->eb_d <= x->stride;
             if (!ok) { fprintf(stderr, "colibri container: layer %d expert tensor disagrees with its declared layout\n", i); exit(1); }
             int64_t tot = x->eb_g + x->eb_u + x->eb_d;
             if (tot > m->gqe_max) m->gqe_max = tot;
             gguf_expert_held(m, x);
         }
-        for (int i = 0; i < c->n_layers; i++) gguf_expert_scales(m, i);
+        for (int i = 0; i < c->n_layers; i++) if (!q36_dense_l(c, i)) gguf_expert_scales(m, i);
         fprintf(stderr, "[gguf] colibri container: experts packed, one read each (layer 0 gate %s up %s down %s, %.2f MB)\n",
                 gq_type_name(m->gqx[0].tg), gq_type_name(m->gqx[0].tu), gq_type_name(m->gqx[0].td), m->gqe_max / 1048576.0);
         return;
     }
+    int first = -1;
     for (int i = 0; i < c->n_layers; i++) {
+        if (q36_dense_l(c, i)) continue;   /* Flint's dense layers carry no experts */
+        if (first < 0) first = i;
         GqExp *x = &m->gqx[i];
         const gguf_tensor **dst[3] = { &x->g, &x->u, &x->d };
         const char *kind[3] = { "gate", "up", "down" };
         for (int k = 0; k < 3; k++) {
             snprintf(nm, sizeof nm, "blk.%d.ffn_%s_exps.weight", i, kind[k]);
             const gguf_tensor *t = gguf_mark(&g_gg, nm);
-            int64_t in = k == 2 ? c->inter : c->hidden, outd = k == 2 ? c->hidden : c->inter;
+            int64_t in = k == 2 ? c->inter : q36_eh(c), outd = k == 2 ? q36_eh(c) : c->inter;
             if (!t || t->n_dims != 3 || t->ne[0] != in || t->ne[1] != outd || t->ne[2] != c->n_experts) {
                 fprintf(stderr, "GGUF %s: missing or not [%lld x %lld x %d]\n", nm, (long long)in, (long long)outd, c->n_experts); exit(1);
             }
@@ -3017,9 +3474,17 @@ static void gguf_map_experts(Model *m) {
         if (tot > m->gqe_max) m->gqe_max = tot;
         gguf_expert_held(m, x);
     }
-    fprintf(stderr, "[gguf] experts: layer 0 gate %s up %s down %s, %.2f MB per expert at most%s\n",
-            gq_type_name(m->gqx[0].tg), gq_type_name(m->gqx[0].tu), gq_type_name(m->gqx[0].td), m->gqe_max / 1048576.0,
-            gguf_expert_ilv(&m->gqx[0]) ? "; held interleaved by 16 for the CPU (Q36_ILV16=0 keeps the rows)" : "");
+    if (first < 0) first = 0;
+    /* a dense layer takes the types of the first layer with experts and holds none: the
+     * loops over layers (the tiers' forms) see one shape, and nothing ever routes there */
+    for (int i = 0; i < c->n_layers; i++)
+        if (q36_dense_l(c, i)) {
+            GqExp *x = &m->gqx[i], *f = &m->gqx[first];
+            x->tg = f->tg; x->tu = f->tu; x->td = f->td; x->eb_g = f->eb_g; x->eb_u = f->eb_u; x->eb_d = f->eb_d;
+        }
+    fprintf(stderr, "[gguf] experts: layer %d gate %s up %s down %s, %.2f MB per expert at most%s\n", first,
+            gq_type_name(m->gqx[first].tg), gq_type_name(m->gqx[first].tu), gq_type_name(m->gqx[first].td), m->gqe_max / 1048576.0,
+            gguf_expert_ilv(&m->gqx[first]) ? "; held interleaved by 16 for the CPU (Q36_ILV16=0 keeps the rows)" : "");
 }
 
 /* After loading: every tensor of the file the engine did not consume. The
@@ -3155,7 +3620,8 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         LD(in_ln,  "input_layernorm.weight", c->hidden);
         LD(post_ln,"post_attention_layernorm.weight", c->hidden);
         #undef LD
-        if (c->n_experts) {
+        const int dense_l = c->dense_layer && c->dense_layer[i];   /* Flint: one MLP, no router */
+        if (c->n_experts && !dense_l) {
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.weight", ai);
             load_tq_noted(m, nm, c->hidden, c->n_experts, quantize_dense, "router", &l->gate);
             QCOUNT(l->gate);
@@ -3169,22 +3635,45 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         } else { l->qn = NULL; l->kn = NULL; }
         /* router correction bias (optional) */
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.e_score_correction_bias", ai);
-        if (c->n_experts && dense_has(m, nm)) { l->gate_bias = load_t_n(m, nm, c->n_experts); }
+        if (c->n_experts && !dense_l && dense_has(m, nm)) { l->gate_bias = load_t_n(m, nm, c->n_experts); }
         else l->gate_bias = NULL;
         /* shared expert (dense, int8-during-load). A dense model's MLP is the same
-         * SwiGLU under mlp.{gate,up,down}_proj, with no gate in front of it. */
-        const char *shp = c->n_experts ? "mlp.shared_expert." : "mlp.";
-        if (c->shared_inter > 0) {   /* Qwen3 MoE has none: its sh_* stay empty */
+         * SwiGLU under mlp.{gate,up,down}_proj, with no gate in front of it, and so is
+         * the MLP of a Flint dense layer (dense_inter wide). */
+        const char *shp = c->n_experts && !dense_l ? "mlp.shared_expert." : "mlp.";
+        l->sh_I = dense_l ? c->dense_inter : c->shared_inter;
+        if (l->sh_I > 0) {   /* Qwen3 MoE has none: its sh_* stay empty */
         snprintf(nm,sizeof(nm),"model.layers.%d.%sgate_proj.weight", ai, shp);
-        load_tq_noted(m, nm, c->hidden, c->shared_inter, quantize_dense, "shexp", &l->sh_g); QCOUNT(l->sh_g);
+        load_tq_noted(m, nm, c->hidden, l->sh_I, quantize_dense, "shexp", &l->sh_g); QCOUNT(l->sh_g);
         snprintf(nm,sizeof(nm),"model.layers.%d.%sup_proj.weight", ai, shp);
-        load_tq_noted(m, nm, c->hidden, c->shared_inter, quantize_dense, "shexp", &l->sh_u); QCOUNT(l->sh_u);
+        load_tq_noted(m, nm, c->hidden, l->sh_I, quantize_dense, "shexp", &l->sh_u); QCOUNT(l->sh_u);
         snprintf(nm,sizeof(nm),"model.layers.%d.%sdown_proj.weight", ai, shp);
-        load_tq_noted(m, nm, c->shared_inter, c->hidden, quantize_dense, "shexp", &l->sh_d); QCOUNT(l->sh_d);
+        load_tq_noted(m, nm, l->sh_I, c->hidden, quantize_dense, "shexp", &l->sh_d); QCOUNT(l->sh_d);
         }
         /* shared_expert_gate: Linear(hidden -> 1), sigmoid-gated shared expert */
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert_gate.weight", ai);
-        l->sh_gate = c->n_experts && c->shared_inter > 0 && dense_has(m, nm) ? load_t_n(m, nm, c->hidden) : NULL;
+        l->sh_gate = c->n_experts && !dense_l && c->shared_inter > 0 && dense_has(m, nm) ? load_t_n(m, nm, c->hidden) : NULL;
+        /* Flint's sinks: one logit per query head, in the softmax's denominator only */
+        snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.softmax_offset", ai);
+        l->sinks = c->attn_sinks && c->is_attn[i] ? load_t_n(m, nm, c->q_heads) : NULL;
+        if (c->muse) {   /* Muse Spark's own tensors (the Cfg comment) */
+            snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.gate_proj.weight", ai);
+            load_tq_noted(m, nm, c->hidden, c->q_heads * c->head_dim, quantize_dense, "attn", &l->ag); QCOUNT(l->ag);
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.pre_expert_proj.weight", ai);
+            load_tq_noted(m, nm, c->hidden, q36_eh(c), quantize_dense, "shexp", &l->lat_d); QCOUNT(l->lat_d);
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.post_expert_proj.weight", ai);
+            load_tq_noted(m, nm, q36_eh(c), c->hidden, quantize_dense, "shexp", &l->lat_u); QCOUNT(l->lat_u);
+            #define LDM(field, suffix, want) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,ai); l->field = load_t_n(m,nm,(want))
+            LDM(ra_a, "post_attention_residual_gate.alpha", c->hidden);
+            LDM(ra_b, "post_attention_residual_gate.beta", c->hidden);
+            LDM(rf_a, "post_feedforward_residual_gate.alpha", c->hidden);
+            LDM(rf_b, "post_feedforward_residual_gate.beta", c->hidden);
+            LDM(post_en, "mlp.experts.post_expert_norm.weight", q36_eh(c));
+            LDM(post_fn, "post_feedforward_layernorm.weight", c->hidden);
+            #undef LDM
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.pre_expert_norm.weight", ai);
+            l->pre_en = load_norm_n(m, nm, q36_eh(c));
+        }
         if (c->is_attn[i]) {
             /* Gated Attention (full_attention) layer, dense projections int8-during-load */
             snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.q_proj.weight", ai);
@@ -3255,7 +3744,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         int n_active = layer_end - layer_begin;
         double slot_gb = 0.0, budget_gb = 0.0;
         cap = qwen36_cap_for_ram(resident, avail, ram_override,
-                                  c->hidden, c->inter, c->n_experts, n_active,
+                                  q36_eh(c), c->inter, c->n_experts, n_active,
                                   xf_mode(m), &slot_gb, &budget_gb);
         fprintf(stderr, "[qwen36] cache auto-sized: %d slots/layer of %d experts "
                         "(%.1f GB budget via %s, %.1f GB dense resident, %.0f MB/slot)\n",
@@ -3307,9 +3796,9 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
 }
 
 /* scale counts per expert matrix: per-row (gs=0) or grouped along input dim */
-static int64_t scale_count_gu(const Cfg *c){ return c->expert_gs ? (int64_t)c->inter * ((c->hidden + c->expert_gs - 1) / c->expert_gs) : c->inter; }
+static int64_t scale_count_gu(const Cfg *c){ return c->expert_gs ? (int64_t)c->inter * ((q36_eh(c) + c->expert_gs - 1) / c->expert_gs) : c->inter; }
 static int down_gs_of(const Cfg *c){ return c->expert_down_bits ? c->expert_down_gs : c->expert_gs; }
-static int64_t scale_count_d (const Cfg *c){ int gs = down_gs_of(c); return gs ? (int64_t)c->hidden * ((c->inter + gs - 1) / gs) : c->hidden; }
+static int64_t scale_count_d (const Cfg *c){ int gs = down_gs_of(c); return gs ? (int64_t)q36_eh(c) * ((c->inter + gs - 1) / gs) : q36_eh(c); }
 
 /* Pure: no Model pointer, no globals, no I/O, same testability contract as
  * coli_resolve_cap / k3_cap_for_ram. cap<=0 sentinel ("auto") resolves to
@@ -3345,8 +3834,8 @@ static void slot_ensure_allocated(Model *m, Slot *s) {
         s->pinned = 0; s->is_int4 = 0; s->g = s->u = s->d = NULL; s->g4 = s->u4 = s->d4 = NULL; s->pw = NULL;
         return;
     }
-    int64_t ng = (int64_t)c->inter * c->hidden;
-    int64_t nd = (int64_t)c->hidden * c->inter;
+    int64_t ng = (int64_t)c->inter * q36_eh(c);
+    int64_t nd = (int64_t)q36_eh(c) * c->inter;
     if (xf_mode(m)) {
         /* half the bytes of the int8 block: the int4 stays packed */
         g_pw_gp = ng / 2;
@@ -3437,6 +3926,11 @@ static void unpack_int4_to_int8(int8_t *out, const uint8_t *raw, int64_t n)
 }
 
 static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
+    /* new bytes in the slot: the copy derived from the last ones (gq_slot_i8's int8,
+     * gq_slot_file_rows' file rows, keyed by t8_eid) is stale. The CUDA tier's copy-mode
+     * warm start reads every expert through one slot a thread whose eid never changes,
+     * and handed the device the first expert's rows for all of them. */
+    s->t8_eid = 0;
     if (g_gguf) {
         /* three reads, one per fused tensor: expert eid's gate, up, down rows */
         const GqExp *x = &m->gqx[layer]; const int ilv = gguf_expert_ilv(x);
@@ -3460,7 +3954,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
             fprintf(stderr, "GGUF: reading layer %d expert %d failed\n", layer, eid); exit(1);
         }
         if (ilv) {   /* the three matrices' groups of 16 rows on the threads, unless the caller already runs on them */
-            const int D = m->c.hidden, I = m->c.inter;
+            const int D = q36_eh(&m->c), I = m->c.inter;
             const int ft[3] = { x->tg, x->tu, x->td }, ht[3] = { x->hg, x->hu, x->hd }, rows[3] = { I, I, D }, cols[3] = { D, D, I };
             const int64_t fo[3] = { 0, x->eb_g, x->eb_g + x->eb_u }, ho[3] = { 0, x->hb_g, x->hb_g + x->hb_u }, fb[3] = { x->eb_g, x->eb_u, x->eb_d };
             int ng[3];
@@ -3484,7 +3978,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.merged_weight", la, eid);
     snprintf(qsnm, sizeof(qsnm), "model.layers.%d.mlp.experts.%d.qs", la, eid);
     Cfg *cc = &m->c;
-    int64_t ng = (int64_t)cc->inter * cc->hidden, nd = (int64_t)cc->hidden * cc->inter;
+    int64_t ng = (int64_t)cc->inter * q36_eh(cc), nd = (int64_t)q36_eh(cc) * cc->inter;
     int64_t want_w = ng + ng + nd;
     int64_t want_s = 2*scale_count_gu(cc) + scale_count_d(cc);
     st_tensor *tw = st_find(&m->S, nm), *ts = st_find(&m->S, qsnm);
@@ -3535,7 +4029,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
         if (s->pw && xf_r16(m)) {
             /* shared kernel, rows interleaved by 16: pairs -> planar beside, then the slot's
              * groups with the scales, on the threads unless the caller already runs on them */
-            const int H = cc->hidden, I = cc->inter, ngI = I / 16, ngH = H / 16;
+            const int H = q36_eh(cc), I = cc->inter, ngI = I / 16, ngH = H / 16;
             const int64_t gp = ng / 2, scu = scale_count_gu(cc), nsc = 2 * scu + scale_count_d(cc);
             const size_t gbH = xf16_group_bytes(H), gbI = xf16_group_bytes(I);
             static _Thread_local uint8_t *pl; static _Thread_local float *scb; static _Thread_local int64_t pcap;
@@ -3565,9 +4059,9 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
         if (s->pw) {
             /* shared kernel: pairs -> planar, never int8 */
             int64_t gp = ng / 2;
-            xf_repack_pairs_signed(s->pw,          raw,          cc->inter,  cc->hidden);
-            xf_repack_pairs_signed(s->pw + gp,     raw + gp,     cc->inter,  cc->hidden);
-            xf_repack_pairs_signed(s->pw + 2 * gp, raw + 2 * gp, cc->hidden, cc->inter);
+            xf_repack_pairs_signed(s->pw,          raw,          cc->inter,  q36_eh(cc));
+            xf_repack_pairs_signed(s->pw + gp,     raw + gp,     cc->inter,  q36_eh(cc));
+            xf_repack_pairs_signed(s->pw + 2 * gp, raw + 2 * gp, q36_eh(cc), cc->inter);
             s->is_int4 = 1;
             st_read_f32(&m->S, qsnm, s->gs, 0);
             return;
@@ -3607,7 +4101,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
  * pipeline at init time. */
 static int container_layer_is_int4(Model *m, int layer) {
     Cfg *cc = &m->c;
-    int64_t ng = (int64_t)cc->inter * cc->hidden, nd = (int64_t)cc->hidden * cc->inter;
+    int64_t ng = (int64_t)cc->inter * q36_eh(cc), nd = (int64_t)q36_eh(cc) * cc->inter;
     int64_t want_w = ng + ng + nd;
     char nm[256];
     snprintf(nm, sizeof(nm),
@@ -3623,7 +4117,7 @@ static int container_layer_is_int4(Model *m, int layer) {
 static void slot_ensure_int8(Model *m, Slot *s) {
     if (s->g || !s->g4) return;
     Cfg *c = &m->c;
-    int64_t ng = (int64_t)c->inter * c->hidden, nd = (int64_t)c->hidden * c->inter;
+    int64_t ng = (int64_t)c->inter * q36_eh(c), nd = (int64_t)q36_eh(c) * c->inter;
     int8_t *w = malloc((size_t)(ng + ng + nd));
     if (!w) { fprintf(stderr, "OOM slot_ensure_int8\n"); exit(1); }
     /* #1271's unpack_int4_to_int8 (branchless, AVX2/NEON/scalar -- see its
@@ -3923,6 +4417,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         }
     }
     const Q36Row *mr = m->mux_rows;   /* a multiplexed step: each row's own conversation and position */
+    const int nope = c->nope_layer && c->nope_layer[layer];   /* Flint: a layer without RoPE */
     for (int s = 0; s < S; s++) {
         int pos = mr ? mr[s].pos : pos_base + s;
         /* the rope of the row's conversation: an image turn's decode rows sit at
@@ -3933,12 +4428,14 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         for (int hh = 0; hh < H; hh++) {
             float *qh = query + ((int64_t)s*H + hh)*hd;
             if (l->qn) rmsnorm_row(qh, qh, l->qn, hd, c->eps);
+            if (nope) continue;
             if (mrope) rope_head_mrope(qh, p3, c->mrope_section, rotary, c->theta);
             else rope_head_partial(qh, pos, rotary, hd, c->theta);
         }
         for (int kvh = 0; kvh < KV; kvh++) {
             float *kh = k + (int64_t)s*KV*kvd + kvh*kvd;
             if (l->kn) rmsnorm_row(kh, kh, l->kn, kvd, c->eps);
+            if (nope) continue;
             if (mrope) rope_head_mrope(kh, p3, c->mrope_section, rotary, c->theta);
             else rope_head_partial(kh, pos, rotary, kvd, c->theta);
         }
@@ -3950,6 +4447,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         memcpy(Vl + ((int64_t)kvh*m->max_t + t)*kvd, vv + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
     }
     float scale = 1.f / sqrtf((float)hd);
+    const int win = c->win_layer && c->win_layer[layer] ? c->window : 0;
     float *ctx = falloc((int64_t)S*H*hd);
     #pragma omp parallel for collapse(2) schedule(static)
     for (int hh = 0; hh < H; hh++) {
@@ -3963,18 +4461,36 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             tid = omp_get_thread_num();
 #endif
             float *sc = m->attn_sc + (int64_t)tid * m->kv_cap;
-            for (int t = 0; t <= qpos; t++) {
+            /* a sliding-window layer (Flint) sees the window's rows, its own included */
+            int t0 = win > 0 && qpos - win + 1 > 0 ? qpos - win + 1 : 0;
+            for (int t = t0; t <= qpos; t++) {
                 const float *kv = Kl + ((int64_t)kvh*m->max_t + t)*kvd;
                 float acc = dot_f32_lanes(qv, kv, kvd);
                 sc[t] = acc * scale;
             }
-            softmax_row(sc, qpos+1);
+            if (l->sinks) {   /* Flint: the head's sink is one more logit in the denominator, with no value */
+                float mx = l->sinks[hh];
+                for (int t = t0; t <= qpos; t++) if (sc[t] > mx) mx = sc[t];
+                float sum = expf(l->sinks[hh] - mx);
+                for (int t = t0; t <= qpos; t++) { sc[t] = expf(sc[t] - mx); sum += sc[t]; }
+                float inv = 1.f / sum;
+                for (int t = t0; t <= qpos; t++) sc[t] *= inv;
+            } else softmax_row(sc + t0, qpos + 1 - t0);
             float *cx = ctx + ((int64_t)s*H + hh)*hd;
             for (int dd = 0; dd < kvd; dd++) cx[dd] = 0;
-            for (int t = 0; t <= qpos; t++) {
+            for (int t = t0; t <= qpos; t++) {
                 const float *vrow = Vl + ((int64_t)kvh*m->max_t + t)*kvd;
                 float a = sc[t]; for (int dd = 0; dd < kvd; dd++) cx[dd] += a * vrow[dd];
             }
+        }
+    }
+    /* Muse Spark: every head's output normalised, and the gate its own projection of the
+     * attention's input (attn_gate), H x hd wide like the heads */
+    if (c->muse) {
+        for (int64_t r = 0; r < (int64_t)S*H; r++) rmsnorm_plain(ctx + r*hd, ctx + r*hd, hd, c->eps);
+        if (l->ag.O) {
+            gate = falloc((int64_t)S*H*hd); gate_dim = hd;
+            if (!qtd_batch(l->qth_ag, gate, x, S, D, H*hd)) matmul_d(gate, x, &l->ag, S, D, H*hd);
         }
     }
     /* apply attn_output_gate: attn_out *= sigmoid(gate). Without a gate (Qwen3 MoE)
@@ -4011,7 +4527,7 @@ static int qwen_shared_batch_rows(int S, int D, int I) {
 
 static void qwen_shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
                                     float *out, float *g, float *u, float *hh) {
-    Cfg *c=&m->c; int D=c->hidden, I=c->shared_inter;
+    Cfg *c=&m->c; int D=c->hidden, I=l->sh_I;
     if (I <= 0) return;   /* no shared expert (qwen3_moe) */
     int B=qwen_shared_batch_rows(S,D,I);
     double _ts=tm_now();
@@ -4055,7 +4571,7 @@ static void qwen_shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
 /* A slot's expert as the shared kernel takes it: planar rows and scale arrays, or the
  * xf16 groups (xf_r16) */
 static XfExpert xf_slot_expert(Model *m, const Slot *e) {
-    const int H = m->c.hidden, I = m->c.inter;
+    const int H = q36_eh(&m->c), I = m->c.inter;
     if (xf_r16(m)) { const size_t gu = (size_t)(I / 16) * xf16_group_bytes(H); return (XfExpert){e->pw, e->pw + gu, e->pw + 2 * gu, NULL, NULL, NULL}; }
     const int64_t gp = (int64_t)I * H / 2;
     return (XfExpert){e->pw, e->pw + gp, e->pw + 2 * gp, e->gs, e->us, e->ds};
@@ -4081,7 +4597,7 @@ static XfExpert xf_slot_expert(Model *m, const Slot *e) {
  * given up for a run. */
 #define QWEN_XF_ROWS 256   /* rows per run at most: about 31 MB of scratch on the 35B */
 static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, const int *idx, const float *val) {
-    Cfg *c = &m->c; int D = c->hidden, K = c->topk, F = c->inter;
+    Cfg *c = &m->c; int D = q36_eh(c), K = c->topk, F = c->inter;
     int cap = m->cache[layer].cap;
     int kper = cap >= K ? K : 1;              /* experts per run */
     int room = cap;                           /* slots a run may fill */
@@ -4132,7 +4648,7 @@ static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, c
 static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, const int *idx, const float *val);
 static void qt_cpu_misses(Model *m, int layer, const float *xs, const int *idx, const float *val,
                           uint32_t mask, float *os, float *g, float *u, float *hh) {
-    Cfg *c = &m->c; int D = c->hidden, K = c->topk, I = c->inter;
+    Cfg *c = &m->c; int D = q36_eh(c), K = c->topk, I = c->inter;
     if (g_gguf) {   /* a GGUF's misses through its own CPU path, each offered to the tier first */
         int mi[64]; float mv[64];
         for (int kk = 0; kk < K && kk < 64; kk++) {
@@ -4291,7 +4807,7 @@ static void route_footer(FILE *f, const Model *m) {
 static void gq_slot_i8(Model *m, int layer, Slot *e) {
     if (e->t8_eid == e->eid + 1) return;
     const Cfg *c = &m->c; const GqExp *x = &m->gqx[layer];
-    const int D = c->hidden, I = c->inter; const int64_t n = (int64_t)I * D;
+    const int D = q36_eh(c), I = c->inter; const int64_t n = (int64_t)I * D;
     if (!e->t8) {
         e->t8 = malloc((size_t)(3 * n)); e->t8s = malloc((size_t)(3 * (n / 32)) * sizeof(float));
         if (!e->t8 || !e->t8s) { fprintf(stderr, "OOM gq_slot_i8\n"); exit(1); }
@@ -4308,8 +4824,11 @@ static int g_vk_gguf_raw;   /* the tier holds the GGUF experts' blocks as the fi
 static const uint8_t *gq_slot_file_rows(Model *m, int layer, Slot *e) {
     const GqExp *x = &m->gqx[layer];
     if (!gguf_expert_ilv(x)) return e->gqe;
-    const int D = m->c.hidden, I = m->c.inter;
-    if (!e->t8 && !(e->t8 = malloc((size_t)(x->eb_g + x->eb_u + x->eb_d)))) { fprintf(stderr, "OOM GGUF expert for the device tier\n"); exit(1); }
+    const int D = q36_eh(&m->c), I = m->c.inter;
+    /* the largest layer's: a slot can hold experts of several layers in turn (the CUDA
+     * tier's copy-mode warm start reads every expert through one slot a thread), and a
+     * published file's layers differ in their block types */
+    if (!e->t8 && !(e->t8 = malloc((size_t)m->gqe_max))) { fprintf(stderr, "OOM GGUF expert for the device tier\n"); exit(1); }
     uint8_t *b = (uint8_t *)e->t8;
     if (e->t8_eid != e->eid + 1) {
         const int ft[3] = { x->tg, x->tu, x->td }, ht[3] = { x->hg, x->hu, x->hd }, rows[3] = { I, I, D }, cols[3] = { D, D, I };
@@ -4329,14 +4848,14 @@ static VktExpertSrc vk_slot_src(Model *m, int layer, Slot *e) {
         return (VktExpertSrc){b, b + x->eb_g, b + x->eb_g + x->eb_u, NULL, NULL, NULL};
     }
     if (g_gguf) {
-        int64_t n = (int64_t)m->c.inter * m->c.hidden;
+        int64_t n = (int64_t)m->c.inter * q36_eh(&m->c);
         gq_slot_i8(m, layer, e);
         return (VktExpertSrc){e->t8, e->t8 + n, e->t8 + 2 * n, e->t8s, e->t8s + n / 32, e->t8s + 2 * (n / 32)};
     }
     if (e->pw) {
-        int64_t gp = (int64_t)m->c.inter * m->c.hidden / 2;
+        int64_t gp = (int64_t)m->c.inter * q36_eh(&m->c) / 2;
         if (xf_r16(m)) {   /* the device reads planar rows and scale arrays: back from the groups, once per expert */
-            const int H = m->c.hidden, I = m->c.inter; const int64_t scu = scale_count_gu(&m->c), nsc = 2 * scu + scale_count_d(&m->c);
+            const int H = q36_eh(&m->c), I = m->c.inter; const int64_t scu = scale_count_gu(&m->c), nsc = 2 * scu + scale_count_d(&m->c);
             const size_t gu = (size_t)(I / 16) * xf16_group_bytes(H);
             if (!e->t8 && !(e->t8 = malloc((size_t)(3 * gp)))) { fprintf(stderr, "OOM int4 expert for the Vulkan tier\n"); exit(1); }
             if (!e->t8s && !(e->t8s = malloc((size_t)nsc * sizeof(float)))) { fprintf(stderr, "OOM int4 expert for the Vulkan tier\n"); exit(1); }
@@ -4357,7 +4876,7 @@ static VktExpertSrc vk_slot_src(Model *m, int layer, Slot *e) {
  * held slots released after each. */
 static void moe_vk_xf_cpu(Model *m, int layer, const float *x, int S, const int *idx,
                           const uint8_t *want, float *ctb) {
-    Cfg *c = &m->c; int D = c->hidden, K = c->topk, F = c->inter;
+    Cfg *c = &m->c; int D = q36_eh(c), K = c->topk, F = c->inter;
     int cap = m->cache[layer].cap;
     int per = cap >= S * K ? S : 1, kper = cap >= K ? K : 1, n = per * kper;
     XfExpert *ex = malloc(sizeof(XfExpert) * (size_t)n);
@@ -4391,7 +4910,7 @@ static void moe_vk_xf_cpu(Model *m, int layer, const float *x, int S, const int 
 /* The int8 slots' CPU pairs (want[i] set), into ctb[i], one at a time. */
 static void moe_vk_i8_cpu(Model *m, int layer, const float *x, int S, const int *idx,
                           const uint8_t *want, float *ctb, float *g, float *u) {
-    Cfg *c = &m->c; int D = c->hidden, K = c->topk, I = c->inter;
+    Cfg *c = &m->c; int D = q36_eh(c), K = c->topk, I = c->inter;
     for (int i = 0; i < S * K; i++) {
         if (idx[i] < 0 || !want[i]) continue;
         const float *xs = x + (int64_t)(i / K) * D;
@@ -4409,7 +4928,7 @@ static void moe_vk_i8_cpu(Model *m, int layer, const float *x, int S, const int 
  * them; an expert the tier would take now is converted for it (vkt_wants) and noted. */
 static void moe_vk_gq_cpu(Model *m, int layer, const float *x, int S, const int *idx,
                           const uint8_t *want, float *ctb) {
-    Cfg *c = &m->c; int D = c->hidden, K = c->topk, I = c->inter;
+    Cfg *c = &m->c; int D = q36_eh(c), K = c->topk, I = c->inter;
     const GqExp *gx = &m->gqx[layer];
     float *G = falloc(I), *U = falloc(I);
     for (int i = 0; i < S * K; i++) {
@@ -4429,7 +4948,7 @@ static void moe_vk_gq_cpu(Model *m, int layer, const float *x, int S, const int 
 }
 static void moe_vk_run(Model *m, Layer *l, int layer, const float *x, int S, float *out,
                        const int *idx, const float *val, int routed_only) {
-    Cfg *c = &m->c; int D = c->hidden, K = c->topk, I = c->inter, SI = routed_only ? 0 : c->shared_inter;
+    Cfg *c = &m->c; int D = q36_eh(c), K = c->topk, I = c->inter, SI = routed_only ? 0 : c->shared_inter;
     int xf = xf_mode(m), B = vkt_step_rows(S, QWEN_VK_ROWS);   /* a whole prompt chunk when the tier streams */
     float *ctb = falloc((int64_t)B * K * D), *shb = SI > 0 ? falloc((int64_t)B * D) : NULL;
     float *g = falloc(I > SI ? I : SI), *u = falloc(I > SI ? I : SI), *hh = falloc(D);
@@ -4447,7 +4966,8 @@ static void moe_vk_run(Model *m, Layer *l, int layer, const float *x, int S, flo
         else    moe_vk_i8_cpu(m, layer, xb, rows, ib, want, ctb, g, u);
         if (shb) { memset(shb, 0, (size_t)rows * D * sizeof(float)); qwen_shared_experts_cpu(m, l, xb, rows, shb, g, u, hh); }
         const float *dsum = NULL;   /* a step wholly on the device: its routed rows summed there */
-        if (ndev && !vkt_join_sum(dev, vb, &dsum)) {   /* the batch failed (the tier stops): those pairs here */
+        /* Muse Spark normalises every expert's output before the sum: the rows come back apart */
+        if (ndev && !(l->post_en ? vkt_join(dev) : vkt_join_sum(dev, vb, &dsum))) {   /* the batch failed (the tier stops): those pairs here */
             if (g_gguf) moe_vk_gq_cpu(m, layer, xb, rows, ib, taken, ctb);
             else if (xf) moe_vk_xf_cpu(m, layer, xb, rows, ib, taken, ctb);
             else    moe_vk_i8_cpu(m, layer, xb, rows, ib, taken, ctb, g, u);
@@ -4468,6 +4988,13 @@ static void moe_vk_run(Model *m, Layer *l, int layer, const float *x, int S, flo
                 if (ib[i] < 0) continue;
                 const float *cp = taken[i] ? dev[i] : ctb + (int64_t)i * D;
                 float w = vb[i];
+                if (l->post_en) {   /* Muse Spark: w * rmsnorm_scaled(cp), the same products in the same order */
+                    const float *ps = l->post_en;
+                    double ms = 0; for (int d = 0; d < D; d++) { double v = (double)cp[d] * ps[d]; ms += v * v; }
+                    const float r = 1.f / sqrtf((float)(ms / D) + c->post_eps);
+                    for (int d = 0; d < D; d++) os[d] += w * (cp[d] * ps[d] * r);
+                    continue;
+                }
                 for (int d = 0; d < D; d++) os[d] += w * cp[d];
             }
             if (shb) { const float *sp = shb + (int64_t)s * D; for (int d = 0; d < D; d++) os[d] += sp[d]; }
@@ -4493,7 +5020,7 @@ static inline void gq_rows_u(float *y, int u, const gq_act *a, const uint8_t *W,
     for (int j = 0; j < u; j++) gq_row_all(y + j, 1, a, W + (int64_t)j * rb, t, I);
 }
 static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const int *idx, const float *val) {
-    Cfg *c = &m->c; const int D = c->hidden, K = c->topk, I = c->inter;
+    Cfg *c = &m->c; const int D = q36_eh(c), K = c->topk, I = c->inter;
     const GqExp *gx = &m->gqx[layer];
     if (m->cache[layer].cap < K || K > 64 || !gq_int_ok(gx->hg, D) || !gq_int_ok(gx->hu, D) || !gq_int_ok(gx->hd, I)) return -1;
     /* rows interleaved by 16 (q36_gq_held) go a group at a time, and then every matrix's rows by 16 */
@@ -4547,13 +5074,14 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
     for (int j = 0; j < n; j++) {
         int k = ord[j]; float *ys = Y + (int64_t)k * D;
         if (gx->sd) for (int d = 0; d < D; d++) ys[d] *= gx->sd[ids[k]];
+        if (m->L[layer].post_en) rmsnorm_scaled(ys, ys, m->L[layer].post_en, D, c->post_eps);   /* Muse Spark */
         for (int d = 0; d < D; d++) out[d] += w[k] * ys[d];
     }
     return 0;
 }
 
 static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, const int *idx, const float *val) {
-    Cfg *c = &m->c; const int D = c->hidden, K = c->topk, I = c->inter, E = c->n_experts;
+    Cfg *c = &m->c; const int D = q36_eh(c), K = c->topk, I = c->inter, E = c->n_experts;
     const GqExp *gx = &m->gqx[layer];
     static int nodec = -1; if (nodec < 0) { const char *e = getenv("GQ_NODECODE"); nodec = e && *e == '1'; }
     if (S == 1 && !nodec && !moe_gq_decode(m, layer, x, out, idx, val)) return;
@@ -4582,6 +5110,8 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
         for (int64_t q = 0; q < (int64_t)n * I; q++) { float gv = G[q]; G[q] = (gv / (1.f + expf(-gv))) * U[q]; }
         gq_matmul(Y, G, sl->gqe + gx->hb_g + gx->hb_u, gx->hd, n, I, D);
         if (gx->sd) for (int64_t q = 0; q < (int64_t)n * D; q++) Y[q] *= gx->sd[e];
+        if (m->L[layer].post_en)   /* Muse Spark: every expert's output scaled, then normalised */
+            for (int r = 0; r < n; r++) rmsnorm_scaled(Y + (int64_t)r * D, Y + (int64_t)r * D, m->L[layer].post_en, D, c->post_eps);
         for (int r = 0; r < n; r++) {
             float *os = out + (int64_t)tl[r] * D; const float *ys = Y + (int64_t)r * D; const float w = wl[r];
             for (int d = 0; d < D; d++) os[d] += w * ys[d];
@@ -4598,11 +5128,12 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
  * moe_ex(..., NULL, 0): the same operations in the same order as before. */
 static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
                    const float *logits_in, int routed_only) {
-    Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
-    if (E == 0) {
+    /* D: the experts' width, the rows of x and out (Muse Spark's latent, hidden otherwise) */
+    Cfg *c = &m->c; int D = q36_eh(c), E = c->n_experts, K = c->topk, I = c->inter;
+    if (E == 0 || (c->dense_layer && c->dense_layer[layer])) {   /* a dense model, or a Flint dense layer */
         memset(out, 0, (int64_t)S*D*sizeof(float));
         if (routed_only) return;
-        float *g = falloc(c->shared_inter), *u = falloc(c->shared_inter), *hh = falloc(D);
+        float *g = falloc(l->sh_I), *u = falloc(l->sh_I), *hh = falloc(D);
         qwen_shared_experts_cpu(m, l, x, S, out, g, u, hh);
         free(g); free(u); free(hh);
         (void)layer;
@@ -4613,20 +5144,30 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
     if (logits_in) memcpy(logits, logits_in, (size_t)S*E*sizeof(float));
     else matmul_d(logits, x, &l->gate, S, D, E);
     tm_add(S, 4, tm_now()-_tr);
-    if (c->has_bias && l->gate_bias) {
+    /* the router's bias: on a softmax router a term of the logits; on a sigmoid one
+     * (Muse Spark's e_score_correction_bias) it moves the choice of the top-k only, and
+     * the chosen experts weigh their sigmoid */
+    const float *selb = c->has_bias && l->gate_bias && c->router_sigmoid ? l->gate_bias : NULL;
+    if (c->has_bias && l->gate_bias && !selb) {
         for (int s = 0; s < S; s++) { float *pr = logits + (int64_t)s*E; for (int e = 0; e < E; e++) pr[e] += l->gate_bias[e]; }
     }
     memset(out, 0, (int64_t)S*D*sizeof(float));
     float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
-    float *sh = falloc(I), *shu = falloc(I), *shd = falloc(D);  /* shared expert scratch */
+    /* shared expert scratch: its own width, which is not the routed experts' (Flint: 1024 and 512) */
+    const int SIw = c->shared_inter > I ? c->shared_inter : I;
+    float *sh = falloc(SIw), *shu = falloc(SIw), *shd = falloc(D);
     /* When a qpack container owns the routed experts, they run through
      * the MLX-affine path (Metal on Apple, CPU reference elsewhere);
      * neither the CUDA tier nor the expert_ffn kernel is consulted.
      * Routing, shared expert, and the combine stay on the CPU below. */
     /* GGUF: the experts as the file stores them, ggml blocks no tier reads (moe_gq_run) */
-    int use_gq = g_gguf && !vkt_ready() && !(qt_ready() && qt_experts_on());   /* the device tiers take a GGUF's experts */
+    /* Muse Spark's prompt rows go to the CPU's batched path (each expert read once for every row
+     * routed to it): the CUDA chain's frame does not run its experts, and the tier's host step
+     * takes a token at a time */
+    const int qt_rows = qt_ready() && qt_experts_on() && !(c->muse && S >= 16);
+    int use_gq = g_gguf && !vkt_ready() && !qt_rows;   /* the device tiers take a GGUF's experts */
     int use_qq = !use_gq && qq_active();
-    int use_qt = !use_gq && !use_qq && qt_ready() && qt_experts_on();   /* a trunk-only tier leaves the experts to the paths below */
+    int use_qt = !use_gq && !use_qq && qt_rows;   /* a trunk-only tier leaves the experts to the paths below */
     /* the Vulkan tier takes the routed experts of every format it was given
      * (moe_vk_run): the routing is collected first, as for the shared kernel */
     int use_vk = !use_gq && !use_qq && !use_qt && vkt_ready();
@@ -4657,7 +5198,7 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
         #pragma omp parallel for schedule(static)
         for (int s = 0; s < S; s++) {
             float *pr = logits + (int64_t)s*E;
-            softmax_row(pr, E);
+            router_probs(c, pr, E);
             uint8_t keep[1024]; int Ec = E;
             if (c->n_group > 1 && c->n_group <= Ec) {
                 int per = E / c->n_group;
@@ -4684,9 +5225,10 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
                 for (int e = 0; e < E; e++) {
                     if (!keep[e]) continue;
                     int taken = 0; for (int j = 0; j < kk; j++) if (idx[j]==e){taken=1;break;}
-                    if (!taken && pr[e] > bv) { bv = pr[e]; best = e; }
+                    const float ce = selb ? pr[e] + selb[e] : pr[e];
+                    if (!taken && ce > bv) { bv = ce; best = e; }
                 }
-                idx[kk] = best; val[kk] = bv;
+                idx[kk] = best; val[kk] = best >= 0 ? pr[best] : 0.f;
             }
             for (int kk = 0; kk < K; kk++) if (idx[kk] < 0) { idx[kk] = -1 - kk; val[kk] = 0.f; }   /* degraded: below */
             float sm=0; for (int kk=0;kk<K;kk++) sm+=val[kk]; if (sm>0) for (int kk=0;kk<K;kk++) val[kk]/=sm;
@@ -4720,7 +5262,7 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
             if (is_zero) { for (int e = 0; e < E; e++) ema[e] = pr[e]; }
             else { for (int e = 0; e < E; e++) ema[e] = (1.f - m->pilot_smooth)*pr[e] + m->pilot_smooth*ema[e]; }
         }
-        softmax_row(pr, E);
+        router_probs(c, pr, E);
         /* group-limited top-k selection */
         uint8_t keep[1024]; int Ec = E < 1024 ? E : 1024;
         if (c->n_group > 1 && c->n_group <= Ec) {
@@ -4743,7 +5285,7 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
             for (int e = 0; e < Ec; e++) keep[e] = 1;
         }
         int idx[256]; float val[256];
-        if (g_cache_route) {
+        if (g_cache_route && !selb) {
             RouteCtx rc = { m, layer };
             route_select(pr, keep, E, K, g_route_j, g_route_m, g_route_p, g_route_alpha,
                          route_level, &rc, idx, val, &m->route);
@@ -4753,9 +5295,10 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
                 for (int e = 0; e < E; e++) {
                     if (!keep[e]) continue;
                     int taken = 0; for (int j = 0; j < kk; j++) if (idx[j]==e){taken=1;break;}
-                    if (!taken && pr[e] > bv) { bv = pr[e]; best = e; }
+                    const float ce = selb ? pr[e] + selb[e] : pr[e];
+                    if (!taken && ce > bv) { bv = ce; best = e; }
                 }
-                idx[kk] = best; val[kk] = bv;
+                idx[kk] = best; val[kk] = best >= 0 ? pr[best] : 0.f;
             }
             if (g_route_agree) {            /* plain routing: full agreement by construction */
                 m->route.agree_hit += (uint64_t)K; m->route.agree_tot += (uint64_t)K; m->route.kl_n++;
@@ -4824,9 +5367,9 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
              * groups; the common block below is skipped. Not for a caller that
              * wants the routed experts only (the dense chain runs the shared
              * expert on the device, qwen36_cuda_chain.h). */
-            if (c->shared_inter > 0 && !routed_only) {
+            if (l->sh_I > 0 && !routed_only) {   /* the layer's own width, as the chains and the batch read it */
                 double _ts2 = tm_now();
-                int Ish = c->shared_inter;
+                int Ish = l->sh_I;
                 if (!qtd(l->qth_shg, sh, xs, D, Ish))  matmul_d(sh, xs, &l->sh_g, 1, D, Ish);
                 if (!qtd(l->qth_shu, shu, xs, D, Ish)) matmul_d(shu, xs, &l->sh_u, 1, D, Ish);
                 for (int i = 0; i < Ish; i++) { float sv = sh[i]; sh[i] = (sv / (1.f + expf(-sv))) * shu[i]; }
@@ -4842,7 +5385,8 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
                 tm_add(S, 3, tm_now()-_ts2);
             }
             double _q2 = tm_now();
-            if(!qt_take(qmask, val, K, out + (int64_t)s*D)){
+            if(!(l->post_en ? qt_take_scaled(qmask, val, K, out + (int64_t)s*D, l->post_en, c->post_eps)
+                            : qt_take(qmask, val, K, out + (int64_t)s*D))){
                 fprintf(stderr,"qwen36: CUDA expert collection failed at layer %d; stopping inference\n",layer);
                 exit(1);
             }
@@ -4859,6 +5403,7 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
                 for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
                 matmul_qd(hh, g, e->d, e->ds, I, D);
                 slot_release(e);
+                if (l->post_en) rmsnorm_scaled(hh, hh, l->post_en, D, c->post_eps);   /* Muse Spark */
                 float w = val[kk];
                 float *os = out + (int64_t)s*D;
                 for (int d = 0; d < D; d++) os[d] += w * hh[d];
@@ -4876,7 +5421,23 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
     if (!use_qt && !use_vk && !routed_only) qwen_shared_experts_cpu(m,l,x,S,out,sh,shu,shd);
     free(logits); free(g); free(u); free(hh); free(sh); free(shu); free(shd);
 }
+/* Muse Spark's feed-forward: the router on the hidden width, the experts at theirs
+ * (ehid) between the two projections, normalised in front (pre_en); moe_ex runs the
+ * routed experts on the latent rows and normalises every expert's output. */
+static void moe_muse(Model *m, Layer *l, int layer, float *x, int S, float *out) {
+    Cfg *c = &m->c; const int D = c->hidden, L = q36_eh(c), E = c->n_experts;
+    float *logits = falloc((int64_t)S*E), *lat = falloc((int64_t)S*L), *lo = falloc((int64_t)S*L);
+    double _tr = tm_now();
+    matmul_d(logits, x, &l->gate, S, D, E);
+    tm_add(S, 4, tm_now()-_tr);
+    if (!qtd_batch(l->qth_ld, lat, x, S, D, L)) matmul_d(lat, x, &l->lat_d, S, D, L);
+    for (int s = 0; s < S; s++) rmsnorm_row(lat + (int64_t)s*L, lat + (int64_t)s*L, l->pre_en, L, c->eps);
+    moe_ex(m, l, layer, lat, S, lo, logits, 1);
+    if (!qtd_batch(l->qth_lu, out, lo, S, L, D)) matmul_d(out, lo, &l->lat_u, S, L, D);
+    free(logits); free(lat); free(lo);
+}
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
+    if (m->c.muse) { moe_muse(m, l, layer, x, S, out); return; }
     moe_ex(m, l, layer, x, S, out, NULL, 0);
 }
 
@@ -5175,7 +5736,7 @@ static void trunk_offer_dense(Model *m){
         if (!c->is_attn[i]) continue;
         Layer *l = &m->L[i];
         size_t bq = qdw_bytes(&l->q), bk = qdw_bytes(&l->k), bv = qdw_bytes(&l->v), bo = qdw_bytes(&l->o);
-        if (bq && bk && bv && bo) qt_trunk_offer("attnproj", i, bq + bk + bv + bo);
+        if (bq && bk && bv && bo) qt_trunk_offer("attnproj", i, bq + bk + bv + bo + qdw_bytes(&l->ag));
     }
     /* The shared expert is offered only on request (Q36_OFFER_SHEXP=1). On the
      * card it is 120 synchronous small GEMVs per token that sit between
@@ -5191,6 +5752,12 @@ static void trunk_offer_dense(Model *m){
             size_t bg = qdw_bytes(&l->sh_g), bu = qdw_bytes(&l->sh_u), bd = qdw_bytes(&l->sh_d);
             if (bg && bu && bd) qt_trunk_offer("shexp", i, bg + bu + bd);
         } }
+    /* Muse Spark's projections to and from the experts' width, under "shexp": the dense
+     * work beside the routed experts (no shared expert there) */
+    for (int i = 0; c->muse && i < c->n_layers; i++) {
+        size_t bd = qdw_bytes(&m->L[i].lat_d), bu = qdw_bytes(&m->L[i].lat_u);
+        if (bd && bu) qt_trunk_offer("shexp", i, bd + bu);
+    }
 }
 /* After qt_init decided: upload what was placed, keep the handles in the
  * Layer. Every matrix falls back on its own, so a failed upload costs one
@@ -5212,12 +5779,15 @@ static int trunk_place_dense(Model *m, double *vram_bytes, int kinds[3]){
             if (l->qth_k) { placed++; kinds[1]++; vram += (double)qdw_bytes(&l->k); }
             if (l->qth_v) { placed++; kinds[1]++; vram += (double)qdw_bytes(&l->v); }
             if (l->qth_o) { placed++; kinds[1]++; vram += (double)qdw_bytes(&l->o); }
+            if (l->ag.O && (l->qth_ag = qdw_place(&l->ag, dev))) { placed++; kinds[1]++; vram += (double)qdw_bytes(&l->ag); }
         }
         int dev = qt_place_of("shexp", i);
         l->qth_shg = qdw_place(&l->sh_g, dev); l->qth_shu = qdw_place(&l->sh_u, dev); l->qth_shd = qdw_place(&l->sh_d, dev);
         if (l->qth_shg) { placed++; kinds[2]++; vram += (double)qdw_bytes(&l->sh_g); }
         if (l->qth_shu) { placed++; kinds[2]++; vram += (double)qdw_bytes(&l->sh_u); }
         if (l->qth_shd) { placed++; kinds[2]++; vram += (double)qdw_bytes(&l->sh_d); }
+        if (l->lat_d.O && (l->qth_ld = qdw_place(&l->lat_d, dev))) { placed++; kinds[2]++; vram += (double)qdw_bytes(&l->lat_d); }
+        if (l->lat_u.O && (l->qth_lu = qdw_place(&l->lat_u, dev))) { placed++; kinds[2]++; vram += (double)qdw_bytes(&l->lat_u); }
     }
     if (vram_bytes) *vram_bytes = vram;
     return placed;
@@ -5300,7 +5870,8 @@ static int layers_forward_control(Model *m, float *x, int S, int pos_base,
             tm_add(S, 0, tm_now()-_t0);
         }
         if (lf) fwrite(tmp + (int64_t)(S-1)*D, sizeof(float), D, lf);   /* sublayer output */
-        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+        if (c->muse) for (int s = 0; s < S; s++) rmsnorm_plain(tmp + (int64_t)s*D, tmp + (int64_t)s*D, D, c->post_eps);
+        q36_residual(x, tmp, l->ra_a, l->ra_b, S, D);
         if (lf) fwrite(x + (int64_t)(S-1)*D, sizeof(float), D, lf);   /* post-deltanet residual */
         if (allow_prefetch && g_pilot >= 1 && S <= 8 && i + 1 < c->n_layers)
             pilot_prefetch(m, i + 1, x, S);
@@ -5308,7 +5879,8 @@ static int layers_forward_control(Model *m, float *x, int S, int pos_base,
         _t0 = tm_now();
         moe(m, l, i, nrm, S, tmp);
         tm_add(S, 2, tm_now()-_t0);
-        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+        if (c->muse) for (int s = 0; s < S; s++) rmsnorm_scaled(tmp + (int64_t)s*D, tmp + (int64_t)s*D, l->post_fn, D, c->post_eps);
+        q36_residual(x, tmp, l->rf_a, l->rf_b, S, D);
         if (lf) fwrite(x + (int64_t)(S-1)*D, sizeof(float), D, lf);
         if (allow_prefetch && g_pilot >= 2 && S <= 8 && i + 2 < c->n_layers)
             pilot_prefetch(m, i + 2, x, S);
@@ -5409,6 +5981,7 @@ static void q36_embed_row(Model *m, int id, int pos, float *row) {
         if (!qem_row(&m->embed_native, id, row, (size_t)D)) { fprintf(stderr, "invalid embedding row for token %d\n", id); exit(1); }
     } else
         memcpy(row, m->embed + (int64_t)id*D, D*sizeof(float));
+    if (m->c.muse && !(vrow >= 0 && vrow < m->vis_rows_n)) rmsnorm_plain(row, row, D, m->c.eps);   /* Muse Spark: the token's row normalised */
 }
 
 #ifdef COLI_CUDA
@@ -5424,7 +5997,7 @@ static int q36_cuda_tier_drafts(Model *m) {
 #ifdef COLI_CUDA
     if (!qt_ready() || !g_cuda_chain || m->dn_dev) return 0;
     for (int i = 0; i < m->c.n_layers; i++)
-        for (int e = 0; e < m->c.n_experts; e++)
+        for (int e = 0; e < m->c.n_experts && !q36_dense_l(&m->c, i); e++)   /* Flint's dense layers hold none */
             if (!qt_is_resident(i, e)) return 0;
     return 1;
 #else
@@ -5563,6 +6136,7 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
             rmsnorm_row(erow, x + (int64_t)p*D, m->final_norm, D, c->eps);
             if (!qt_lmhead_matmul(elog, erow, D, c->vocab))
                 matmul_d(elog, erow, &m->lm_head, 1, D, c->vocab);
+            q36_logits_out(c, elog, c->vocab);
             serve_echo(g_echo_id, pos_base + p + 1, ids[p+1], elog, c->vocab, g_echo_k);
         }
         free(erow); free(elog);
@@ -5581,6 +6155,7 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
         if (!qt_lmhead_matmul(lr, last, D, c->vocab))
             matmul_d(lr, last, &m->lm_head, 1, D, c->vocab);
     }
+    q36_logits_out(c, logit, (int64_t)nlogits * c->vocab);   /* the chain's too */
     if (tm_on()) { tm_add(S, 5, tm_now()-_th); if (S==1) g_tm_dec_tokens++; else g_tm_pre_tokens += S; }
     free(x); free(last);
     if (lf) fclose(lf);
@@ -5691,6 +6266,7 @@ static float *q36_step_rows(Model *m, const Q36Row *rows, const int *ids, int S)
     for (int s = 0; s < S && on_card; s++)
         on_card = qt_lmhead_matmul(logit + (int64_t)s * c->vocab, last + (int64_t)s*D, D, c->vocab);
     if (!on_card) matmul_d(logit, last, &m->lm_head, S, D, c->vocab);
+    q36_logits_out(c, logit, (int64_t)S * c->vocab);
     if (tm_on()) { tm_add(S, 5, tm_now()-_th); g_tm_dec_tokens += S; }
     free(x); free(last);
     return logit;
@@ -6584,8 +7160,13 @@ static int serve_eos_ids(int *ids, int cap){
     int n=0;
     if(getenv("Q36_EOS")){ ids[n++]=atoi(getenv("Q36_EOS")); return n; }
     for(int k=0;k<g_nspecial && n<cap;k++)
-        if(!strcmp(g_sp_str[k],"<|im_end|>")||!strcmp(g_sp_str[k],"<|endoftext|>"))
+        if(!strcmp(g_sp_str[k],"<|im_end|>")||!strcmp(g_sp_str[k],"<|endoftext|>")||
+           !strcmp(g_sp_str[k],"<|eot|>")||!strcmp(g_sp_str[k],"<|end_of_text|>"))   /* Muse Spark's two */
             ids[n++]=g_sp_id[k];
+    for(int k=0;k<g_n_model_eos && n<cap;k++){   /* the model's own (model_eos_add) */
+        int seen=0; for(int e=0;e<n;e++) if(ids[e]==g_model_eos[k]) seen=1;
+        if(!seen) ids[n++]=g_model_eos[k];
+    }
     if(!n) ids[n++]=151645;   /* tokenizer without added_tokens: old default */
     return n;
 }
@@ -6834,7 +7415,7 @@ static void serve_one(Model *m, ServeReq *q){
     if(!q36_serve_start(m,q,&ids,&np,&lo,&clk)) return;
     int gen=0, limited=1, forwards=1;   /* il prefill e' il primo forward */
     const double s_disk=clk.s_disk, s_attn=clk.s_attn, s_moe=clk.s_moe, s_head=clk.s_head;
-    int eos_ids[4]; int n_eos=serve_eos_ids(eos_ids,4);
+    int eos_ids[Q36_MAX_EOS + 4]; int n_eos=serve_eos_ids(eos_ids,Q36_MAX_EOS + 4);
     double t0=clk.t0;
     unsigned char sbuf[16]; int sbn=0;
     Q36Spec spec; q36_spec_begin(m, &spec, ids, np);   /* COLI_LOOKUP=1: drafts, every token still sampled from the exact logits */
@@ -7318,7 +7899,7 @@ static void serve_mux(Model *m){
     Q36Row *rows = malloc((size_t)n * sizeof *rows);
     int *tok = malloc((size_t)n * sizeof(int)), *who = malloc((size_t)n * sizeof(int));
     if (!rq || !rows || !tok || !who) { fprintf(stderr, "[serve] out of memory\n"); exit(1); }
-    int eos_ids[4]; int n_eos = serve_eos_ids(eos_ids, 4);
+    int eos_ids[Q36_MAX_EOS + 4]; int n_eos = serve_eos_ids(eos_ids, Q36_MAX_EOS + 4);
     unsigned long long steps = 0, nrows = 0;
     fprintf(stderr, "[qwen36] serving %d conversations at once (KV_SLOTS)\n", n);
     for (;;) {
@@ -7487,6 +8068,7 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
     #pragma omp parallel for schedule(dynamic, 16)
     for (int gi = 0; gi < cap_total; gi++) {
         int l = gi / m->c.n_experts, eidw = gi % m->c.n_experts;
+        if (q36_dense_l(&m->c, l)) continue;   /* Flint's dense layers carry no experts */
         Slot *e; expert_get(m, l, eidw, &e);
         /* int4: i puntatori impacchettati (o planari); int8: i pesi stessi.
          * Prima qui si esigeva e->g4, che su un container int8 e' NULL: la
@@ -7579,6 +8161,32 @@ static int vk_in_ram(void *ctx, int layer, int e) {
     pthread_mutex_unlock(&g_pilot_mx);
     return r;
 }
+/* The tier's host pool took `bytes` of the RAM the expert cache was sized from (vk_tier.h,
+ * ram_given): fewer slots a layer, top-k at least (COLI_VK_TIER_HOST_GB sizes the pool
+ * instead, and the cache keeps its size). */
+static size_t g_vk_slot_bytes;
+static void vk_ram_given(void *ctx, size_t bytes) {
+    Model *m = ctx;
+    const Cfg *c = &m->c;
+    int L = 0, was = 0, now = 0;
+    for (int i = 0; m->cache && i < c->n_layers; i++) L += m->cache[i].slots != NULL;
+    if (L < 1 || !g_vk_slot_bytes) return;
+    const size_t per = g_vk_slot_bytes * (size_t)L;
+    const int cut = (int)((bytes + per - 1) / per);
+    pthread_mutex_lock(&g_pilot_mx);
+    for (int i = 0; i < c->n_layers; i++) {
+        LCache *lc = &m->cache[i];
+        if (!lc->slots) continue;
+        int cap = lc->cap - cut;
+        if (cap < c->topk) cap = c->topk;
+        if (cap < lc->n) cap = lc->n;   /* slots filled already stay */
+        if (cap > lc->cap) cap = lc->cap;
+        was = lc->cap; now = cap; lc->cap = cap;
+    }
+    pthread_mutex_unlock(&g_pilot_mx);
+    fprintf(stderr, "[VK] qwen36: the tier's host pool took %.1f GiB of the RAM the expert cache was sized from: %d slots a layer, not %d\n",
+            bytes / 1073741824.0, now, was);
+}
 /* After the device, the chain, a qpack container and the CUDA tier are decided, before
  * the expert tier sizes its budget: the dense matrices go up now, so the tier sees them
  * placed. The CUDA tier and a qpack container keep the host copies (the dense part
@@ -7638,7 +8246,7 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
         for (int l = 0; raw && l < L; l++) {
             const GqExp *x = &m->gqx[l];
             int bg = coli_vk_block_elems(100 + x->tg), bd = coli_vk_block_elems(100 + x->td);
-            if (x->tu != x->tg || x->sg || x->su || x->sd || !bg || !bd || c->hidden % bg || c->inter % bd) raw = 0;
+            if (x->tu != x->tg || x->sg || x->su || x->sd || !bg || !bd || q36_eh(c) % bg || c->inter % bd) raw = 0;
             if (x->tg != m->gqx[0].tg || x->td != m->gqx[0].td) mixed = 1;
         }
         for (int l = 0; raw && l < L; l++) {   /* the commonest pair is the tier's main form */
@@ -7670,21 +8278,24 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
     } else {
         gu = (VktFmt){gs ? VKT_SRC_I8_GS : VKT_SRC_I8_ROW, gs}; dn = gu;
     }
-    int64_t ng = (int64_t)c->inter * c->hidden;
-    size_t slot = g_gguf ? (size_t)m->gqe_max
+    int64_t ng = (int64_t)c->inter * q36_eh(c);
+    size_t slot = g_vk_slot_bytes = g_gguf ? (size_t)m->gqe_max
                 : (size_t)(xf_mode(m) ? (2 * ng + ng) / 2 : 3 * ng) +
                   (size_t)(2 * scale_count_gu(c) + scale_count_d(c)) * sizeof(float);
     VktConfig vc = {.engine = "qwen36", .layers = c->n_layers, .experts = c->n_experts,
-                    .hidden = c->hidden, .inter = c->inter, .topk = c->topk,
+                    .hidden = q36_eh(c), .inter = c->inter, .topk = c->topk,
                     .gate_up = gu, .down = dn, .act = VKT_ACT_SWIGLU,
                     .max_rows = QWEN_VK_ROWS * c->topk,
                     .ram_reserve = slot * (size_t)cap * (size_t)c->n_layers,
+                    .ram_floor = slot * (size_t)c->topk * (size_t)c->n_layers, .ram_given = vk_ram_given,
                     .dense_bytes = vk_dense_bytes(m), .stage = g_vk_chain,
                     .in_ram = vk_in_ram, .ram_ctx = m,
                     .load = vk_load, .release = vk_release, .load_ctx = m,
                     .layer_gate_up = lgu, .layer_down = ldn};
     rt_init("qwen36", c->n_layers, c->n_experts);
     rt_drop_row(c->n_layers);   /* no MTP row */
+    for (int i = 0; i < c->n_layers; i++)   /* Flint's dense layers: no experts, no history row */
+        if (c->dense_layer && c->dense_layer[i]) rt_drop_row(i);
     const char *up = getenv("COLI_USAGE");
     if (up && *up) snprintf(g_vk_usage, sizeof g_vk_usage, "%s", up);
     else snprintf(g_vk_usage, sizeof g_vk_usage, "%s/.coli_usage", snap);
@@ -8028,11 +8639,13 @@ int main(int argc, char **argv) {
     int expert_is_int4 = 1, expert_mixed = 0;
     {
         char probe[256];
-        snprintf(probe, sizeof(probe),
-                 "model.layers.%d.mlp.experts.0.merged_weight", m.active_of[0]);
-        st_tensor *pt = g_gguf ? NULL : st_find(&m.S, probe);
+        st_tensor *pt = NULL;
+        for (int l = 0; !g_gguf && !pt && l < m.c.n_layers; l++) {   /* the first layer with experts (Flint's start dense) */
+            snprintf(probe, sizeof(probe), "model.layers.%d.mlp.experts.0.merged_weight", m.active_of[l]);
+            pt = st_find(&m.S, probe);
+        }
         if (g_gguf) expert_is_int4 = 0;
-        int64_t want = 2*(int64_t)m.c.inter*m.c.hidden + (int64_t)m.c.hidden*m.c.inter;
+        int64_t want = 2*(int64_t)m.c.inter*q36_eh(&m.c) + (int64_t)q36_eh(&m.c)*m.c.inter;
         if (pt && pt->nbytes == want) expert_is_int4 = 0;   /* int8: un byte per elemento */
         /* mixed (convert_qwen36.py --down-bits): int4 gate/up + int8 down = 2/3 of int8 */
         if (pt && pt->nbytes == want * 2 / 3) { expert_is_int4 = 0; expert_mixed = 1; }
@@ -8077,6 +8690,12 @@ int main(int argc, char **argv) {
      * tier holds the trunk only and the experts stay the CPU's. */
     int gguf_tier = 0;
 #ifdef COLI_CUDA
+    /* the CUDA chain uploads its own router, DeltaNet b|a and gate rows after the tier sized
+     * its budget: out of the tier's allowance, or the tier fills the card and the chain's
+     * prompt scratch and KV mirror find no room (Muse Spark's f32 router: 496 MiB) */
+    if (q36cc_env_on() && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1') qt_reserve(q36cc_own_bytes(&m));
+#endif
+#ifdef COLI_CUDA
     if (g_gguf && !qq_active() && m.c.n_experts > 0 && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1') {
         const int L = m.c.n_layers;
         int *tg = malloc((size_t)L * sizeof(int)), *td = malloc((size_t)L * sizeof(int));
@@ -8086,10 +8705,10 @@ int main(int argc, char **argv) {
             const GqExp *x = &m.gqx[l];
             ok = x->tg == x->tu && !x->sg && !x->su && !x->sd && cc_moe_block_type(x->tg) && cc_moe_block_type(x->td) &&
                  coli_cuda_block_elems(100 + x->tg) > 0 && coli_cuda_block_elems(100 + x->td) > 0 &&
-                 m.c.hidden % coli_cuda_block_elems(100 + x->tg) == 0 && m.c.inter % coli_cuda_block_elems(100 + x->td) == 0;
+                 q36_eh(&m.c) % coli_cuda_block_elems(100 + x->tg) == 0 && m.c.inter % coli_cuda_block_elems(100 + x->td) == 0;
             if (ok) { tg[l] = x->tg; td[l] = x->td; bg[l] = (size_t)x->eb_g; bdn[l] = (size_t)x->eb_d; }
         }
-        if (ok && qt_init_gguf(L, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk, tg, td, bg, bdn, 0)) gguf_tier = 1;   /* the slots' rows stay */
+        if (ok && qt_init_gguf(L, m.c.n_experts, q36_eh(&m.c), m.c.inter, cap, m.c.topk, tg, td, bg, bdn, 0)) gguf_tier = 1;   /* the slots' rows stay */
         else fprintf(stderr, "[qwen36] COLI_CUDA=1: %s; the routed experts stay on the CPU\n",
                      ok ? "the CUDA expert tier did not start" : "the GGUF's expert types are not all ones the CUDA chain's experts take");
         free(tg); free(td); free(bg); free(bdn);
@@ -8101,11 +8720,12 @@ int main(int argc, char **argv) {
      * dense trunk goes to the devices all the same (-1). Not a GGUF. */
     if (m.c.n_experts > 0 && !g_gguf) qt_source_planar(xf_mode(&m));
     if (gguf_tier || (!qq_active() && !g_gguf && m.c.n_experts > 0 &&
-        qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk,
+        qt_init(m.c.n_layers, m.c.n_experts, q36_eh(&m.c), m.c.inter, cap, m.c.topk,
                 m.c.expert_gs, expert_mixed ? -1 : expert_is_int4))) {
         fprintf(stderr, qt_experts_on() ? "[gpu] MoE experts -> CUDA VRAM tier\n"
                                         : "[gpu] dense trunk -> CUDA (the routed experts stay on the CPU)\n");
         atexit(qt_shutdown);
+        for (int i = 0; i < m.c.n_layers; i++) if (q36_dense_l(&m.c, i)) qt_layer_off(i);   /* Flint's dense layers */
         /* The placer predicted; measure before uploading a byte of trunk. */
         if (!trunk_probe_gpu_wins(&m)) {
             qt_trunk_withdraw("measured slower than the CPU");
@@ -8395,6 +9015,9 @@ static void qwen36_segment_layer_free(Layer *layer) {
     free(layer->in_ln); free(layer->post_ln);
     qw_free(&layer->q); qw_free(&layer->k); qw_free(&layer->v); qw_free(&layer->o);
     free(layer->qn); free(layer->kn); qw_free(&layer->gate); free(layer->gate_bias);
+    qw_free(&layer->ag); qw_free(&layer->lat_d); qw_free(&layer->lat_u);
+    free(layer->ra_a); free(layer->ra_b); free(layer->rf_a); free(layer->rf_b);
+    free(layer->pre_en); free(layer->post_en); free(layer->post_fn);
     qw_free(&layer->sh_g); qw_free(&layer->sh_u); qw_free(&layer->sh_d); free(layer->sh_gate);
     qw_free(&layer->dn_qkv); qw_free(&layer->dn_z); free(layer->dn_b); free(layer->dn_a);
     free(layer->dn_conv); free(layer->dn_dtbias); free(layer->dn_alog);
@@ -8835,7 +9458,9 @@ static int qwen36_edge_engine_open(
     load_tq(&engine->model, "lm_head.weight", config->hidden, config->vocab, 0, "lmhead", &engine->model.lm_head);
     engine->model.final_norm = load_norm_n(
         &engine->model, "model.norm.weight", config->hidden);
-    engine->model.quant_bits = container_layer_is_int4(&engine->model, 0) ? 4 : 8;
+    int probe_layer = 0;   /* the first layer with experts: Flint's first layers are dense */
+    while (probe_layer + 1 < config->n_layers && q36_dense_l(config, probe_layer)) probe_layer++;
+    engine->model.quant_bits = container_layer_is_int4(&engine->model, probe_layer) ? 4 : 8;
     char tokenizer_path[4096];
     snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
              options->model_dir);

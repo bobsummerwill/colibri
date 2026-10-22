@@ -106,9 +106,13 @@ static VkcFit g_v41_fit;
 static int g_v41_fit_done, g_v41_partial;
 static int g_v41_dho_try;   /* the fit runs where the trunk may live on the device only (v41_dho_open) */
 #endif
-#ifndef COLI_VULKAN   /* exclusive RAM/VRAM (vk_tier.h) is the Vulkan build's: no device holds an expert */
-static inline int  vkt_ram_first(int layer, int eid) { (void)layer; (void)eid; return 0; }
-static inline void vkt_ram_gave(void) {}
+#include "xtier.h"   /* the routed-expert tier on Vulkan or CUDA (XT); vk_tier.h's stubs without either */
+#ifdef COLI_CUDA
+#include "backend_cuda.h"
+#include "cu_dense.h"      /* a GGUF's dense matrices on the tier's device, a matrix at a time */
+#include "route_trace.h"   /* the tier's expert history (.coli_usage), kept while it is on */
+static int g_v41_cu = 0;   /* COLI_CUDA=1 and the device opened for the tier (v41_cu_tier_start) */
+static size_t g_v41_cud;   /* the room the dense matrices take there (cud_open) */
 #endif
 
 #define V41_MAX_LAYERS 64
@@ -720,6 +724,21 @@ static int vk_mul(int fmt, const void *data, const uint8_t *tiles, int O, int I,
 }
 #endif
 
+#ifdef COLI_CUDA
+/* A GGUF's dense matrix on the tier's CUDA device (cu_dense.h), found by its blocks' address:
+ * wo_a's groups are views made for each call. Rows strided otherwise than packed stay the
+ * CPU's. 1 = done there. Only mv8's and mvb's callers come here, the dense part: a routed
+ * expert's slot holds one expert and then another, and goes to v41_gx_rows. */
+static int v41_cu_mm(float *y, int ystride, const uint8_t *q, int type, int O, int I,
+                     const float *x, int xstride, int rows) {
+    if (!g_cud.on || (rows > 1 && (xstride != I || ystride != O))) return 0;
+    CudEntry *e = cud_entry(q, 100 + type, O, I);
+    return e && !e->no && cud_mm(&e->h, &e->no, y, x, rows, 100 + type, q, NULL, O, I, 0);
+}
+#define V41_CU(...) if (v41_cu_mm(__VA_ARGS__)) return;
+#else
+#define V41_CU(...)
+#endif
 /* y = W x for `rows` positions, W a GGUF matrix (ggml blocks of held type `type`): the
  * ggml_quants.h kernels, the activations quantized once for every row; x and y strided as
  * mv8_rows takes them. */
@@ -747,7 +766,7 @@ static void v41_gx_rows(float *y, int ystride, const uint8_t *q, int type, int O
  * checkpoint, the attention block was 41% of a turn's wall clock -- more than
  * the expert reads from disk. A scalar byte-at-a-time decode was most of it. */
 static void mv8(float *y, const W8 *w, const float *x) {
-    if (w->gx) { v41_gx_rows(y, w->O, w->q, w->gt, w->O, w->I, x, w->I, 1); return; }
+    if (w->gx) { V41_CU(y, w->O, w->q, w->gt, w->O, w->I, x, w->I, 1) v41_gx_rows(y, w->O, w->q, w->gt, w->O, w->I, x, w->I, 1); return; }
 #ifdef COLI_VULKAN
     if (vk_mul(12, w->q, w->s, w->O, w->I, y, w->O, x, w->I, 1)) return;
     v41_dho_host(w->q);
@@ -800,7 +819,7 @@ static int mv_block_rows(int I) {
 }
 
 static void mv8_rows(float *y, int ystride, const W8 *w, const float *x, int xstride, int rows) {
-    if (w->gx) { v41_gx_rows(y, ystride, w->q, w->gt, w->O, w->I, x, xstride, rows); return; }
+    if (w->gx) { V41_CU(y, ystride, w->q, w->gt, w->O, w->I, x, xstride, rows) v41_gx_rows(y, ystride, w->q, w->gt, w->O, w->I, x, xstride, rows); return; }
 #ifdef COLI_VULKAN
     if (vk_mul(12, w->q, w->s, w->O, w->I, y, ystride, x, xstride, rows)) return;
     v41_dho_host(w->q);
@@ -878,7 +897,7 @@ static void mvb_cpu(float *y, const WB *w, const float *x) {
     }
 }
 static void mvb(float *y, const WB *w, const float *x) {
-    if (w->gx) { v41_gx_rows(y, w->O, w->g, w->gt, w->O, w->I, x, w->I, 1); return; }
+    if (w->gx) { V41_CU(y, w->O, w->g, w->gt, w->O, w->I, x, w->I, 1) v41_gx_rows(y, w->O, w->g, w->gt, w->O, w->I, x, w->I, 1); return; }
 #ifdef COLI_VULKAN
     if (vk_mul(11, w->w, NULL, w->O, w->I, y, w->O, x, w->I, 1)) return;
     v41_dho_host(w->w);
@@ -889,7 +908,7 @@ static void mvb(float *y, const WB *w, const float *x) {
  * per position), the one-position kernel row by row on the CPU, so the CPU bits are
  * mvb's. A prefill site that projected token by token calls this once instead. */
 static void mvb_rows(float *y, int ystride, const WB *w, const float *x, int xstride, int rows) {
-    if (w->gx) { v41_gx_rows(y, ystride, w->g, w->gt, w->O, w->I, x, xstride, rows); return; }
+    if (w->gx) { V41_CU(y, ystride, w->g, w->gt, w->O, w->I, x, xstride, rows) v41_gx_rows(y, ystride, w->g, w->gt, w->O, w->I, x, xstride, rows); return; }
 #ifdef COLI_VULKAN
     if (vk_mul(11, w->w, NULL, w->O, w->I, y, ystride, x, xstride, rows)) return;
     v41_dho_host(w->w);
@@ -906,6 +925,8 @@ typedef struct {
     int fd_w, fd_s;
     int64_t off_w, off_s, rows;
     int inline_scales;   /* a GGUF's table: each row its head_dim e4m3 then its scales, one read */
+    int gt;              /* a published GGUF's table: rows of this ggml type, rb bytes each (-1: e4m3) */
+    int64_t rb;
     /* row cache: open addressing on the row id, LRU by a clock */
     int cap, mask;
     int64_t *key;      /* row id, -1 for empty */
@@ -1020,6 +1041,23 @@ static void engram_table_open(EngramTable *t, shards *S, int layer, int head_dim
     st_tensor *w = st_find(S, name);
     snprintf(name, sizeof(name), "layers.%d.engram.embed.scale", layer);
     st_tensor *s = st_find(S, name);
+    t->gt = -1; t->rb = 0;
+    st_tensor *g = w ? NULL : st_find(S, "engram.embed.weight");
+    if (g && st_is_ggml(g->dtype)) {
+        /* the published deepseek41 GGUFs (per_layer_token_embd): one table of every layer's heads,
+         * its rows a ggml type; the sidecar's offsets index it whole, so each layer opens
+         * all of it */
+        t->gt = st_ggml_type(g->dtype); t->rb = gq_row_bytes(t->gt, head_dim);
+        if (head_dim <= 0 || t->rb <= 0 || t->rb > 4 * head_dim + 64 || g->nbytes % t->rb) {
+            fprintf(stderr, "[engram] the %s table of %lld bytes is not whole rows of %d\n",
+                    gq_type_name(t->gt), (long long)g->nbytes, head_dim);
+            exit(1);
+        }
+        t->fd_w = t->fd_s = g->fd; t->off_w = t->off_s = g->off;
+        t->rows = g->nbytes / t->rb; t->inline_scales = 0;
+        if (g_v41_dry) { v41_used(S, g); cache_rows = 1; }
+        goto cache;
+    }
     t->inline_scales = w && !s;   /* a GGUF (st_gguf.h): the scales at the end of each row */
     if (!w || (!s && !t->inline_scales)) { fprintf(stderr, "[engram] layer %d has no table\n", layer); exit(1); }
     /* SEC: engram_row() reads row `id` at id * head_dim bytes into the table and at
@@ -1052,6 +1090,7 @@ static void engram_table_open(EngramTable *t, shards *S, int layer, int head_dim
         t->rows = w->nbytes / head_dim;
     }
     if (g_v41_dry) { v41_used(S, w); v41_used(S, s); cache_rows = 1; }
+cache:;
     int cap = 1;
     while (cap < cache_rows) cap <<= 1;
     t->cap = cap; t->mask = cap - 1;
@@ -1088,9 +1127,17 @@ static const float *engram_row(EngramTable *t, int64_t id, int head_dim) {
 fill:
     t->misses++;
     {
-        uint8_t row[512 + 64], *bytes = row, *scales = row + 512;
+        uint8_t row[2048 + 128], *bytes = row, *scales = row + 512;
         if (head_dim > 512 || groups > 64) {
             fprintf(stderr, "[engram] head_dim %d exceeds the row buffer\n", head_dim); exit(1); }
+        if (t->gt >= 0) {   /* a ggml row (the open checked rb against the buffer) */
+            float *out = t->value + (size_t)victim * head_dim;
+            st_pread_full(t->fd_w, row, (size_t)t->rb, t->off_w + id * t->rb, "engram row");
+            if (gq_dequant_row(t->gt, row, out, head_dim)) {
+                fprintf(stderr, "[engram] no row reader for ggml type %s\n", gq_type_name(t->gt)); exit(1); }
+            t->key[victim] = id; t->used[victim] = ++t->clock;
+            return out;
+        }
         if (t->inline_scales) {
             st_pread_full(t->fd_w, row, head_dim + groups, t->off_w + id * (head_dim + groups), "engram row");
             scales = row + head_dim;
@@ -1273,10 +1320,12 @@ typedef struct {
      * routed experts, typed by layer: [layer * 3 + k] for k = w1, w3, w2, the file's type, the
      * slots' (gx_h: interleaved by 16 rows where the type has that form, -1 for MXFP4 laid out
      * as the checkpoint's FP4 and scales) and the file's bytes of one matrix. The slots are
-     * sized for the largest layer's (gx_part, the six parts of Slot). */
-    int gguf, gx;
+     * sized for the largest layer's (gx_part, the six parts of Slot). gx_spec: the DSpark
+     * stages' experts are too (the head's own GGUF), at [(n_layers + stage) * 3 + k], their
+     * slots sized for the largest stage's (gx_spec_part), apart from the backbone's. */
+    int gguf, gx, gx_spec;
     int *gx_t, *gx_h;
-    int64_t *gx_len, gx_part[V41_EXPERT_TENSORS];
+    int64_t *gx_len, gx_part[V41_EXPERT_TENSORS], gx_spec_part[V41_EXPERT_TENSORS];
     WB embed, head;
     WF norm;
     LCache *cache;
@@ -1659,11 +1708,21 @@ static int64_t expert_part_bytes(const Cfg *c, int part) {
 static int64_t slot_part_bytes(const Model *m, int part) {
     return m->gx ? m->gx_part[part] : expert_part_bytes(&m->c, part);
 }
+/* A DSpark stage's slot: the checkpoint's, or the head GGUF's largest stage's. */
+static int64_t stage_part_bytes(const Model *m, int part) {
+    return m->gx_spec ? m->gx_spec_part[part] : expert_part_bytes(&m->c, part);
+}
+/* The index of a kind's layer in the GGUF expert forms (gx_t, gx_h, gx_len), -1 when its
+ * experts are the checkpoint's: the backbone's layers, then the DSpark stages. */
+static int v41_gx_index(const Model *m, const char *kind, int layer) {
+    if (!strcmp(kind, "layers")) return m->gx ? layer : -1;
+    return m->gx_spec ? m->c.n_layers + layer : -1;
+}
 /* 1 when a GGUF layer's slots hold a matrix in another form than the file's (interleaved by
  * 16 rows, or MXFP4 as FP4 and scales): it is read through a copy, and the Vulkan tier reads
  * the file's rows back. */
 static int v41_gx_conv(const Model *m, int layer, int k) {
-    return m->gx && m->gx_h[3 * layer + k] != m->gx_t[3 * layer + k];
+    return (layer < m->c.n_layers ? m->gx : m->gx_spec) && m->gx_h[3 * layer + k] != m->gx_t[3 * layer + k];
 }
 static void v41_gx_shape(const Cfg *c, int k, int64_t *out) {   /* rows, columns of w1, w3, w2 */
     out[0] = k == 2 ? c->dim : c->moe_inter; out[1] = k == 2 ? c->moe_inter : c->dim;
@@ -1675,19 +1734,23 @@ static void v41_gx_geometry(Model *m) {
     static const char *const k3[3] = {"w1", "w3", "w2"};
     const st_tensor *t = st_find(&m->S, "layers.0.ffn.experts.0.w1.weight");
     m->gx = t && st_ggml_type_any(t->dtype) >= 0;
-    if (!m->gx) return;
-    const int L = c->n_layers;
-    m->gx_t = xmalloc((size_t)L * 3 * sizeof(int), "gguf expert types");
-    m->gx_h = xmalloc((size_t)L * 3 * sizeof(int), "gguf expert forms");
-    m->gx_len = xmalloc((size_t)L * 3 * sizeof(int64_t), "gguf expert bytes");
+    t = c->n_mtp > 0 ? st_find(&m->S, "mtp.0.ffn.experts.0.w1.weight") : NULL;
+    m->gx_spec = t && st_ggml_type_any(t->dtype) >= 0;
+    if (!m->gx && !m->gx_spec) return;
+    const int L = c->n_layers, all = L + (m->gx_spec ? c->n_mtp : 0);
+    m->gx_t = xmalloc((size_t)all * 3 * sizeof(int), "gguf expert types");
+    m->gx_h = xmalloc((size_t)all * 3 * sizeof(int), "gguf expert forms");
+    m->gx_len = xmalloc((size_t)all * 3 * sizeof(int64_t), "gguf expert bytes");
     memset(m->gx_part, 0, sizeof m->gx_part);
+    memset(m->gx_spec_part, 0, sizeof m->gx_spec_part);
     int ilv = 0, mx = 0;
-    for (int i = 0; i < L; i++)
+    for (int i = m->gx ? 0 : L; i < all; i++)
         for (int k = 0; k < 3; k++) {
             char name[160];
             int64_t shape[2];
+            const int stage = i >= L;   /* a DSpark stage's, from the head's GGUF */
             v41_gx_shape(c, k, shape);
-            snprintf(name, sizeof name, "layers.%d.ffn.experts.0.%s.weight", i, k3[k]);
+            snprintf(name, sizeof name, "%s.%d.ffn.experts.0.%s.weight", stage ? "mtp" : "layers", stage ? i - L : i, k3[k]);
             t = st_find(&m->S, name);
             const int type = t ? st_ggml_type_any(t->dtype) : -1;
             const int64_t rb = type >= 0 ? gq_row_bytes(type, shape[1]) : -1;
@@ -1696,28 +1759,34 @@ static void v41_gx_geometry(Model *m) {
                         (long long)shape[0], (long long)shape[1]); exit(1); }
             int held = type;
             int64_t w = t->nbytes, sc = 0;
-            if (type == GQ_MXFP4) { held = -1; w = shape[0] * shape[1] / 2; sc = shape[0] * shape[1] / 32; mx++; }
+            if (type == GQ_MXFP4) { held = -1; w = shape[0] * shape[1] / 2; sc = shape[0] * shape[1] / 32; mx += !stage; }
             else {
                 held = coli_ggml_held_type(type, shape[0], shape[1], "V41_ILV16");
                 w = gq_row_bytes(held, shape[1]) * shape[0];
-                ilv += held != type;
+                ilv += !stage && held != type;
             }
             m->gx_t[3 * i + k] = type; m->gx_h[3 * i + k] = held; m->gx_len[3 * i + k] = t->nbytes;
-            for (int e = 0; g_v41_dry && e < c->n_routed; e++) {   /* every expert, as a read would refuse it */
-                snprintf(name, sizeof name, "layers.%d.ffn.experts.%d.%s.weight", i, e, k3[k]);
+            for (int e = 0; g_v41_dry && e < (stage ? c->spec_routed : c->n_routed); e++) {   /* every expert, as a read would refuse it */
+                snprintf(name, sizeof name, "%s.%d.ffn.experts.%d.%s.weight", stage ? "mtp" : "layers", stage ? i - L : i, e, k3[k]);
                 const st_tensor *x = st_find(&m->S, name);
                 if (!x || x->dtype != t->dtype || x->nbytes != t->nbytes) {
                     fprintf(stderr, "%s: missing, or not the type and bytes of the layer's expert 0\n", name); exit(1); }
                 v41_used(&m->S, x);
             }
-            if (w > m->gx_part[2 * k]) m->gx_part[2 * k] = w;
-            if (sc > m->gx_part[2 * k + 1]) m->gx_part[2 * k + 1] = sc;
+            int64_t *part = stage ? m->gx_spec_part : m->gx_part;
+            if (w > part[2 * k]) part[2 * k] = w;
+            if (sc > part[2 * k + 1]) part[2 * k + 1] = sc;
         }
-    fprintf(stderr, "[v41] GGUF experts: %s gate/up, %s down (layer 0)", gq_type_name(m->gx_t[0]),
-            gq_type_name(m->gx_t[2]));
-    if (mx) fprintf(stderr, "; MXFP4 as the checkpoint's FP4");
-    if (ilv) fprintf(stderr, "; %d of %d matrices interleaved by 16 rows (V41_ILV16=0: the file's rows)", ilv, 3 * L);
-    fprintf(stderr, "\n");
+    if (m->gx) {
+        fprintf(stderr, "[v41] GGUF experts: %s gate/up, %s down (layer 0)", gq_type_name(m->gx_t[0]),
+                gq_type_name(m->gx_t[2]));
+        if (mx) fprintf(stderr, "; MXFP4 as the checkpoint's FP4");
+        if (ilv) fprintf(stderr, "; %d of %d matrices interleaved by 16 rows (V41_ILV16=0: the file's rows)", ilv, 3 * L);
+        fprintf(stderr, "\n");
+    }
+    if (m->gx_spec)
+        fprintf(stderr, "[v41] the DSpark head's GGUF experts: %s gate/up, %s down%s\n", gq_type_name(m->gx_t[3 * L]),
+                gq_type_name(m->gx_t[3 * L + 2]), m->gx_t[3 * L] == GQ_MXFP4 ? ", as the checkpoint's FP4" : "");
 }
 
 /* Fill in the six reads that make up one expert. Naming them into a list instead
@@ -1733,7 +1802,7 @@ static int expert_read_list(Model *m, const char *kind, int layer, int eid, Slot
     static const char *const leaf[2] = { "weight", "scale" };
     char name[160];
     int n = 0;
-    const int gx = m->gx && !strcmp(kind, "layers");   /* a GGUF's: the three matrices, no scales */
+    const int gi = v41_gx_index(m, kind, layer), gx = gi >= 0;   /* a GGUF's: the three matrices, no scales */
     for (int i = 0; i < 3; i++) {
         for (int f = 0; f < 2 - gx; f++) {
             snprintf(name, sizeof(name), "%s.%d.ffn.experts.%d.%s.%s",
@@ -1744,7 +1813,7 @@ static int expert_read_list(Model *m, const char *kind, int layer, int eid, Slot
             out[n].slot = s;
             out[n].part = f ? part[i].scale_part : part[i].weight_part;
             out[n].rep = rep;
-            out[n].gx_layer = gx ? layer : -1;
+            out[n].gx_layer = gi;
             n++;
         }
     }
@@ -1887,10 +1956,10 @@ static void expert_fetch(Model *m, const char *kind, int layer,
     }
     m->expert_bytes += bytes;
     m->t_disk += now_s() - started;
-    const int gx = m->gx && !strcmp(kind, "layers");
+    const int gi = v41_gx_index(m, kind, layer);
     for (int i = 0; i < n; i++) {
         slot[i]->eid = eid[i];
-        for (int k = 0; k < 3; k++) slot[i]->gt[k] = gx ? m->gx_h[3 * layer + k] : -1;
+        for (int k = 0; k < 3; k++) slot[i]->gt[k] = gi >= 0 ? m->gx_h[3 * gi + k] : -1;
     }
     free(list);
 }
@@ -1939,9 +2008,9 @@ static int v41_victim(const Model *m, const LCache *cache, const char *kind, int
     for (int i = 1; i < cache->n; i++)
         if (cache->slot[i].used < cache->slot[oldest].used) oldest = i;
     for (int i = 0; i < cache->n; i++)
-        if (cache->slot[i].eid >= 0 && vkt_ram_first(tl, cache->slot[i].eid) &&
+        if (cache->slot[i].eid >= 0 && XT(ram_first)(tl, cache->slot[i].eid) &&
             (dev < 0 || cache->slot[i].used < cache->slot[dev].used)) dev = i;
-    if (dev >= 0) { vkt_ram_gave(); return dev; }
+    if (dev >= 0) { XT(ram_gave)(); return dev; }
     return oldest;
 }
 static Slot *expert_slot_at(Model *m, LCache *cache, const char *kind, int layer, int eid) {
@@ -2032,7 +2101,7 @@ static void spec_load(Model *m, int ecap);
 
 /* One layer's expert cache. The DSpark stages route over their own, smaller expert set
  * but the experts themselves are the same shape, so the slots are too. */
-static void cache_init(Model *m, LCache *cache, int ecap) {
+static void cache_init(Model *m, LCache *cache, int ecap, int stage) {
     cache->cap = ecap; cache->n = 0;
     cache->slot = xmalloc((size_t)ecap * sizeof(Slot), "expert slots");
     for (int k = 0; k < ecap; k++) {
@@ -2045,7 +2114,7 @@ static void cache_init(Model *m, LCache *cache, int ecap) {
          * scratch buffer and copying it again (see the expert reader). */
         s->gt[0] = s->gt[1] = s->gt[2] = -1; s->vk_rows = NULL;
         for (int part = 0; part < V41_EXPERT_TENSORS; part++) {
-            size_t bytes = (size_t)slot_part_bytes(m, part) + ST_DIRECT_ALIGN;
+            size_t bytes = (size_t)(stage ? stage_part_bytes(m, part) : slot_part_bytes(m, part)) + ST_DIRECT_ALIGN;
             void *window = NULL;
             if (posix_memalign(&window, ST_DIRECT_ALIGN, bytes) != 0) {
                 fprintf(stderr, "OOM allocating expert window (%zu bytes)\n", bytes);
@@ -2352,8 +2421,18 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
             engram_table_open(&e->table[t], &m->S, layer, e->head_dim, engram_cache_rows);
             wf_load(&m->S, &m->L[layer].eng_q, NAME("layers.%d.engram.q_weight", layer),
                     (int64_t)hc * dim);
-            wf_load(&m->S, &m->L[layer].eng_k, NAME("layers.%d.engram.k_weight", layer),
-                    (int64_t)hc * dim);
+            /* the published deepseek41 GGUFs keep q_weight * k_weight as one (engram_gate, also named
+             * engram.gate here): the gate reads them only as that product, so k is ones there */
+            st_tensor *gate = st_find(&m->S, NAME("layers.%d.engram.gate", layer));
+            if (st_find(&m->S, NAME("layers.%d.engram.k_weight", layer)) || !gate)
+                wf_load(&m->S, &m->L[layer].eng_k, NAME("layers.%d.engram.k_weight", layer),
+                        (int64_t)hc * dim);
+            else {
+                WF *k = &m->L[layer].eng_k;
+                if (g_v41_dry) v41_used(&m->S, gate);   /* read as q_weight */
+                k->n = (int64_t)hc * dim; k->w = xmalloc((size_t)k->n * sizeof(float), "engram k ones");
+                for (int64_t i = 0; i < k->n; i++) k->w[i] = 1.0f;
+            }
         }
     }
 #ifdef COLI_VULKAN
@@ -2366,7 +2445,7 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
     m->cache = xmalloc((size_t)c->n_layers * sizeof(LCache), "expert caches");
     for (int i = 0; i < c->n_layers; i++) {
         if (g_v41_dry) { memset(&m->cache[i], 0, sizeof(LCache)); continue; }   /* nothing is read */
-        cache_init(m, &m->cache[i], ecap);
+        cache_init(m, &m->cache[i], ecap, 0);
     }
     spec_load(m, ecap);
     if (c->vision_layers > 0) {
@@ -3035,16 +3114,16 @@ static void moe_gate(Model *m, Layer *l, int E, int topk, float *scores,
  * stay a plausible working set for the cache. */
 #define MOE_ROW_CHUNK 32
 
-#ifdef COLI_VULKAN
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
 /* ---- the Vulkan routed-expert tier (vk_tier.c) ---------------------------------
  * One block of positions of a backbone layer with the tier on. The block's resident
- * experts go to the device as one batch (vkt_issue) while the CPU computes the other
+ * experts go to the device as one batch (XT(issue)) while the CPU computes the other
  * draws expert-major, as moe_run_at does, and the shared expert into a buffer of its
  * own; then every rank of every position joins the output in rank order, the
  * device's rows and the CPU's alike (w x row, then the add), and the shared expert
  * after them, as moe_run_at adds them. So the order of the sum never depends on
  * which experts were resident. Every expert the CPU computed passes its slot to the
- * tier (vkt_note), which may promote it. The DSpark stages ("mtp"), with caches of
+ * tier (XT(note)), which may promote it. The DSpark stages ("mtp"), with caches of
  * their own, are the tier's extra layers n_layers + stage when it took them
  * (COLI_VK_TIER_MTP). */
 static char g_vk_usage[2100];   /* the tier's history (vk_tier_start); empty = none */
@@ -3086,7 +3165,7 @@ static void moe_vk_cpu(Model *m, LCache *cache, const char *kind, int layer, int
                        const int *chosen, const float *weights, const uint8_t *want, float *contrib) {
     Cfg *c = &m->c;
     int dim = c->dim, draws = rows * topk;
-    /* a block of up to MOE_ROW_CHUNK rows, or a streamed prompt chunk (vkt_step_rows) */
+    /* a block of up to MOE_ROW_CHUNK rows, or a streamed prompt chunk (XT(step_rows)) */
     int *uniq = xmalloc((size_t)draws * 5 * sizeof(int), "expert union");
     int *head = uniq + draws, *tail = head + draws, *count = tail + draws, *next = count + draws;
     int n_uniq = 0;
@@ -3122,9 +3201,9 @@ static void moe_vk_cpu(Model *m, LCache *cache, const char *kind, int layer, int
             }
             m->hits += (uint64_t)(cnt - 1);
             const int tl = v41_tier_layer(m, kind, layer);
-            if (!vk_slot_ilv(slot[u]) || vkt_wants(tl, uniq[u0 + u])) {   /* converted only for the tier to take */
+            if (!vk_slot_ilv(slot[u]) || XT(wants)(tl, uniq[u0 + u])) {   /* converted only for the tier to take */
                 VktExpertSrc src = vk_slot_src(m, slot[u]);
-                vkt_note(tl, uniq[u0 + u], &src);
+                XT(note)(tl, uniq[u0 + u], &src);
                 vk_drop_rows(slot[u]);
             }
         }
@@ -3140,13 +3219,13 @@ static void moe_vk_block(Model *m, Layer *l, LCache *cache, const char *kind, in
     uint8_t *taken = xmalloc((size_t)draws * 2, "device draws"), *want = taken + draws;
     const float **dev = xmalloc((size_t)draws * sizeof(*dev), "device rows");
     for (int r = 0; backbone && r < rows; r++) rt_count(layer, chosen + r * topk, topk);
-    int ndev = vkt_issue(v41_tier_layer(m, kind, layer), xc, rows, topk, chosen, taken);
+    int ndev = XT(issue)(v41_tier_layer(m, kind, layer), xc, rows, topk, chosen, taken);
     for (int d = 0; d < draws; d++) { want[d] = !taken[d]; if (taken[d] && backbone) ehit_mark(m, layer, chosen[d]); }
     float *contrib = xmalloc((size_t)draws * dim * sizeof(float), "expert contributions");
     float *shared = xmalloc((size_t)rows * dim * sizeof(float), "shared expert");
     moe_vk_cpu(m, cache, kind, layer, topk, xc, rows, chosen, weights, want, contrib);
     if (with_shared) shared_ffn_down(m, l, xc, rows, shared);
-    if (ndev && !vkt_join(dev)) {   /* the batch failed (the tier stops): those draws here */
+    if (ndev && !XT(join)(dev)) {   /* the batch failed (the tier stops): those draws here */
         moe_vk_cpu(m, cache, kind, layer, topk, xc, rows, chosen, weights, taken, contrib);
         memset(taken, 0, (size_t)draws);
     }
@@ -3374,7 +3453,7 @@ static int cluster_worker_run(const char *snap, int port) {
     }
     m.ecap = ecap;
     m.cache = xmalloc((size_t)nr_layers * sizeof(LCache), "expert caches");
-    for (int i = 0; i < nr_layers; i++) cache_init(&m, &m.cache[i], ecap);
+    for (int i = 0; i < nr_layers; i++) cache_init(&m, &m.cache[i], ecap, 0);
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { perror("cluster worker socket"); return 1; }
     int yes = 1; setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
@@ -3463,10 +3542,10 @@ static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int 
     int dim = c->dim;
     if (topk > MOE_TOPK_MAX) {
         fprintf(stderr, "[moe] n_activated %d exceeds the scratch\n", topk); exit(1); }
-#ifdef COLI_VULKAN
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
     /* the tier streams a prompt chunk's cold experts: the whole step in one block, so
      * each expert's rows meet in one GEMM (moe_vk_block's arrays follow its size) */
-    if (vkt_ready() && !strcmp(kind, "layers") && vkt_step_rows(n, MOE_ROW_CHUNK) > MOE_ROW_CHUNK) {
+    if (XT(ready)() && !strcmp(kind, "layers") && XT(step_rows)(n, MOE_ROW_CHUNK) > MOE_ROW_CHUNK) {
         int *chosen = xmalloc((size_t)n * topk * sizeof(int), "routing");
         float *weights = xmalloc((size_t)n * topk * sizeof(float), "routing weights");
         float *scores = xmalloc((size_t)n * E * sizeof(float), "gate scores");
@@ -3492,8 +3571,8 @@ static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int 
             moe_gate(m, l, E, topk, scores + (size_t)r * E,
                      chosen + r * topk, weights + r * topk);
         free(scores);
-#ifdef COLI_VULKAN
-        if (vkt_ready() && v41_tier_layer(m, kind, layer) < vkt_layers()) {   /* the backbone, a stage the tier took */
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+        if (XT(ready)() && v41_tier_layer(m, kind, layer) < XT(layers)()) {   /* the backbone, a stage the tier took */
             moe_vk_block(m, l, cache, kind, layer, topk, xc, rows, outc, chosen, weights, with_shared);
             continue;
         }
@@ -3963,8 +4042,8 @@ static void spec_load(Model *m, int ecap) {
         fprintf(stderr, "[v41] no DSpark head in this checkpoint: drafts off\n");
         return;
     }
-    if (m->gx) {   /* the stages' slots would be a GGUF layer's (cache_init) */
-        fprintf(stderr, "[v41] a GGUF's DSpark head is not read yet: drafts off\n");
+    if (m->gguf && !m->gx_spec) {   /* a GGUF's stages read as the head's GGUF has them (gx_spec) */
+        fprintf(stderr, "[v41] the DSpark head's experts are not a ggml type: drafts off\n");
         return;
     }
     int dim = c->dim, hd = c->head_dim, nh = c->n_heads, hc = c->hc_mult;
@@ -4003,7 +4082,7 @@ static void spec_load(Model *m, int ecap) {
         memset(l->window, 0, (size_t)c->window * hd * sizeof(float));
         l->window_pos = xmalloc((size_t)c->window * sizeof(int), "DSpark window positions");
         for (int k = 0; k < c->window; k++) l->window_pos[k] = -1;
-        cache_init(m, &sp->cache[i], ecap);
+        cache_init(m, &sp->cache[i], ecap, 1);
     }
     w8_load(&m->S, &sp->main_proj, "mtp.0.main_proj.weight", dim, dim * c->n_spec_targets);
     wf_load(&m->S, &sp->main_norm, "mtp.0.main_norm.weight", dim);
@@ -4938,8 +5017,8 @@ static void serve_emap(Model *m) {
             int resident = 0;
             for (int k = 0; k < cache->n; k++) if (cache->slot[k].eid == e) { resident = 1; break; }
             int byte = resident << 6;    /* tier in bits 6-7; no usage counter here, heat 0 */
-#ifdef COLI_VULKAN
-            if (vkt_resident(i, e)) byte = 2 << 6;   /* on the Vulkan device */
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+            if (XT(resident)(i, e)) byte = 2 << 6;   /* on the Vulkan device */
 #endif
             hex[w++] = "0123456789abcdef"[byte >> 4];
             hex[w++] = "0123456789abcdef"[byte & 15];
@@ -5519,8 +5598,10 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
         serve_line("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu\n", wall, n_prompt, emitted,
                    m->t_disk - disk0, 0.0, m->t_expert - expert0, m->t_attn - attn0,
                    m->t_engram - engram0, (unsigned long long)(m->forwards - forwards0));
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+        if (XT(ready)()) { XT(report)("turn", turn_hits, turn_miss); vk_tier_save(); }
+#endif
 #ifdef COLI_VULKAN
-        if (vkt_ready()) { vkt_report("turn", turn_hits, turn_miss); vk_tier_save(); }
         v41c_report();   /* the dense chain's line, when it ran */
 #endif
         serve_hits(m);
@@ -5545,6 +5626,9 @@ static int *load_ids(jval *root, const char *key, int *count) {
  * coli_vk_matmul_calls() counts only calls that completed there, so a path that
  * initialised and never ran cannot pass for one that did. */
 static void vk_report(void) {
+#ifdef COLI_CUDA
+    if (g_v41_cu) cud_report("deepseek_v41");
+#endif
 #ifdef COLI_VULKAN
     if (!g_vk_ready) return;
     size_t bytes = 0, tensors = 0;
@@ -5555,13 +5639,14 @@ static void vk_report(void) {
 #endif
 }
 
-#ifdef COLI_VULKAN
-/* ---- the Vulkan routed-expert tier: start ----------------------------------------
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+/* ---- the routed-expert tier: start (Vulkan, or CUDA: cu_tier.h) ---------------------------
  * After the weights and the device. The experts sit in the slots as the checkpoint
  * stores them, fp4 with a ue8m0 scale per 32 inputs (MXFP4_E8M0, fmt 7 on the
  * device); the activation is the clamped SwiGLU. The history (.coli_usage, beside
  * the container or COLI_USAGE) is kept only while the tier is on; it gives the warm
  * start, read straight from the container in parallel. */
+#ifdef COLI_VULKAN
 static int vk_placed(const void *data) {   /* on the device already (the dense weights on the device only) */
     if (!g_v41_dho) return 0;
     V41Home *h = v41_home_of(data);
@@ -5586,6 +5671,60 @@ static size_t vk_dense_bytes(Model *m) {
     }
     return b;
 }
+#endif
+/* the device the tier runs on: open, a block type's elements there, the dense part it still
+ * takes, whether it shares the RAM (the CUDA tier's engine keeps the dense part on the CPU) */
+static int v41_tier_dev(void) {
+#ifdef COLI_CUDA
+    if (xt_cuda()) return g_v41_cu;
+#endif
+#ifdef COLI_VULKAN
+    return g_vk_ready;
+#else
+    return 0;
+#endif
+}
+static int v41_tier_block_elems(int fmt) {
+#ifdef COLI_CUDA
+    if (xt_cuda()) return coli_cuda_block_elems(fmt);
+#endif
+#ifdef COLI_VULKAN
+    return coli_vk_block_elems(fmt);
+#else
+    (void)fmt; return 0;
+#endif
+}
+#ifdef COLI_CUDA
+/* a GGUF's dense matrices as the CUDA device would hold them (cu_dense.h): the head and the layers' */
+static size_t v41_cu_w8(const W8 *w) { return w->gx ? cud_bytes(100 + w->gt, w->O, w->I, 0) : 0; }
+static size_t v41_cu_wb(const WB *w) { return w->gx ? cud_bytes(100 + w->gt, w->O, w->I, 0) : 0; }
+static size_t v41_cu_dense_bytes(const Model *m) {
+    size_t b = v41_cu_wb(&m->head);
+    for (int i = 0; i < m->c.n_layers; i++) {
+        const Layer *l = &m->L[i];
+        b += v41_cu_w8(&l->wq_a) + v41_cu_w8(&l->wq_b) + v41_cu_w8(&l->wkv) + v41_cu_w8(&l->wo_a) +
+             v41_cu_w8(&l->wo_b) + v41_cu_w8(&l->idx_wq_b) + v41_cu_w8(&l->sh_w1) + v41_cu_w8(&l->sh_w3) +
+             v41_cu_w8(&l->sh_w2) + v41_cu_w8(&l->eng_wkv) + v41_cu_wb(&l->comp_wkv) + v41_cu_wb(&l->comp_wgate) +
+             v41_cu_wb(&l->idx_wk) + v41_cu_wb(&l->idx_wproj) + v41_cu_wb(&l->gate_w);
+    }
+    return b;
+}
+#endif
+static size_t v41_tier_dense_bytes(Model *m) {
+#ifdef COLI_CUDA
+    if (xt_cuda()) return g_v41_cud;
+#endif
+#ifdef COLI_VULKAN
+    if (!xt_cuda()) return vk_dense_bytes(m);
+#endif
+    (void)m; return 0;
+}
+static int v41_tier_shares_ram(void) {
+#ifdef COLI_VULKAN
+    if (!xt_cuda()) return coli_vk_device_shares_ram();
+#endif
+    return 0;
+}
 /* Is the expert in this layer's slots now (the tier's balance asks)? */
 static int vk_in_ram(void *ctx, int layer, int e) {
     Model *m = ctx;
@@ -5593,6 +5732,34 @@ static int vk_in_ram(void *ctx, int layer, int e) {
     LCache *cache = layer < m->c.n_layers ? &m->cache[layer] : &m->spec.cache[layer - m->c.n_layers];   /* a DSpark stage's */
     for (int i = 0; i < cache->n; i++) if (cache->slot[i].eid == e) return 1;
     return 0;
+}
+/* The tier's host pool took `bytes` of the RAM the expert cache was sized from (vk_tier.h,
+ * ram_given): fewer slots a layer, top-k at least (COLI_VK_TIER_HOST_GB sizes the pool
+ * instead, and the cache keeps its size); the windows of the slots past it go. */
+static size_t g_v41_vk_slot_bytes;
+static void vk_ram_given(void *ctx, size_t bytes) {
+    Model *m = ctx;
+    const Cfg *c = &m->c;
+    int L = 0, was = 0, now = 0;
+    for (int i = 0; m->cache && i < c->n_layers; i++) L += m->cache[i].slot != NULL;
+    if (L < 1 || !g_v41_vk_slot_bytes) return;
+    const size_t per = g_v41_vk_slot_bytes * (size_t)L;
+    const int cut = (int)((bytes + per - 1) / per);
+    for (int i = 0; i < c->n_layers; i++) {
+        LCache *lc = &m->cache[i];
+        if (!lc->slot) continue;
+        int cap = lc->cap - cut;
+        if (cap < c->n_activated) cap = c->n_activated;
+        if (cap < lc->n) cap = lc->n;   /* slots filled already stay */
+        if (cap > lc->cap) cap = lc->cap;
+        for (int k = cap; k < lc->cap; k++)   /* never read: their windows back */
+            for (int part = 0; part < V41_EXPERT_TENSORS; part++) {
+                free(lc->slot[k].base[part]); lc->slot[k].base[part] = NULL; *slot_part(&lc->slot[k], part) = NULL;
+            }
+        was = lc->cap; now = cap; lc->cap = cap;
+    }
+    fprintf(stderr, "%s deepseek_v41: the tier's host pool took %.1f GiB of the RAM the expert cache was sized from: %d slots a layer, not %d\n", XT_TAG,
+            bytes / 1073741824.0, now, was);
 }
 /* A GGUF's experts on the tier as the file has them (shaders/blockdec.glsl), the forms by
  * layer as published files mix them; MXFP4 ones as the checkpoint's FP4 the slots hold. Gate
@@ -5611,7 +5778,7 @@ static int v41_vk_gguf_forms(const Model *m, VktFmt *gu, VktFmt *dn, VktFmt **lg
         for (int k = 0; k < 3 && !no; k += 2) {
             VktFmt *to = k ? &ldn[l] : &lgu[l];
             if (t[k] == GQ_MXFP4) { *to = f; continue; }
-            const int be = coli_vk_block_elems(100 + t[k]);
+            const int be = v41_tier_block_elems(100 + t[k]);
             if (!be || (k ? c->moe_inter : c->dim) % be) no = "a type without a device form";
             *to = (VktFmt){(VktSrc)(VKT_SRC_GGML + t[k]), 0};
         }
@@ -5629,12 +5796,12 @@ static int v41_vk_gguf_forms(const Model *m, VktFmt *gu, VktFmt *dn, VktFmt **lg
     }
     if (!no && forms > VKT_FORMS - 1) no = "more distinct types than the tier holds";
     if (no) {
-        fprintf(stderr, "[VK] tier deepseek_v41: the GGUF's experts: %s; the tier stays off\n", no);
+        fprintf(stderr, "%s tier deepseek_v41: the GGUF's experts: %s; the tier stays off\n", XT_TAG, no);
         free(lgu); free(ldn);
         return 0;
     }
     *gu = lgu[best]; *dn = ldn[best];
-    fprintf(stderr, "[VK] tier deepseek_v41: the GGUF experts' blocks go to the device as the file has them (%s gate/up, %s down",
+    fprintf(stderr, "%s tier deepseek_v41: the GGUF experts' blocks go to the device as the file has them (%s gate/up, %s down", XT_TAG,
             gq_type_name(m->gx_t[3 * best]), gq_type_name(m->gx_t[3 * best + 2]));
     if (forms > 1) fprintf(stderr, " on %d of %d layers, the others their own types", bestn, L);
     fprintf(stderr, ")\n");
@@ -5671,18 +5838,19 @@ static int v41_gx_expert_rows(Model *m, int layer, int eid, uint8_t **buf, VktEx
 }
 static void vk_tier_start(Model *m, const char *snap, int cap) {
     Cfg *c = &m->c;
-    if (!g_vk_ready || c->n_routed < 1 || !vkt_wanted()) return;
+    if (!v41_tier_dev() || c->n_routed < 1 || !XT(wanted)()) return;
     VktFmt f = {VKT_SRC_MXFP4_E8M0, 32}, gu = f, dn = f;
     VktFmt *lgu = NULL, *ldn = NULL;   /* a GGUF's forms by layer, when they differ */
     if (m->gx && !v41_vk_gguf_forms(m, &gu, &dn, &lgu, &ldn)) return;
     size_t expert = 0;
     for (int part = 0; part < V41_EXPERT_TENSORS; part++) expert += (size_t)slot_part_bytes(m, part);
+    g_v41_vk_slot_bytes = expert;
     /* The DSpark stages (index n_layers + stage): their experts are the backbone's form,
      * the tier's extra layers. By default on a discrete GPU only: on a GPU that shares
      * the RAM, qwen38's head measured no faster there (docs/vulkan.md, "The MTP head's
      * layer on the tier"); COLI_VK_TIER_MTP=1 or 0 decides. */
     const char *tm = getenv("COLI_VK_TIER_MTP");
-    int want_mtp = tm && *tm ? *tm != '0' : !coli_vk_device_shares_ram();
+    int want_mtp = tm && *tm ? *tm != '0' : !v41_tier_shares_ram();
     int stages = want_mtp && m->spec.active && c->spec_routed <= c->n_routed && c->spec_activated <= MOE_TOPK_MAX ? c->n_mtp : 0;
     VktConfig vc = {.engine = "deepseek_v41", .layers = c->n_layers, .experts = c->n_routed,
                     .hidden = c->dim, .inter = c->moe_inter, .topk = c->n_activated,
@@ -5691,7 +5859,8 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
                     .extra_layers = stages, .extra_gate_up = f, .extra_down = f,
                     .max_rows = MOE_ROW_CHUNK * c->n_activated,
                     .ram_reserve = expert * (size_t)cap * (size_t)c->n_layers,
-                    .dense_bytes = vk_dense_bytes(m), .in_ram = vk_in_ram, .ram_ctx = m,
+                    .ram_floor = expert * (size_t)c->n_activated * (size_t)c->n_layers, .ram_given = vk_ram_given,
+                    .dense_bytes = v41_tier_dense_bytes(m), .in_ram = vk_in_ram, .ram_ctx = m,
                     .load = vk_load, .release = vk_unhold, .load_ctx = m, .load_batch = vk_load_batch};
     rt_init("deepseek_v41", c->n_layers, c->n_routed);
     rt_drop_row(c->n_layers);   /* no MTP row: the history is the backbone's */
@@ -5701,18 +5870,20 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
     int64_t h = rt_load(g_vk_usage);
     if (h > 0) fprintf(stderr, "[USAGE] expert history: %lld selections (%s)\n", (long long)h, g_vk_usage);
     /* The device goes before the drivers unload, after the tier's teardown (atexit runs
-     * last-registered first), and whether or not the tier starts: vkt_init makes the
+     * last-registered first), and whether or not the tier starts: XT(init) makes the
      * expert batch's pipelines before it can refuse (no room), and a driver still
      * compiling them at exit crashed one run in sixteen on Mesa's Dozen. */
-    atexit(coli_vk_shutdown);
-    const int tier_on = vkt_init(&vc, rt_counts_all());
-    free(lgu); free(ldn);   /* read during vkt_init only */
+#ifdef COLI_VULKAN
+    if (!xt_cuda()) atexit(coli_vk_shutdown);
+#endif
+    const int tier_on = XT(init)(&vc, rt_counts_all());
+    free(lgu); free(ldn);   /* read during XT(init) only */
     if (!tier_on) { rt_destroy(); g_vk_usage[0] = 0; return; }
-    atexit(vkt_shutdown);
+    atexit(XT(shutdown));
     int all = c->n_layers * c->n_routed;
     int *pl = malloc((size_t)all * sizeof(int)), *pe = malloc((size_t)all * sizeof(int));
     const char *warm = getenv("COLI_VK_TIER_WARM");   /* 0: no warm start, the tier fills as experts pass by */
-    int n = pl && pe && !(warm && *warm == '0') ? vkt_plan(pl, pe, all) : 0;
+    int n = pl && pe && !(warm && *warm == '0') ? XT(plan)(pl, pe, all) : 0;
     if (n > 0) {
         double t0 = now_s();
         static const char *const part[V41_EXPERT_TENSORS] = {"w1.weight", "w1.scale", "w3.weight", "w3.scale", "w2.weight", "w2.scale"};
@@ -5721,8 +5892,8 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
             if (m->gx) {   /* a GGUF's: the file's rows */
                 uint8_t *rows = NULL;
                 VktExpertSrc src;
-                if (!v41_gx_expert_rows(m, pl[i], pe[i], &rows, &src)) vkt_put(pl[i], pe[i], &src);
-                else vkt_put(pl[i], pe[i], NULL);   /* no memory: the planned slot is given back */
+                if (!v41_gx_expert_rows(m, pl[i], pe[i], &rows, &src)) XT(put)(pl[i], pe[i], &src);
+                else XT(put)(pl[i], pe[i], NULL);   /* no memory: the planned slot is given back */
                 free(rows);
                 continue;
             }
@@ -5735,11 +5906,11 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
                 p[k] = at; at += expert_part_bytes(c, k);
             }
             VktExpertSrc src = {p[0], p[2], p[4], p[1], p[3], p[5]};
-            vkt_put(pl[i], pe[i], &src);
+            XT(put)(pl[i], pe[i], &src);
             free(buf);
         }
-        vkt_put_done();
-        vkt_warm_report("deepseek_v41", n, now_s() - t0);
+        XT(put_done)();
+        XT(warm_report)("deepseek_v41", n, now_s() - t0);
     }
     free(pl); free(pe);
 }
@@ -5770,6 +5941,19 @@ static int v41_gguf_report(Model *m, const char *snap) {
 }
 
 int main(int argc, char **argv) {
+#if defined(COLI_CUDA) && defined(COLI_VULKAN)
+    {   /* A build with both backends runs on Vulkan, the same card, when CUDA was asked for
+         * (COLI_CUDA=1) and COLI_VULKAN was not set: the dense chain runs a layer's work on the card in one
+         * frame, where the CUDA path (cu_dense.h) takes a matrix at a time. COLI_VULKAN=0 keeps the CUDA
+         * tier; without a Vulkan device the CUDA tier still starts. */
+        const char *cu = getenv("COLI_CUDA"), *vk = getenv("COLI_VULKAN");
+        if (cu && atoi(cu) && !(vk && *vk)) {
+            setenv("COLI_VULKAN", "1", 1);
+            fprintf(stderr, "[CUDA] deepseek_v41: a build with Vulkan runs on it, the same card, its dense chain and expert tier "
+                            "(COLI_VULKAN=0 keeps the CUDA tier)\n");
+        }
+    }
+#endif
     /* Size the team to PHYSICAL cores before anything else touches the model.
      * This engine issues ~720 OpenMP regions per decoded token -- three per
      * expert application, 240 applications a token -- and every one of them is
@@ -5852,6 +6036,24 @@ int main(int argc, char **argv) {
     if (g_vk_ready && !vkt_ready() && !coli_vk_dense())
         coli_vk_dense_decide("deepseek_v41", 0, 1);   /* no tier after all: the trunk to the device */
 #endif
+#ifdef COLI_CUDA
+    {   /* COLI_CUDA=1 with no Vulkan tier: the CUDA device opens for the routed experts, the same
+         * tier (cu_tier.h) holds them, and a GGUF's dense matrices go there too as far as their
+         * budget goes (cu_dense.h), which the tier leaves them */
+        const char *cu = getenv("COLI_CUDA");
+        int dev = 0;
+        if (cu && atoi(cu) && !vkt_ready() && c->n_routed > 0 && cut_wanted()) {
+            if (!coli_cuda_init(&dev, 1)) fprintf(stderr, "[CUDA] deepseek_v41: no CUDA device, the routed experts stay on the CPU\n");
+            else {
+                g_v41_cu = 1;
+                xt_use_cuda(1);
+                g_v41_cud = cud_open("deepseek_v41", coli_cuda_device_at(0), v41_cu_dense_bytes(&m));
+                vk_tier_start(&m, snap, cap);
+                if (!cut_ready()) { xt_use_cuda(0); g_v41_cu = 0; g_cud.on = 0; }
+            }
+        }
+    }
+#endif
 
     if (getenv("SERVE") && atoi(getenv("SERVE"))) {
         char path[1024];
@@ -5867,8 +6069,8 @@ int main(int argc, char **argv) {
         srand(seed ? (unsigned)strtoul(seed, NULL, 10) : (unsigned)time(NULL));
         serve_loop(&m, &tokenizer, snap);
         vk_report();
-#ifdef COLI_VULKAN
-        vkt_report("run", m.hits, m.miss);
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+        XT(report)("run", m.hits, m.miss);
         vk_tier_save();
 #endif
         return 0;
@@ -6053,8 +6255,8 @@ int main(int argc, char **argv) {
         spec_failed = 1;
     }
     vk_report();
-#ifdef COLI_VULKAN
-    vkt_report("run", m.hits, m.miss);
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+    XT(report)("run", m.hits, m.miss);
     vk_tier_save();
 #endif
     free(confidence); free(draft);

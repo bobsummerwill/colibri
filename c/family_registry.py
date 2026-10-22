@@ -339,7 +339,9 @@ def _qwen36_geometry(config, context, _model_dir):
     30 of 40 layers never grow."""
     layers = _required_int(config, "num_hidden_layers", "qwen36")
     kinds = _qwen36_layer_types(config, layers, _model_dir)
-    full = sum(kind == "full_attention" for kind in kinds)
+    # Flint's and Muse Spark's sliding_attention layers keep their rows like the full ones (the
+    # engine's KV is one array per attention layer, the window applied when it reads)
+    full = sum(kind in ("full_attention", "sliding_attention") for kind in kinds)
     kv = (full * context * _required_int(config, "num_key_value_heads", "qwen36") *
           _required_int(config, "head_dim", "qwen36") * 2 * 4)
     if full == layers:
@@ -1039,7 +1041,8 @@ def _dsv41_expert_inventory(name, size, config, _dtype=None):
 
 # a table as the checkpoint's two tensors, or a GGUF's one (blk.N.engram_embd, each row its
 # e4m3 then its scales: _gguf_tensor_sizes renames only the experts)
-_DSV41_ENGRAM = re.compile(r"^(?:layers\.(\d+)\.engram\.embed\.(weight|scale)|blk\.(\d+)\.engram_embd\.weight)$")
+_DSV41_ENGRAM = re.compile(r"^(?:layers\.(\d+)\.engram\.embed\.(weight|scale)|blk\.(\d+)\.engram_embd\.weight"
+                           r"|per_layer_token_embd\.weight|engram\.embed\.weight)$")   # the published GGUFs': every table in one
 
 
 def _dsv41_resident_inventory(name, size, _config, _dtype=None):
@@ -1486,7 +1489,12 @@ FAMILIES = (
         # qwen3_moe: Qwen3-Coder-30B-A3B and its REAP prunes, every layer attention,
         # no shared expert (tools/convert_qwen36.py writes their container).
         # qwen3: the dense Qwen3 (0.6B to 32B), qwen3_moe's layers with one MLP each.
-        model_types=("qwen3_5_moe", "qwen3_5_moe_text", "qwen3_5", "qwen3_5_text", "qwen3_moe", "qwen3"),
+        # flint: Flint (RecursiveSI/flint), qwen3_moe's layers with a sink per head,
+        # sliding-window layers, dense layers in front and sigmoid routing.
+        # muse_spark: Muse Spark Open (its GGUFs, tools/gguf_import.py), Flint's window and
+        # layers without RoPE, residual gates and the experts at their own width.
+        model_types=("qwen3_5_moe", "qwen3_5_moe_text", "qwen3_5", "qwen3_5_text", "qwen3_moe", "qwen3", "flint",
+                     "muse_spark"),
         display_name="Qwen3.6-35B-A3B",
         display_scale="35B",
         # Both checkpoints declare qwen3_5_moe_text. Keyed on the three
@@ -1509,6 +1517,12 @@ FAMILIES = (
                             ("num_experts", 103), ("hidden_size", 2048)),
                            "Qwen3-Coder-REAP-25B-A3B", "25B",
                            model_id="qwen3-coder-reap-25b-a3b-colibri"),
+            DisplayVariant((("num_hidden_layers", 49),
+                            ("num_experts", 256), ("hidden_size", 2048)),
+                           "Flint", "40B", model_id="flint-colibri"),
+            DisplayVariant((("num_hidden_layers", 62),
+                            ("num_experts", 256), ("hidden_size", 8192)),
+                           "Muse-Spark-Open-816B-A42B", "816B", model_id="muse-spark-open-colibri"),
         ),
         engine_artifact="qwen36",
         engine_aliases=(),
@@ -1626,15 +1640,13 @@ FAMILIES = (
         planner_id="deepseek_v41",
         planner_geometry=_dsv41_geometry,
         planner_unsupported_reason="",
-        # No VRAM tier to plan: the engine links no CUDA/Metal path. Since #1830 a
-        # VK=1 build can put its resident matrices on a Vulkan device
-        # (COLI_VULKAN=1), opt-in and outside the planner, which is why
-        # tests/test_registry_engine_agreement.py does not count VK_OBJ. The
-        # planner must not offer a VRAM tier it cannot execute. Left at the default True it wrote "VRAM 296.0 GB hot
-        # tier ... 100% projected expert residency" into `coli plan` for this
-        # model; resource_plan.py:945 is the gate and says the same thing in
-        # words ("a CPU-only engine has no VRAM tier").
-        supports_accelerator=False,
+        # A CUDA build holds the routed experts in VRAM on the shared tier
+        # (cu_tier.h, COLI_CUDA=1); a build with Vulkan too runs on Vulkan unless
+        # COLI_VULKAN=0. Before that the engine linked no CUDA/Metal path and this
+        # was False: the planner must not offer a VRAM tier it cannot execute
+        # (resource_plan.py's gate, "a CPU-only engine has no VRAM tier").
+        # tests/test_registry_engine_agreement.py holds it to the build rule.
+        supports_accelerator=True,
         expert_inventory=_dsv41_expert_inventory,
         resident_inventory=_dsv41_resident_inventory,
         config_section="text_config",
@@ -1680,11 +1692,10 @@ FAMILIES = (
         planner_id="mimo",
         planner_geometry=_mimo_geometry,
         planner_unsupported_reason="",
-        # No VRAM tier to plan: mimo.c links no CUDA/Metal backend. Its Vulkan path
-        # (#1830's dense matrices, and the routed experts on the shared Vulkan tier,
-        # vk_tier.c) is opt-in and outside the planner (see deepseek_v41 above for
-        # why the planner must not offer a VRAM tier the engine cannot use).
-        supports_accelerator=False,
+        # A CUDA build holds the routed experts in VRAM on the shared tier, as
+        # deepseek_v41's above (cu_tier.h); a build with Vulkan too runs on Vulkan
+        # unless COLI_VULKAN=0.
+        supports_accelerator=True,
         expert_inventory=_mimo_expert_inventory,
         resident_inventory=_mimo_resident_inventory,
         config_section="root",

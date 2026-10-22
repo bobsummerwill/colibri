@@ -170,6 +170,10 @@ jobs:
           # choose staging on its own; then the formats, the tier and the chain's ops staged.
           bash tests/vulkan_engines.sh staged
           COLI_VK_STAGED=1 bash tests/vulkan_engines.sh shader
+      - name: Memory types and budgets against tables
+        run: |
+          cd c
+          make vk-memtype-check VK=1
 
   # Every engine with a Vulkan hook, run twice on its tiny fixture: on the CPU and on
   # Lavapipe, with the same snapshot and settings. The gate is the CPU's tokens (and
@@ -248,6 +252,7 @@ jobs:
           # MiMo-V2.6's dense chain (COLI_VK_CHAIN=1), and the same under ASan and UBSan
           - family: mimo-chain
             req: c/tools/requirements-mimo-tiny.txt
+            extra: gguf>=0.19   # the GGUF chain gates write their tiny model with gguf-py
           - family: mimo-chain-sanitize
             req: c/tools/requirements-mimo-tiny.txt
           # GLM-5.2 (colibri) and GLM-5.3 Flash (glm53) on the routed-expert tier, and
@@ -260,13 +265,14 @@ jobs:
           # ops, and the same under ASan and UBSan
           - family: glm-chain
             req: c/tools/requirements-glm53-tiny.txt
+            extra: gguf>=0.19   # the GGUF chain gates write their tiny model with gguf-py
           - family: glm-chain-sanitize
             req: c/tools/requirements-glm53-tiny.txt
           # the dense chain (COLI_VK_CHAIN=1) of deepseek_v41 and deepseek_v4, and the same
           # under ASan and UBSan
           - family: deepseek-chain
             req: c/tools/requirements-deepseek-v4-tiny.txt
-            extra: sympy pillow
+            extra: sympy pillow gguf>=0.19
           - family: deepseek-chain-sanitize
             req: c/tools/requirements-deepseek-v4-tiny.txt
             extra: sympy pillow
@@ -274,6 +280,7 @@ jobs:
           # and gated MLA layers on the device, and the same under ASan and UBSan
           - family: kimi-chain
             req: c/tools/requirements-kimi-k3-tiny.txt
+            extra: gguf>=0.19
           - family: kimi-chain-sanitize
             req: c/tools/requirements-kimi-k3-tiny.txt
           # the dense weights on the device only (COLI_VK_DENSE_HOST=0): the host copies
@@ -753,6 +760,21 @@ jobs:
           nvcc -O2 -std=c++17 -arch=sm_80 -c cuda_chain.cu -o /dev/null \
             -Xcompiler=-Wall,-Wextra
           echo "cuda_chain syntax check passed"
+      - name: Compile the CUDA routed-expert tier (syntax only, no GPU)
+        run: |
+          cd c
+          # cu_xb.cu, the tier's device side, built into the same backend; cu_tier.c, vk_tier.c
+          # compiled again over it; deepseek_v4.c with the tier on CUDA (no Vulkan)
+          nvcc -O2 -std=c++17 -arch=sm_80 -c cu_xb.cu -o /dev/null \
+            -Xcompiler=-Wall,-Wextra
+          gcc -fsyntax-only -DCOLI_CUDA -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-unused-function cu_tier.c
+          gcc -fsyntax-only -D_GNU_SOURCE -DCOLI_CUDA -fopenmp -pthread -include pthread.h -Wall -Wextra \
+            -Wno-unused-parameter -Wno-unused-function -Wno-misleading-indentation deepseek_v4.c
+          for f in kimi_k3.c glm53.c deepseek_v41.c mimo.c; do
+            gcc -fsyntax-only -DCOLI_CUDA -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+              -Wno-misleading-indentation $f
+          done
+          echo "CUDA tier syntax check passed"
       - name: Compile backend_cuda_ink.cu (syntax only, no GPU)
         run: |
           cd c
@@ -1596,6 +1618,10 @@ jobs:
           cd c
           python3 tools/make_qwenimage_vae_tiny.py qwenimage_vae_tiny
           tests/test_qwenimage_vae qwenimage_vae_tiny
+      - name: Single-frame VAE encoder against diffusers, normal and ASan/UBSan
+        run: |
+          make -C c qwenimage-encoder-check
+          python3 c/tools/check_qwenimage_encoder.py --sanitizers
       - name: The shipping defaults (int8 weights) end to end, and the serve protocol
         run: |
           cd c
@@ -1703,6 +1729,16 @@ jobs:
           SNAP=./glm_tiny COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 64 16 16
       - name: Oracle allowance and failure regressions
         run: cd c && python3 tests/test_glm_oracle.py
+      - name: The MTP head under the draft gate (docs/speculative.md)
+        # Greedy stays exact whatever the gate picks (a draft is only ever verified),
+        # with the gate deciding from measured times and with every draft carried.
+        run: |
+          cd c
+          python3 tools/make_glm_mtp_tiny.py --src glm_tiny --out glm_tiny_mtp
+          cp ref_glm.json glm_tiny_mtp/
+          for g in COLI_SPEC_GATE=1 COLI_SPEC_GATE=0; do
+            env $g SNAP=./glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json COLI_TEMP=0 ORACLE_STRICT=1 DRAFT=2 ./colibri 64 16 16
+          done
       - name: Structural efficiency tests
         # test_cpu_vs_cpu_tok_s_stability is NOT in this list: it is a tok/s
         # bound (two runs within 25%) over a ~15 ms tiny replay -- it measured

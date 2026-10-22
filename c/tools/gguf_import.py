@@ -21,11 +21,12 @@ serve`, `coli web` and the planner treat it like any other.
 
 Supported architectures: qwen35moe (Qwen3.5 / Qwen3.6 MoE -> qwen36 engine), qwen35 (their
 dense models -> qwen36 engine), qwen3moe (Qwen3 MoE, Qwen3-Coder -> qwen36 engine), qwen3 (the dense
-Qwen3 -> qwen36 engine), qwen4exp (Qwen3.8-Flash-Next -> qwen38 engine), deepseek4 (DeepSeek V4
+Qwen3 -> qwen36 engine), flint (Flint -> qwen36 engine), muse-spark (Muse Spark Open -> qwen36
+engine), qwen4exp (Qwen3.8-Flash-Next -> qwen38 engine), deepseek4 (DeepSeek V4
 Flash -> deepseek_v4 engine), inkling (Inkling -> inkling engine), glm5-next (GLM-5.3-Flash ->
 glm53 engine), glm-dsa (GLM-5.2 / GLM-5.3 -> colibri engine), mimo2 (MiMo-V2.6 -> mimo engine),
-deepseek41 (DeepSeek V4.1 Flash in antirez's format -> deepseek_v41 engine), olmoe (OLMoE ->
-olmoe engine).
+deepseek41 (DeepSeek V4.1 Flash, files with the config whole and the published K-quant and IQ ones ->
+deepseek_v41 engine), olmoe (OLMoE -> olmoe engine).
 
 Usage:
   python3 tools/gguf_import.py MODEL.gguf OUT_DIR [--mode link|copy]
@@ -229,6 +230,96 @@ def qwen3_config(meta, tensors, overrides=None):
         cfg.pop(k, None)
     cfg.update({"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"],
                 "intermediate_size": int(need("feed_forward_length"))})
+    return cfg, layers
+
+
+def flint_config(meta, tensors, overrides=None):
+    """Flint (llama.cpp's flint: RecursiveSI/flint) as the qwen36 engine's config.json, in the
+    release's own form: qwen3moe's layers with a sink per head, sliding-window layers, layers
+    without RoPE, dense layers in front and sigmoid routing beside an ungated shared expert."""
+    p = "flint."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    layers = int(need("block_count"))
+    head_dim = int(meta.get(p + "attention.key_length", int(need("embedding_length")) // int(need("attention.head_count"))))
+    emb = tensors.get("token_embd.weight") or sys.exit("GGUF has no token_embd.weight")
+    if int(meta.get(p + "expert_gating_func", 2)) != 2:
+        sys.exit(f"GGUF {p}expert_gating_func {meta.get(p + 'expert_gating_func')}: Flint routes by sigmoid (2)")
+    sliding = list(need("attention.sliding_window_pattern"))
+    rope = list(need("attention.rope_pattern"))
+    if len(sliding) != layers or len(rope) != layers:
+        sys.exit(f"GGUF {p}attention patterns: {len(sliding)} and {len(rope)} entries for {layers} layers")
+    lead = int(meta.get(p + "leading_dense_block_count", 0))
+    cfg = {
+        "model_type": "flint",
+        "architectures": ["FlintForCausalLM"],
+        "hidden_size": int(need("embedding_length")),
+        "num_hidden_layers": layers,
+        "num_attention_heads": int(need("attention.head_count")),
+        "num_key_value_heads": int(need("attention.head_count_kv")),
+        "head_dim": head_dim,
+        "num_experts": int(need("expert_count")),
+        "num_experts_per_tok": int(need("expert_used_count")),
+        "moe_intermediate_size": int(need("expert_feed_forward_length")),
+        "shared_expert_intermediate_size": int(need("expert_shared_feed_forward_length")),
+        "intermediate_size": int(meta.get(p + "feed_forward_length", 0)),
+        "mlp_only_layers": list(range(lead)),
+        "norm_topk_prob": True,
+        "router_score_function": "sigmoid",
+        "vocab_size": int(emb["dims"][1]),
+        "rms_norm_eps": float(meta.get(p + "attention.layer_norm_rms_epsilon", 1e-6)),
+        "max_position_embeddings": int(meta.get(p + "context_length", 262144)),
+        "rope_theta": float(meta.get(p + "rope.freq_base", 10000.0)),
+        "sliding_window": int(need("attention.sliding_window")),
+        "layer_types": ["sliding_attention" if s_ else "full_attention" for s_ in sliding],
+        "no_rope_layer_indices": [i for i, r in enumerate(rope) if not r],
+        "softmax_type": "learnable",
+        "tie_word_embeddings": "output.weight" not in tensors,
+        "hidden_act": "silu",
+    }
+    return cfg, layers
+
+
+def muse_config(meta, tensors, overrides=None):
+    """Muse Spark (the GGUF arch muse-spark: meta-models/Muse-Spark-Open) as the qwen36 engine's
+    config.json: the text model's keys, flat. The engine reads everything from the GGUF; this
+    is what coli's planner, doctor and gateway read (the window, the experts, the KV)."""
+    p = "muse-spark."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    layers = int(need("block_count"))
+    emb = tensors.get("token_embd.weight") or sys.exit("GGUF has no token_embd.weight")
+    if int(meta.get(p + "expert_gating_func", 2)) != 2:
+        sys.exit(f"GGUF {p}expert_gating_func {meta.get(p + 'expert_gating_func')}: Muse Spark routes by sigmoid (2)")
+    sliding = list(need("attention.sliding_window_pattern"))
+    if len(sliding) != layers:
+        sys.exit(f"GGUF {p}attention.sliding_window_pattern: {len(sliding)} entries for {layers} layers")
+    theta = float(meta.get(p + "rope.freq_base", 500000.0))
+    cfg = {
+        "model_type": "muse_spark",
+        "architectures": ["MuseSparkForConditionalGeneration"],
+        "hidden_size": int(need("embedding_length")),
+        "num_hidden_layers": layers,
+        "num_attention_heads": int(need("attention.head_count")),
+        "num_key_value_heads": int(need("attention.head_count_kv")),
+        "head_dim": int(need("attention.key_length")),
+        "num_experts": int(need("expert_count")),
+        "num_experts_per_tok": int(need("expert_used_count")),
+        "moe_intermediate_size": int(need("expert_feed_forward_length")),
+        "moe_hidden_size": int(need("moe_latent_size")),
+        "intermediate_size": int(meta.get(p + "feed_forward_length", 0)),
+        "vocab_size": int(emb["dims"][1]),
+        "rms_norm_eps": float(meta.get(p + "attention.layer_norm_rms_epsilon", 1e-5)),
+        "post_norm_eps": float(meta.get(p + "post_norm_epsilon", 1e-8)),
+        "max_position_embeddings": int(meta.get(p + "context_length", 1048576)),
+        "rope_theta": theta,
+        "sliding_window": int(need("attention.sliding_window")),
+        # the sliding layers take RoPE, the full ones none (the release's layer_rope_theta)
+        "layer_types": ["sliding_attention" if s_ else "full_attention" for s_ in sliding],
+        "layer_rope_theta": [theta if s_ else 0 for s_ in sliding],
+        "output_multiplier": float(need("logit_scale")),
+        "final_logit_softcapping": float(meta.get(p + "final_logit_softcapping", 0.0)),
+        "tie_word_embeddings": "output.weight" not in tensors,
+        "hidden_act": "silu",
+    }
     return cfg, layers
 
 
@@ -510,12 +601,88 @@ def mimo2_config(meta, tensors, overrides=None):
     return cfg, layers
 
 
+def deepseek41_meta_config(meta, tensors):
+    """The published deepseek41 GGUFs (K-quant and IQ types) carry no config.json:
+    the checkpoint's text_config from its keys (conversion writes each from one of them).
+    No DSpark head and no vision tower in these files: their own GGUFs hold them (the
+    DSpark head's keys come from dspark_head, when main finds one)."""
+    p = "deepseek41."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    gating = int(meta.get(p + "expert_gating_func", 4))
+    if gating != 4:
+        sys.exit(f"{p}expert_gating_func {gating}: the engine routes with sqrt(softplus) (4) only")
+    emb = tensors.get("token_embd.weight") or sys.exit("GGUF has no token_embd.weight")
+    clamp = meta.get(p + "swiglu_clamp_exp") or [10.0]
+    text = {
+        "model_type": "deepseek_v41_text",
+        "vocab_size": int(emb["dims"][1]),
+        "hidden_size": int(need("embedding_length")),
+        "moe_intermediate_size": int(need("expert_feed_forward_length")),
+        "num_hidden_layers": int(need("block_count")),
+        "num_attention_heads": int(need("attention.head_count")),
+        "num_key_value_heads": int(meta.get(p + "attention.head_count_kv", 1)),
+        "head_dim": int(need("attention.key_length")),
+        "qk_rope_head_dim": int(need("rope.dimension_count")),
+        "q_lora_rank": int(need("attention.q_lora_rank")),
+        "o_lora_rank": int(need("attention.output_lora_rank")),
+        "o_groups": int(need("attention.output_group_count")),
+        "hidden_act": "silu",
+        "swiglu_limit": float(clamp[0]),
+        "rms_norm_eps": float(need("attention.layer_norm_rms_epsilon")),
+        "tie_word_embeddings": "output.weight" not in tensors,
+        "max_position_embeddings": int(meta.get(p + "context_length", 1048576)),
+        "rope_theta": float(meta.get(p + "rope.freq_base", 10000.0)),
+        "rope_scaling": {
+            "rope_type": meta.get(p + "rope.scaling.type", "yarn"),
+            "factor": float(meta.get(p + "rope.scaling.factor", 1.0)),
+            "beta_fast": int(meta.get(p + "rope.scaling.yarn_beta_fast", 32)),
+            "beta_slow": int(meta.get(p + "rope.scaling.yarn_beta_slow", 1)),
+            "original_max_position_embeddings": int(meta.get(p + "rope.scaling.original_context_length",
+                                                             meta.get(p + "context_length", 65536))),
+        },
+        "n_routed_experts": int(need("expert_count")),
+        "n_shared_experts": int(meta.get(p + "expert_shared_count", 1)),
+        "num_experts_per_tok": int(need("expert_used_count")),
+        "scoring_func": "sqrtsoftplus",
+        "topk_method": "noaux_tc",
+        "norm_topk_prob": bool(meta.get(p + "expert_weights_norm", True)),
+        "routed_scaling_factor": float(meta.get(p + "expert_weights_scale", 1.0)),
+        "sliding_window": int(need("attention.sliding_window")),
+        "compress_ratios": [int(r) for r in need("attention.compress_ratios")],
+        "compress_rope_theta": float(need("attention.compress_rope_freq_base")),
+        "kv_source_layer_ids": [int(x) for x in need("attention.kv_source_layers")],
+        "index_source_layer_ids": [int(x) for x in need("attention.indexer.source_layers")],
+        "index_n_heads": int(need("attention.indexer.head_count")),
+        "index_head_dim": int(need("attention.indexer.key_length")),
+        "index_topk": int(need("attention.indexer.top_k")),
+        "candidate_source_layer_id": int(need("attention.indexer.candidate_source_layer")),
+        "candidate_topk_blocks": int(need("attention.indexer.candidate_top_k_blocks")),
+        "candidate_block_size": int(need("attention.indexer.candidate_block_size")),
+        "hc_mult": int(need("hyper_connection.count")),
+        "hc_sinkhorn_iters": int(need("hyper_connection.sinkhorn_iterations")),
+        "hc_eps": float(meta.get(p + "hyper_connection.epsilon", 1e-6)),
+        "num_nextn_predict_layers": 0,
+    }
+    if p + "ple.layers" in meta:   # the engram: dsv41_engram.json carries its tables (deepseek41_engram)
+        text.update({"engram_layer_ids": [int(x) for x in need("ple.layers")],
+                     "engram_max_ngram_size": int(need("ple.ngram_size")),
+                     "engram_n_heads": int(need("ple.heads_per_ngram")),
+                     "engram_head_dim": int(need("embedding_length_per_layer_input")),
+                     "engram_pad_token_id": int(meta.get(p + "engram.pad_token_id", 2)),
+                     "engram_vocab_size": int(meta.get(p + "engram.vocab_size", 0)),
+                     "engram_compressed_vocab_size": int(meta.get(p + "engram.compressed_vocab_size", 0))})
+    return {"architectures": ["DeepseekV41ForConditionalGeneration"], "model_type": "deepseek_v41",
+            "bos_token_id": int(meta.get("tokenizer.ggml.bos_token_id", 0)),
+            "eos_token_id": int(meta.get("tokenizer.ggml.eos_token_id", 1)), "text_config": text}
+
+
 def deepseek41_config(meta, tensors, overrides=None):
-    """DeepSeek V4.1 (antirez's deepseek41): the file carries the checkpoint's config.json
-    whole (deepseek41.config), and the engine reads it as it is. The model's layers are
-    the blocks with attention (no MTP block in these files)."""
-    raw = meta.get("deepseek41.config") or sys.exit("GGUF metadata lacks deepseek41.config")
-    cfg = json.loads(raw)
+    """DeepSeek V4.1: a deepseek41 file may carry the checkpoint's config.json whole
+    (deepseek41.config), and the engine reads it as it is; the published K-quant and IQ files have its keys
+    (deepseek41_meta_config). The model's layers are the blocks with attention (no MTP
+    block in these files)."""
+    raw = meta.get("deepseek41.config")
+    cfg = json.loads(raw) if raw else deepseek41_meta_config(meta, tensors)
     text = cfg.get("text_config", cfg)
     layers = int(text["num_hidden_layers"])
     present = sum(1 for b in range(layers + 8) if f"blk.{b}.attn_q_a.weight" in tensors)
@@ -533,6 +700,8 @@ def deepseek41_engram(meta, cfg):
     ids = list(t.get("engram_layer_ids") or [])
     if not ids:
         return None
+    if "deepseek41.engram.primes" not in meta and "deepseek41.ple.layers" in meta:
+        return deepseek41_ple_engram(meta, t, ids)
     p = "deepseek41.engram."
     need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
     if list(need("layer_ids")) != ids:
@@ -560,6 +729,91 @@ def deepseek41_engram(meta, cfg):
             "num_embeddings": [int(x) for x in need("rows")], "primes": primes, "offsets": offsets,
             "multipliers": [[str(v) for v in mult_flat[i * n:(i + 1) * n]] for i in range(len(ids))],
             "token_map": token_map}
+
+
+def deepseek41_ple_engram(meta, t, ids):
+    """The sidecar from the published deepseek41 GGUFs' keys: every table in one tensor
+    (per_layer_token_embd, the engine's engram.embed.weight) whose head_offsets run over all
+    of them, so a table's offsets are the file's and each layer reads the whole tensor."""
+    p = "deepseek41."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    n, heads = int(t["engram_max_ngram_size"]), int(t["engram_n_heads"])
+    per = (n - 1) * heads
+    sizes, offs = [int(x) for x in need("ple.head_vocab_sizes")], [int(x) for x in need("ple.head_offsets")]
+    mult = [int(x) for x in need("ple.layer_multipliers")]
+    if len(sizes) != len(ids) * per or len(offs) != len(sizes) or len(mult) != len(ids) * n:
+        sys.exit("deepseek41: the engram's head sizes, offsets and multipliers are not one set per table")
+    acc = 0
+    for k, (sz, off) in enumerate(zip(sizes, offs)):
+        if off != acc:
+            sys.exit(f"deepseek41: engram head {k} starts at row {off}, the heads before it end at {acc}")
+        acc += sz
+    token_map = [int(x) for x in need("engram.token_map")]
+    return {"max_ngram_size": n, "n_heads": heads, "head_dim": int(t["engram_head_dim"]),
+            "pad_id": token_map[int(t.get("engram_pad_token_id", 2))], "layer_ids": ids,
+            "num_embeddings": [sum(sizes[i * per:(i + 1) * per]) for i in range(len(ids))],
+            "primes": [[sizes[i * per + k * heads:i * per + (k + 1) * heads] for k in range(n - 1)] for i in range(len(ids))],
+            "offsets": [offs[i * per:(i + 1) * per] for i in range(len(ids))],
+            "multipliers": [[str(v) for v in mult[i * n:(i + 1) * n]] for i in range(len(ids))],
+            "token_map": token_map}
+
+
+def kimik3_config(meta, tensors, overrides=None):
+    """kimi-k3 (Kimi K3): the checkpoint's text_config (kimi_linear) from the keys, as
+    kimi_k3.c and the planner read it. The KDA layers are those whose head_count_kv is 0,
+    the MLA layers' 1; MLA's own head sizes are key_length_mla and value_length_mla (the
+    plain key_length and value_length are the KDA side's). The routed experts work in the
+    latent (expert_latent_length) between ffn_routed_up and ffn_routed_down."""
+    p = "kimi-k3."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    layers = int(need("block_count"))
+    kv = [int(x) for x in need("attention.head_count_kv")]
+    if len(kv) != layers or any(v not in (0, 1) for v in kv):
+        sys.exit(f"{p}attention.head_count_kv: not one 0 (KDA) or 1 (MLA) a layer")
+    gating = int(meta.get(p + "expert_gating_func", 2))
+    if gating != 2:
+        sys.exit(f"{p}expert_gating_func {gating}: the engine routes with sigmoid scores (2) only")
+    emb = tensors.get("token_embd.weight") or sys.exit("GGUF has no token_embd.weight")
+    rope, qk = int(need("rope.dimension_count")), int(need("attention.key_length_mla"))
+    heads = int(need("attention.head_count"))
+    text = {
+        "model_type": "kimi_linear",
+        "hidden_size": int(need("embedding_length")),
+        "num_hidden_layers": layers,
+        "vocab_size": int(emb["dims"][1]),
+        "first_k_dense_replace": int(need("leading_dense_block_count")),
+        "intermediate_size": int(need("feed_forward_length")),
+        "num_attention_heads": heads,
+        "q_lora_rank": int(need("attention.q_lora_rank")),
+        "kv_lora_rank": int(need("attention.kv_lora_rank")),
+        "qk_nope_head_dim": qk - rope,
+        "qk_rope_head_dim": rope,
+        "v_head_dim": int(need("attention.value_length_mla")),
+        "num_experts": int(need("expert_count")),
+        "num_experts_per_token": int(need("expert_used_count")),
+        "moe_intermediate_size": int(need("expert_feed_forward_length")),
+        "routed_expert_hidden_size": int(need("expert_latent_length")),
+        "num_shared_experts": int(need("expert_shared_count")),
+        "attn_res_block_size": int(need("attn_res.block_size")),
+        "activation_situ_beta": float(need("activation.situ_beta")),
+        "activation_situ_linear_beta": float(need("activation.situ_linear_beta")),
+        "rms_norm_eps": float(need("attention.layer_norm_rms_epsilon")),
+        "rope_parameters": {"rope_theta": float(meta.get(p + "rope.freq_base", 10000.0))},
+        "max_position_embeddings": int(meta.get(p + "context_length", 1048576)),
+        "routed_scaling_factor": float(meta.get(p + "expert_weights_scale", 1.0)),
+        "norm_topk_prob": bool(meta.get(p + "expert_weights_norm", True)),
+        "linear_attn_config": {"num_heads": heads, "head_dim": int(need("kda.head_dim")),
+                               "short_conv_kernel_size": int(need("ssm.conv_kernel")),
+                               "gate_lower_bound": float(meta.get(p + "kda.gate_lower_bound", -5.0)),
+                               "kda_layers": [i + 1 for i, v in enumerate(kv) if v == 0]},
+    }
+    present = sum(1 for b in range(layers + 4) if f"blk.{b}.attn_norm.weight" in tensors)
+    if present != layers:
+        sys.exit(f"kimi-k3: {present} blocks, the config declares {layers}")
+    cfg = {"architectures": ["KimiK3ForConditionalGeneration"], "model_type": "kimi_k3",
+           "bos_token_id": int(meta.get("tokenizer.ggml.bos_token_id", 163584)),
+           "eos_token_id": int(meta.get("tokenizer.ggml.eos_token_id", 163586)), "text_config": text}
+    return cfg, layers
 
 
 def olmoe_config(meta, tensors, overrides=None):
@@ -673,7 +927,7 @@ def qwen4exp_config(meta, tensors, overrides=None):
 
 
 COPY_UNREAD = {"qwen4exp"}   # their engine does not read the colibri container (copy mode)
-ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "glm5-next": glm5next_config, "glm-dsa": glmdsa_config, "mimo2": mimo2_config, "deepseek41": deepseek41_config, "olmoe": olmoe_config, "qwen4exp": qwen4exp_config}
+ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "flint": flint_config, "muse-spark": muse_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "glm5-next": glm5next_config, "glm-dsa": glmdsa_config, "mimo2": mimo2_config, "deepseek41": deepseek41_config, "kimi-k3": kimik3_config, "olmoe": olmoe_config, "qwen4exp": qwen4exp_config}
 
 # unsloth ships Qwen3.8-Flash-Next's MTP head apart, in an MTP/ folder of the repository:
 # shared-* borrow token_embd and output from the model (the engine always does), the
@@ -716,6 +970,67 @@ def mtp_head_ok(path, meta, layers):
         r.close()
 
 
+DSPARK_PREFERENCE = ("Q8_0", "BF16")
+
+
+def dspark_candidates(src):
+    """dspark-*.gguf next to the model, to name (main links one only with --mtp): its folder, the
+    parent, a dspark/ folder in either; Q8_0 first."""
+    seen, found = set(), []
+    for d in (src.parent, src.parent / "dspark", src.parent.parent, src.parent.parent / "dspark"):
+        for f in sorted(d.glob("dspark-*.gguf")) if d.is_dir() else ():
+            if f.resolve() not in seen:
+                seen.add(f.resolve()); found.append(f)
+    rank = lambda f: next((i for i, tag in enumerate(DSPARK_PREFERENCE) if f.name.endswith(f"-{tag}.gguf")), len(DSPARK_PREFERENCE))
+    return sorted(found, key=rank)
+
+
+def dspark_head(path, meta):
+    """(the text_config keys of DeepSeek V4.1's DSpark head, '') when path is one for this
+    deepseek41 model (arch dflash: its stages as blk.<s>, its own tensors beside them), else
+    (None, why not). The draft's noise token and Markov rank are the model's keys."""
+    try:
+        r = GGUFReader(str(path))
+    except (GGUFError, OSError) as e:
+        return None, str(e)
+    try:
+        hm, t = r.metadata, {x["name"]: x for x in r.tensors}
+        if hm.get("general.architecture") != "dflash":
+            return None, f"architecture {hm.get('general.architecture')!r}, not dflash"
+        p, q = "dflash.", "deepseek41."
+        for k in ("embedding_length", "attention.head_count", "attention.key_length", "attention.q_lora_rank",
+                  "attention.output_lora_rank", "attention.output_group_count", "attention.sliding_window",
+                  "expert_feed_forward_length", "hyper_connection.count"):
+            if int(hm.get(p + k, -1)) != int(meta.get(q + k, -2)):
+                return None, f"{k} {hm.get(p + k)} does not match the model's {meta.get(q + k)}"
+        for k, mk in (("expert_count", "dspark.expert_count"), ("expert_used_count", "dspark.expert_used_count"),
+                      ("block_size", "dspark.block_size")):
+            if mk and q + mk in meta and int(hm.get(p + k, -1)) != int(meta[q + mk]):
+                return None, f"{k} {hm.get(p + k)} does not match the model's dspark.{k.split('.')[-1]} {meta[q + mk]}"
+        targets = [int(x) for x in hm.get(p + "target_layers") or []]
+        if q + "dspark.target_layers" in meta and targets != [int(x) for x in meta[q + "dspark.target_layers"]]:
+            return None, "its target layers are not the model's"
+        stages = int(hm.get(p + "block_count", 0))
+        if stages < 1 or not targets or (q + "dspark.noise_token_id") not in meta:
+            return None, "no stages, no target layers, or the model has no dspark.noise_token_id"
+        need = ["fc.weight", "enc.output_norm.weight", "output_norm.weight", "conf_proj.weight",
+                "markov_w1.weight", "markov_w2.weight"] + [f"blk.{s}.ffn_gate_exps.weight" for s in range(stages)]
+        if any(n not in t for n in need):
+            return None, f"no {next(n for n in need if n not in t)}"
+        if int(t["fc.weight"]["dims"][0]) != len(targets) * int(meta[q + "embedding_length"]):
+            return None, "fc.weight does not read its target layers"
+        rank = int(t["markov_w1.weight"]["dims"][0])
+        if q + "dspark.markov_rank" in meta and rank != int(meta[q + "dspark.markov_rank"]):
+            return None, f"a Markov rank of {rank}, the model's {meta[q + 'dspark.markov_rank']}"
+        return {"n_mtp_layers": stages, "dspark_block_size": int(hm[p + "block_size"]),
+                "dspark_noise_token_id": int(meta[q + "dspark.noise_token_id"]),
+                "dspark_target_layer_ids": targets, "dspark_markov_rank": rank,
+                "dspark_n_routed_experts": int(hm[p + "expert_count"]),
+                "dspark_n_activated_experts": int(hm[p + "expert_used_count"])}, ""
+    finally:
+        r.close()
+
+
 # ------------------------------------------------------------- tokenizer
 # The pre-tokenizer of a GGUF tokenizer, by llama.cpp's name for it (tokenizer.ggml.pre ->
 # llama-vocab.cpp's regex_exprs), in the shape the checkpoint's tokenizer.json gives it.
@@ -730,7 +1045,24 @@ O200K_SPLITS = ["[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p
 # cl100k's, as GLM-5.3-Flash's tokenizer.json has it (llama.cpp's "glm4")
 CL100K_SPLITS = ["(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|"
                  "\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"]
-PRE_SPLITS = {"glm4": CL100K_SPLITS, "deepseek-v3": DEEPSEEK_SPLITS, "joyai-llm": DEEPSEEK_SPLITS,
+# Kimi's tiktoken split (tools/k3_tokenizer.py's PAT, one regex as tiktoken applies it)
+KIMI_SPLITS = ["|".join([
+    r"""[\p{Han}]+""",
+    r"""[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?""",
+    r"""[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?""",
+    r"""\p{N}{1,3}""",
+    r""" ?[^\s\p{L}\p{N}]+[\r\n]*""",
+    r"""\s*[\r\n]+""",
+    r"""\s+(?!\S)""",
+    r"""\s+""",
+])]
+# Flint's (RecursiveSI/flint tokenizer.json): digits by three and the CJK runs split out first,
+# then o200k's letter rules with punctuation and symbols as their own class
+FLINT_SPLITS = ["\\p{N}{1,3}", "[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+",
+                "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+                "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+                " ?[\\p{P}\\p{S}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"]
+PRE_SPLITS = {"glm4": CL100K_SPLITS, "flint": FLINT_SPLITS, "kimi-k2": KIMI_SPLITS, "deepseek-v3": DEEPSEEK_SPLITS, "joyai-llm": DEEPSEEK_SPLITS,
               "hunyuan-dense": DEEPSEEK_SPLITS, "hy_v4": DEEPSEEK_SPLITS,
               "inkling": O200K_SPLITS, "gpt-4o": O200K_SPLITS}
 # BPE options of the tokenizer.json a family ships (the GGUF does not carry them)
@@ -787,6 +1119,9 @@ def tokenizer_files(meta):
     for k in ("eot", "eom"):   # end of turn, end of message (GLM's <|user|>, <|observation|>)
         i = meta.get(f"tokenizer.ggml.{k}_token_id")
         if i is not None and int(i) not in eos:
+            eos.append(int(i))
+    for i in meta.get("tokenizer.ggml.eog_token_ids") or []:   # every end of generation (Flint's four)
+        if int(i) not in eos:
             eos.append(int(i))
     for extra in ("<|endoftext|>", "<|im_end|>"):
         if extra in toks and toks.index(extra) not in eos:
@@ -922,9 +1257,10 @@ def main():
     ap.add_argument("out", type=Path)
     ap.add_argument("--mode", choices=("link", "copy"), default="link")
     ap.add_argument("--mtp", type=Path, default=None,
-                    help="qwen4exp: the MTP head's GGUF (unsloth's mtp-*.gguf); unset, one next to the model "
-                         "is used (its folder, the parent, an MTP/ folder in either; shared-Q8_0 first)")
-    ap.add_argument("--no-mtp", action="store_true", help="qwen4exp: no MTP head, plain decoding")
+                    help="qwen4exp: the MTP head's GGUF (mtp-*.gguf), unset one next to the model (its folder, "
+                         "the parent, an MTP/ folder in either; shared-Q8_0 first); deepseek41: the DSpark head's "
+                         "(dspark-*.gguf, arch dflash), which drafts only when named")
+    ap.add_argument("--no-mtp", action="store_true", help="qwen4exp, deepseek41: no draft head, plain decoding")
     ap.add_argument("--indexer-compress-ratio", type=int, default=0,
                     help="qwen4exp: when the GGUF's attention.compress_ratios are all 0 (a converter "
                          "that read the layers as qwen_sparse_attention)")
@@ -955,6 +1291,21 @@ def main():
             cfg["mtp_num_hidden_layers"] = 1
             cfg["mtp"] = {"layer_types": ["full_attention"], "rope_theta": cfg["rope_parameters"]["rope_theta"]}
             cfg["mtp_use_dedicated_embeddings"] = False
+    # DeepSeek V4.1's DSpark head drafts only when --mtp names it: on UD-IQ1_S with the Q8_0
+    # head (an RTX PRO 4000, 62 GB of RAM) 22-33% of the drafts were accepted and decode
+    # went from 5.0-5.3 tok/s to 4.3-4.6 (docs/gguf.md). A head next to the model is named.
+    dspark_file = None
+    if arch == "deepseek41" and not args.no_mtp and not any(n.startswith("mtp.") for n in tensors):
+        text = cfg.get("text_config", cfg)
+        if args.mtp:
+            keys, why = dspark_head(args.mtp, meta)
+            if not keys:
+                sys.exit(f"--mtp {args.mtp}: {why}")
+            dspark_file = args.mtp.resolve(); mtp_where = str(dspark_file)
+            text.update(keys)
+        else:
+            mtp_where = next((f"none linked; {c} is this model's, --mtp links it (measured slower on "
+                              f"UD-IQ1_S, docs/gguf.md)" for c in dspark_candidates(src) if dspark_head(c, meta)[0]), None)
     tok, tcfg, gen = tokenizer_files(meta)
     args.out.mkdir(parents=True, exist_ok=True)
     cfg["colibri_gguf"] = {"arch": arch, "mode": args.mode, "source": str(src), **model_name(meta)}
@@ -974,12 +1325,15 @@ def main():
             "size": sum(p.stat().st_size for p in parts) if args.mode == "link" else target.stat().st_size}
     if mtp_file:
         link["mtp"] = str(mtp_file)
+    if dspark_file:
+        link["dspark"] = str(dspark_file)
     (args.out / "gguf.json").write_text(json.dumps(link, indent=1), encoding="utf-8")
     for r in readers:
         r.close()
     print(f"colibri model directory ready: {args.out}  ({arch}, {layers} layers, mode {args.mode})")
-    if arch == "qwen4exp":
-        print(f"  MTP head: {mtp_where or ('off (--no-mtp)' if args.no_mtp else 'none found: decoding without drafts (--mtp names one)')}")
+    if arch in ("qwen4exp", "deepseek41"):
+        head = "MTP head" if arch == "qwen4exp" else "DSpark head"
+        print(f"  {head}: {mtp_where or ('off (--no-mtp)' if args.no_mtp else 'none found: decoding without drafts (--mtp names one)')}")
 
 
 if __name__ == "__main__":

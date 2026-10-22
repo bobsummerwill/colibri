@@ -10,7 +10,7 @@ extern "C" {
 
 /* Opaque persistent device copy of one resident quantized tensor,
  * mirroring backend_cuda.h. On Strix Halo the "upload" writes into
- * HOST_VISIBLE|DEVICE_LOCAL memory — same physical RAM the iGPU reads,
+ * host-visible memory (vk_memtype.h) — same physical RAM the iGPU reads,
  * so there is no PCIe copy, unlike the discrete-CUDA path. */
 typedef struct ColiVkTensor ColiVkTensor;
 
@@ -28,22 +28,22 @@ void coli_vk_set_swiglu_limit(float limit);
  * (VK_EXT_memory_priority; scratches and the KV mirror pin themselves at 1.0) —
  * the engine brackets the bulk expert-tier fill at 0.4 so an oversubscribed heap
  * evicts cold experts, never the per-token attention working set.
- * mem_budget reports device-local usage/budget in GB (VK_EXT_memory_budget);
+ * mem_budget reports usage/budget of the device memory in GB (VK_EXT_memory_budget);
  * returns 0 if unavailable. */
 void coli_vk_alloc_priority(float p);
 int  coli_vk_mem_budget(double *used_gb, double *budget_gb);
 
 /* Device memory books (docs/vulkan.md, "A partial chain"). Every device memory allocation
- * of the backend and of the chain is counted per device when its heap is device-local.
- * COLI_VK_DEVICE_CAP_MB=n (tests; n may be a fraction) makes the device hold at most n MiB:
+ * of the backend and of the chain is counted per device when it comes from device memory.
+ * COLI_VK_DEVICE_CAP_MB=n (tests; n may be a fraction) limits the device to n MiB:
  * an allocation past it fails as out of device memory, and coli_vk_mem_budget (and
  * _budget2, coli_vk_free_bytes, coli_vk_device_local_bytes) report the cap and this
  * process's bytes, so a CPU device behaves like a small card.
  *   coli_vk_device_cap      the cap in bytes (0: none)
- *   coli_vk_device_used     device-local bytes this process holds on the device
+ *   coli_vk_device_used     bytes of device memory this process has allocated on the device
  *   coli_vk_free_bytes      free device memory now: the cap less what is held, else the
- *                           budget less its usage (VK_EXT_memory_budget), else the largest
- *                           device-local heap less what is held
+ *                           budget less its usage (VK_EXT_memory_budget), else the size of
+ *                           the device memory less what is held
  *   coli_vk_block_bytes     the block size a memory pool of `def` bytes takes (smaller
  *                           under the cap, at most about 4096 blocks to fill it)
  *   coli_vk_mem_alloc/free  vkAllocateMemory / vkFreeMemory through the books (vk_chain.c):
@@ -227,11 +227,31 @@ int    coli_vk_tier_tensor(ColiVkTensor **t, int fmt, int I, int O, int gs,
  * frees. With mapped memory it does nothing. Thread-safe; the n tensors on one device.
  * 0 = the copy failed (the device is lost): free the tensors. */
 int    coli_vk_tensor_commit(ColiVkTensor *const *t, int n);
+/* A tier tensor on device dev with the layout of src, a tensor of the host pool (a
+ * promotion: the tier copies its host pool expert up). Staged uploads: empty, then
+ * coli_vk_tensor_copy fills the n of them from their sources by the device's copy engine
+ * (none of the bytes through the CPU); mapped memory: filled here, and the copy does
+ * nothing. 0 = no room, no memory, or (the copy) the device is lost: free them. */
+int    coli_vk_tier_tensor_like(int dev, ColiVkTensor **t, const ColiVkTensor *src, size_t pad_w, size_t pad_s);
+int    coli_vk_tensor_copy(ColiVkTensor *const *dst, ColiVkTensor *const *src, int n);
+/* coli_vk_tensor_copy into tier tensors with room for their sources (the streaming's slots,
+ * coli_vk_tier_tensor_pad's): each takes its source's format and shape first, as
+ * coli_vk_tensor_refill_as does; with mapped memory the CPU copies. All n before it
+ * returns. 0 = a source not in the host pool, no room, or the copy failed. */
+int    coli_vk_tensor_copy_as(ColiVkTensor *const *dst, ColiVkTensor *const *src, int n);
+/* coli_vk_tensor_copy_as without a wait: with staged uploads the copies go at the head of
+ * sub-batch half h's next submit (coli_vk_xb_sub_issue / _step), a barrier between them and
+ * its dispatches, so the engine thread goes on and the bus runs beside the device's batch
+ * before; mapped memory copies here. The dsts must not be read by a batch in flight.
+ * coli_vk_xb_sub_copy_drop forgets the copies no submit took (a step that ended early). */
+int    coli_vk_xb_sub_copy(int h, ColiVkTensor *const *dst, ColiVkTensor *const *src, int n);
+void   coli_vk_xb_sub_copy_drop(void);
 int    coli_vk_staged(void);   /* 1 = resident data goes to the device through staged uploads */
 size_t coli_vk_tensor_row_bytes(int fmt, int I);
 int coli_vk_block_elems(int fmt);   /* block formats (100 + ggml type, 200-203): elements per block; else 0 */
 void *coli_vk_block_table_dev(int dev);   /* the VkBuffer their GEMVs read at binding 2 (blockdec_table.h), NULL without it */
 uint64_t coli_vk_block_table_addr(int dev);   /* that table's device address (bufferDeviceAddress), 0 without one */
+size_t coli_vk_block_table_bytes(int dev);   /* the bytes that table holds in the weight pool, 0 before the first block matrix */
 int coli_vk_set_vq2_books(const int8_t *a, const int8_t *b);   /* fmt 203's codebooks (256 x 8 int8 each) */
 /* What coli_vk_tensor_ensure(fmt, I, O, gs) adds to coli_vk_mem_info's bytes: the rows
  * at their padded stride and the scales (0 for a grouped format without a group size). */
@@ -400,6 +420,9 @@ void coli_vk_xb_stats_dev(int dev, ColiVkXbStats *st);
 /* 1 if the selected device is an integrated GPU (shares physical memory with
  * the host), 0 otherwise or when no device is selected. */
 int coli_vk_device_integrated(void);
+/* 1 if the selected device is an integrated GPU with many active compute units
+ * (COLI_VK_IGPU_MANY_CU, vk_igpu_threshold.h), 0 otherwise or when it reports none. */
+int coli_vk_device_igpu_many_cu(void);
 /* 1 for an integrated GPU or a CPU device (Lavapipe): device memory is host RAM. */
 int coli_vk_device_shares_ram(void);
 /* VK_KHR_shader_integer_dot_product on the primary device: 0 none, 1 supported, 2 with
@@ -412,7 +435,7 @@ int coli_vk_timeline(void);
 const void *coli_vk_tensor_host_rows(const ColiVkTensor *t, const void **scales);
 /* An expert's three tensors (gate, up, down), for coli_vk_tensor_host_rows. */
 void coli_vk_xb_expert_tensors(const ColiVkExpert *e, ColiVkTensor **g, ColiVkTensor **u, ColiVkTensor **d);
-/* The largest DEVICE_LOCAL heap in bytes (for a budget without VK_EXT_memory_budget). */
+/* The size of the device memory in bytes (for a budget without VK_EXT_memory_budget). */
 size_t coli_vk_device_local_bytes(void);
 const char *coli_vk_device_name(void);
 

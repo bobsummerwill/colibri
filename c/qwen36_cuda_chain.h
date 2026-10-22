@@ -60,6 +60,9 @@ typedef struct {
     int cap;                                   /* the host's kv_cap the mirrors follow */
     CcBuf *prm;                                /* every norm / conv / DeltaNet parameter */
     size_t *o_in, *o_post, *o_qn, *o_kn, *o_conv, *o_dn, o_final;
+    size_t *o_snk;                             /* Flint: a layer's sink logits in prm */
+    size_t *o_ra, *o_rf, *o_pre, *o_pf;        /* Muse Spark: residual gates (alpha | beta), pre_en, post_fn */
+    ColiCudaTensor **t_ag, **t_ld, **t_lu;     /* Muse Spark: the attention gate and the latent projections (the tier's) */
     ColiCudaTensor **t_ab, **t_sg, **t_gate;   /* the chain's own: DeltaNet b|a rows, shared gate row, router */
     ColiCudaTensor **t_q, **t_k, **t_v, **t_o, **t_dnp, **t_dno, **t_shg, **t_shu, **t_shd, *t_lm;   /* the tier's */
     CcBuf **rec, **ring, **kc, **vc;           /* per layer state */
@@ -69,6 +72,8 @@ typedef struct {
     int dn_where, host_zero;
     CcBuf *x, *nrm, *tmp, *q, *k, *v, *ctx, *qkvz, *ab, *cv, *dny, *h2, *lg, *gs, *us, *hs, *ds, *sgd, *fin;
     CcBuf *h2d, *lgd, *kvd, *outd, *xd, *lfd, *routed, *cs;
+    CcBuf *csd;   /* cs on the device: every RoPE of a step reads it there, not over the bus */
+    CcBuf *agb, *lat, *latd;   /* Muse Spark: the attention gate's rows, the experts' input rows */
     float *host_routed;
     /* the routed experts in the frame (q36cc_dm_*): the tier's residents on this device by
      * address ([L][E] entries, the host's copy of who is in it, the layers with some expert
@@ -180,6 +185,18 @@ static int q36cc_take(Q36CChain *ch, ColiCudaTensor **slot, ColiCudaTensor *t, i
     return 1;
 }
 
+/* The device bytes q36cc_setup's own tensors take (the router, b|a and gate rows), as it
+ * uploads them: qwen36's main keeps them out of the tier's allowance (qt_reserve). */
+static size_t q36cc_own_bytes(Model *m) {
+    Cfg *c = &m->c; size_t b = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        Layer *l = &m->L[i];
+        if (!c->is_attn[i]) b += (size_t)2 * c->dn_vheads * c->hidden * 4;
+        if (c->n_experts > 0 && !q36_dense_l(c, i)) b += (size_t)l->gate.I * l->gate.O * (l->gate.q ? 1 : 4);
+        if (l->sh_gate && l->sh_I > 0) b += (size_t)c->hidden * 4;
+    }
+    return b;
+}
 static void q36cc_free_own(Q36CChain *ch, Model *m) {
     int L = m->c.n_layers;
     if (ch->t_ab) for (int i = 0; i < L; i++) { if (ch->t_ab[i]) coli_cuda_tensor_free(ch->t_ab[i]); ch->t_ab[i] = NULL; }
@@ -205,6 +222,15 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
                 qq_active() ? "a qpack container" : g_pilot ? "PILOT prefetch reads the residual on the host" : "KV_SLOTS > 1 keeps one state per conversation on the host");
         return NULL;
     }
+    if (c->muse && !cc_muse_ready()) {
+        fprintf(stderr, "[chain] qwen36: the CUDA backend has no Muse Spark norms and gates (an older DLL); the per-matrix path\n");
+        return NULL;
+    }
+    if ((c->attn_sinks || c->win_layer) && !cc_attn_w_ready()) {
+        fprintf(stderr, "[chain] qwen36: the CUDA backend has no attention with a window and sinks (an older DLL); "
+                        "the per-matrix path\n");
+        return NULL;
+    }
     if (!q36cc_geometry_ok(c)) {
         fprintf(stderr, "[chain] qwen36: a geometry its kernels do not take (head dim %d, DeltaNet %dx%d); the per-matrix path\n",
                 c->head_dim, c->dn_kdim, c->dn_vdim);
@@ -216,6 +242,10 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
     ch->dev = -1;
     ch->o_in = calloc(L, sizeof(size_t)); ch->o_post = calloc(L, sizeof(size_t)); ch->o_qn = calloc(L, sizeof(size_t));
     ch->o_kn = calloc(L, sizeof(size_t)); ch->o_conv = calloc(L, sizeof(size_t)); ch->o_dn = calloc(L, sizeof(size_t));
+    ch->o_snk = calloc(L, sizeof(size_t));
+    ch->o_ra = calloc(L, sizeof(size_t)); ch->o_rf = calloc(L, sizeof(size_t));
+    ch->o_pre = calloc(L, sizeof(size_t)); ch->o_pf = calloc(L, sizeof(size_t));
+    ch->t_ag = calloc(L, sizeof(void *)); ch->t_ld = calloc(L, sizeof(void *)); ch->t_lu = calloc(L, sizeof(void *));
     ch->t_ab = calloc(L, sizeof(void *)); ch->t_sg = calloc(L, sizeof(void *)); ch->t_gate = calloc(L, sizeof(void *));
     ch->t_q = calloc(L, sizeof(void *)); ch->t_k = calloc(L, sizeof(void *)); ch->t_v = calloc(L, sizeof(void *));
     ch->t_o = calloc(L, sizeof(void *)); ch->t_dnp = calloc(L, sizeof(void *)); ch->t_dno = calloc(L, sizeof(void *));
@@ -223,7 +253,8 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
     ch->rec = calloc(L, sizeof(void *)); ch->ring = calloc(L, sizeof(void *));
     ch->kc = calloc(L, sizeof(void *)); ch->vc = calloc(L, sizeof(void *));
     ch->kv_valid = calloc(L, sizeof(int)); ch->attn_ord = calloc(L, sizeof(int));
-    if (!ch->o_in || !ch->o_post || !ch->o_qn || !ch->o_kn || !ch->o_conv || !ch->o_dn || !ch->t_ab || !ch->t_sg || !ch->t_gate ||
+    if (!ch->o_in || !ch->o_post || !ch->o_qn || !ch->o_kn || !ch->o_conv || !ch->o_dn || !ch->o_snk || !ch->t_ab || !ch->t_sg || !ch->t_gate ||
+        !ch->o_ra || !ch->o_rf || !ch->o_pre || !ch->o_pf || !ch->t_ag || !ch->t_ld || !ch->t_lu ||
         !ch->t_q || !ch->t_k || !ch->t_v || !ch->t_o || !ch->t_dnp || !ch->t_dno || !ch->t_shg || !ch->t_shu || !ch->t_shd ||
         !ch->rec || !ch->ring || !ch->kc || !ch->vc || !ch->kv_valid || !ch->attn_ord) return NULL;
     /* the tier's matrices, every one on one device */
@@ -236,14 +267,19 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
             Q36CC_TAKE(&ch->t_k[i], qt_dense_tensor(l->qth_k - 1, &d_), "k_proj");
             Q36CC_TAKE(&ch->t_v[i], qt_dense_tensor(l->qth_v - 1, &d_), "v_proj");
             Q36CC_TAKE(&ch->t_o[i], qt_dense_tensor(l->qth_o - 1, &d_), "o_proj");
+            if (c->muse) Q36CC_TAKE(&ch->t_ag[i], qt_dense_tensor(l->qth_ag - 1, &d_), "the attention's gate");
         } else {
             Q36CC_TAKE(&ch->t_dnp[i], qt_dnproj_tensor(i, &d_), "the DeltaNet in_proj");
             Q36CC_TAKE(&ch->t_dno[i], qt_dense_tensor(l->qth_dnout - 1, &d_), "the DeltaNet out_proj");
         }
-        if (c->shared_inter > 0) {
+        if (l->sh_I > 0) {   /* shared_inter, or a Flint dense layer's MLP */
             Q36CC_TAKE(&ch->t_shg[i], qt_dense_tensor(l->qth_shg - 1, &d_), "the shared expert's gate");
             Q36CC_TAKE(&ch->t_shu[i], qt_dense_tensor(l->qth_shu - 1, &d_), "the shared expert's up");
             Q36CC_TAKE(&ch->t_shd[i], qt_dense_tensor(l->qth_shd - 1, &d_), "the shared expert's down");
+        }
+        if (c->muse) {
+            Q36CC_TAKE(&ch->t_ld[i], qt_dense_tensor(l->qth_ld - 1, &d_), "the projection to the experts' width");
+            Q36CC_TAKE(&ch->t_lu[i], qt_dense_tensor(l->qth_lu - 1, &d_), "the projection from the experts' width");
         }
     }
     { int i = 0; Q36CC_TAKE(&ch->t_lm, qt_lmhead_tensor(&d_), "lm_head"); }
@@ -258,6 +294,11 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
         if (c->is_attn[i]) {
             if (m->L[i].qn) { ch->o_qn[i] = np; np += c->head_dim; }
             if (m->L[i].kn) { ch->o_kn[i] = np; np += c->k_head_dim; }
+            if (m->L[i].sinks) { ch->o_snk[i] = np; np += c->q_heads; }
+            if (c->muse) {
+                ch->o_ra[i] = np; np += 2 * (size_t)D; ch->o_rf[i] = np; np += 2 * (size_t)D;
+                ch->o_pre[i] = np; np += q36_eh(c); ch->o_pf[i] = np; np += D;
+            }
         } else {
             ch->o_conv[i] = np; np += (size_t)conv_dim * convk;
             ch->o_dn[i] = np; np += 2 * (size_t)vh + c->dn_vdim;
@@ -273,6 +314,13 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
         if (c->is_attn[i]) {
             if (l->qn) memcpy(arena + ch->o_qn[i], l->qn, c->head_dim * sizeof(float));
             if (l->kn) memcpy(arena + ch->o_kn[i], l->kn, c->k_head_dim * sizeof(float));
+            if (l->sinks) memcpy(arena + ch->o_snk[i], l->sinks, c->q_heads * sizeof(float));
+            if (c->muse) {
+                memcpy(arena + ch->o_ra[i], l->ra_a, D * sizeof(float)); memcpy(arena + ch->o_ra[i] + D, l->ra_b, D * sizeof(float));
+                memcpy(arena + ch->o_rf[i], l->rf_a, D * sizeof(float)); memcpy(arena + ch->o_rf[i] + D, l->rf_b, D * sizeof(float));
+                memcpy(arena + ch->o_pre[i], l->pre_en, q36_eh(c) * sizeof(float));
+                memcpy(arena + ch->o_pf[i], l->post_fn, D * sizeof(float));
+            }
         } else {
             memcpy(arena + ch->o_conv[i], l->dn_conv, (size_t)conv_dim * convk * sizeof(float));
             memcpy(arena + ch->o_dn[i], l->dn_alog, vh * sizeof(float));
@@ -300,8 +348,8 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
             ch->ring[i] = ch->rec[i] ? cc_buf((size_t)conv_dim * (convk - 1) * sizeof(float), CC_DEV) : NULL;
             ok = ch->t_ab[i] && ch->rec[i] && ch->ring[i];
         } else ch->attn_ord[i] = ch->n_attn++;
-        if (ok && c->n_experts > 0) { ch->t_gate[i] = q36cc_qw_tensor(ch->dev, &l->gate); ok = ch->t_gate[i] != NULL; own += (size_t)l->gate.I * l->gate.O * (l->gate.q ? 1 : 4); }
-        if (ok && l->sh_gate && c->shared_inter > 0) { ch->t_sg[i] = q36cc_f32_tensor(ch->dev, l->sh_gate, D, 1); ok = ch->t_sg[i] != NULL; own += (size_t)D * 4; }
+        if (ok && c->n_experts > 0 && !q36_dense_l(c, i)) { ch->t_gate[i] = q36cc_qw_tensor(ch->dev, &l->gate); ok = ch->t_gate[i] != NULL; own += (size_t)l->gate.I * l->gate.O * (l->gate.q ? 1 : 4); }
+        if (ok && l->sh_gate && l->sh_I > 0) { ch->t_sg[i] = q36cc_f32_tensor(ch->dev, l->sh_gate, D, 1); ok = ch->t_sg[i] != NULL; own += (size_t)D * 4; }
     }
     if (!ok) {
         fprintf(stderr, "[chain] qwen36: device memory for the chain's parameters refused; the per-matrix path\n");
@@ -328,7 +376,10 @@ static int q36cc_bufs(Q36CChain *ch, Model *m, int rows) {
     Cfg *c = &m->c; int D = c->hidden, H = c->q_heads, KV = c->kv_heads, hd = c->head_dim;
     int qo = H * c->q_head_dim, kvo = KV * c->k_head_dim, vd = c->dn_vheads * c->dn_vdim;
     int E = c->n_experts > 0 ? c->n_experts : 1, SI = c->shared_inter > 0 ? c->shared_inter : 1;
+    if (c->dense_layer && c->dense_inter > SI) SI = c->dense_inter;   /* Flint's dense layers: a wider MLP */
     size_t r = (size_t)rows, F = sizeof(float);
+    /* the routed sum's rows: the experts' width (Muse Spark's latent), at least the hidden */
+    const size_t RW = (size_t)(q36_eh(c) > D ? q36_eh(c) : D), LT = (size_t)q36_eh(c), AG = (size_t)H * hd;
     int ok = cc_reserve(&ch->x, r * D * F, CC_DEV) && cc_reserve(&ch->nrm, r * D * F, CC_DEV) && cc_reserve(&ch->tmp, r * D * F, CC_DEV) &&
              cc_reserve(&ch->q, r * qo * F, CC_DEV) && cc_reserve(&ch->k, r * kvo * F, CC_DEV) && cc_reserve(&ch->v, r * kvo * F, CC_DEV) &&
              cc_reserve(&ch->ctx, r * H * hd * F, CC_DEV) && cc_reserve(&ch->qkvz, r * (c->dn_conv_dim + vd) * F, CC_DEV) &&
@@ -338,8 +389,11 @@ static int q36cc_bufs(Q36CChain *ch, Model *m, int rows) {
              cc_reserve(&ch->ds, r * D * F, CC_DEV) && cc_reserve(&ch->sgd, r * F, CC_DEV) && cc_reserve(&ch->fin, D * F, CC_DEV) &&
              cc_reserve(&ch->h2d, r * D * F, CC_DOWN) && cc_reserve(&ch->lgd, r * E * F, CC_DOWN) &&
              cc_reserve(&ch->kvd, (size_t)(ch->n_attn ? ch->n_attn : 1) * 2 * r * kvo * F, CC_DOWN) &&
-             cc_reserve(&ch->outd, (size_t)c->vocab * F, CC_DOWN) && cc_reserve(&ch->routed, r * D * F, CC_UP) &&
-             cc_reserve(&ch->cs, r * (c->rotary_dim > 0 ? c->rotary_dim : 2) * F, CC_UP);
+             cc_reserve(&ch->outd, (size_t)c->vocab * F, CC_DOWN) && cc_reserve(&ch->routed, r * RW * F, CC_UP) &&
+             cc_reserve(&ch->cs, r * (c->rotary_dim > 0 ? c->rotary_dim : 2) * F, CC_UP) &&
+             cc_reserve(&ch->csd, r * (c->rotary_dim > 0 ? c->rotary_dim : 2) * F, CC_DEV);
+    if (ok && c->muse)   /* Muse Spark's alone: the attention gate's rows, the experts' input rows */
+        ok = cc_reserve(&ch->agb, r * AG * F, CC_DEV) && cc_reserve(&ch->lat, r * LT * F, CC_DEV) && cc_reserve(&ch->latd, r * LT * F, CC_DOWN);
     return ok;
 }
 /* the KV mirrors at the host's capacity (a cache that grew is mirrored again) */
@@ -359,7 +413,7 @@ static int q36cc_mirror(Q36CChain *ch, Model *m) {
     return 1;
 }
 static int q36cc_scratch(Q36CChain *ch, Model *m, int rows) {
-    Cfg *c = &m->c; int D = c->hidden;
+    Cfg *c = &m->c; int D = q36_eh(c) > c->hidden ? q36_eh(c) : c->hidden;   /* the routed sum's width */
     if (!q36cc_bufs(ch, m, rows)) return 0;
     if (ch->rows < rows) {
         float *hr = realloc(ch->host_routed, (size_t)rows * D * sizeof(float));
@@ -463,19 +517,33 @@ static int q36cc_norm(CcBuf *x, size_t xo, CcBuf *w, size_t wo, CcBuf *y, size_t
     CcNorm p = {rows, D, 1, (int)xo, D, D, (int)yo, D, D, (int)wo, 0, CC_NORM_ADD1, eps, 1.f};
     return cc_norm(x, w, y, &p);
 }
+/* The heads' output (ctx) through o_proj into tmp; Muse Spark normalises every head's
+ * output first, then gates it by sigmoid(attn_gate(x)) (agb, recorded with q/k/v). */
+static int q36cc_attn_out(Q36CChain *ch, Model *m, int i, int n) {
+    Cfg *c = &m->c; int H = c->q_heads, hd = c->head_dim;
+    if (c->muse) {
+        CcNorm p = {n * H, hd, H, 0, H * hd, hd, 0, H * hd, hd, 0, 0, CC_NORM_NOW, c->eps, 1.f};
+        CcEw g = {CC_EW_SIGMUL, n * H * hd, H * hd, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
+        if (!cc_norm(ch->ctx, ch->prm, ch->ctx, &p) || !cc_ew(ch->ctx, ch->ctx, ch->agb, NULL, NULL, &g)) return 0;
+    }
+    return cc_matmul(ch->t_o[i], ch->ctx, 0, ch->tmp, 0, n);
+}
 static int q36cc_attention(Q36CChain *ch, Model *m, Layer *l, int i, int n, int pb) {
     Cfg *c = &m->c;
     int H = c->q_heads, KV = c->kv_heads, hd = c->head_dim, qdim = c->q_head_dim, kvd = c->k_head_dim;
     int qo = H * qdim, kvo = KV * kvd, half = c->rotary_dim / 2, gate_dim = qdim > hd ? qdim - hd : 0;
+    if (c->nope_layer && c->nope_layer[i]) half = 0;   /* Flint: a layer without RoPE */
+    const int win = c->win_layer && c->win_layer[i] ? c->window : 0;
     int ok = cc_matmul(ch->t_q[i], ch->nrm, 0, ch->q, 0, n) &&
              cc_matmul(ch->t_k[i], ch->nrm, 0, ch->k, 0, n) &&
              cc_matmul(ch->t_v[i], ch->nrm, 0, ch->v, 0, n);
+    if (ok && c->muse) ok = cc_matmul(ch->t_ag[i], ch->nrm, 0, ch->agb, 0, n);
     if (ok && l->qn) { CcNorm p = {n * H, hd, H, 0, qo, qdim, 0, qo, qdim, (int)ch->o_qn[i], 0, CC_NORM_ADD1, c->eps, 1.f};
                        ok = cc_norm(ch->q, ch->prm, ch->q, &p); }
-    if (ok && half) { CcRope p = {n * H, H, 0, qo, qdim, half, 0, 2 * half}; ok = cc_rope(ch->q, ch->cs, &p); }
+    if (ok && half) { CcRope p = {n * H, H, 0, qo, qdim, half, 0, 2 * half}; ok = cc_rope(ch->q, ch->csd, &p); }
     if (ok && l->kn) { CcNorm p = {n * KV, kvd, KV, 0, kvo, kvd, 0, kvo, kvd, (int)ch->o_kn[i], 0, CC_NORM_ADD1, c->eps, 1.f};
                        ok = cc_norm(ch->k, ch->prm, ch->k, &p); }
-    if (ok && half) { CcRope p = {n * KV, KV, 0, kvo, kvd, half, 0, 2 * half}; ok = cc_rope(ch->k, ch->cs, &p); }
+    if (ok && half) { CcRope p = {n * KV, KV, 0, kvo, kvd, half, 0, 2 * half}; ok = cc_rope(ch->k, ch->csd, &p); }
     if (!ok) return 0;
     /* the new rows into the device cache, and to the host's */
     size_t ko = (size_t)ch->attn_ord[i] * 2 * ch->rows * kvo;
@@ -488,8 +556,12 @@ static int q36cc_attention(Q36CChain *ch, Model *m, Layer *l, int i, int n, int 
     free(rg);
     CcAttn a = {n, H, KV, hd, pb, ch->cap, 0, qo, qdim, hd, qo, qdim, gate_dim > 0, 0, H * hd, 0, 0,
                 1.f / sqrtf((float)hd), 0, 0};
-    return ok && cc_attn(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, NULL, &a) &&
-           cc_matmul(ch->t_o[i], ch->ctx, 0, ch->tmp, 0, n);
+    if (win || l->sinks) {   /* Flint: a sliding window and a sink per head */
+        CcAttnW w = {a, win, l->sinks != NULL, (int)ch->o_snk[i]};
+        return ok && cc_attn_w(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, l->sinks ? ch->prm : NULL, &w) &&
+               q36cc_attn_out(ch, m, i, n);
+    }
+    return ok && cc_attn(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, NULL, &a) && q36cc_attn_out(ch, m, i, n);
 }
 /* ns: the chunk's rows a verify copies the state after (rows 0..ns-1, slots c0..): the
  * convolution and the recurrence split into one dispatch per copy, each ending on its
@@ -515,7 +587,7 @@ static int q36cc_deltanet(Q36CChain *ch, Model *m, Layer *l, int i, int n, int c
     return ok && cc_matmul(ch->t_dno[i], ch->dny, 0, ch->tmp, 0, n);
 }
 static int q36cc_shared(Q36CChain *ch, Model *m, Layer *l, int i, int n) {
-    Cfg *c = &m->c; int ok = 1, SI = c->shared_inter; (void)l;
+    int ok = 1, SI = l->sh_I; (void)m;   /* shared_inter, or a Flint dense layer's MLP width */
     if (SI > 0) {
         CcEw p = {CC_EW_SWIGLU, n * SI, SI, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
         ok = cc_matmul(ch->t_shg[i], ch->h2, 0, ch->gs, 0, n) &&
@@ -529,7 +601,15 @@ static int q36cc_shared(Q36CChain *ch, Model *m, Layer *l, int i, int n) {
 /* x += routed + gate * shared, as moe() leaves `out` and layers_forward_range adds it */
 static int q36cc_combine(Q36CChain *ch, Model *m, int i, int n, CcBuf *routed) {
     Cfg *c = &m->c;
-    int flags = (c->n_experts > 0 ? 1 : 0) | (c->shared_inter > 0 ? 2 : 0) | (m->L[i].sh_gate && c->shared_inter > 0 ? 4 : 0);
+    if (c->muse) {   /* Muse Spark: the routed sum back to the hidden width, normalised, through the residual gate */
+        const int D = c->hidden;
+        CcNorm p = {n, D, 1, 0, D, D, 0, D, D, (int)ch->o_pf[i], 0, CC_NORM_PRESCALE, c->post_eps, 1.f};
+        CcEw g = {CC_EW_RESGATE, n * D, D, 1, 0, 1, 0, 0, 0, (int)ch->o_rf[i] + D, (int)ch->o_rf[i], 1.f};
+        return cc_matmul(ch->t_lu[i], routed, 0, ch->tmp, 0, n) &&
+               cc_norm(ch->tmp, ch->prm, ch->tmp, &p) && cc_ew(ch->x, ch->x, ch->tmp, ch->prm, ch->prm, &g);
+    }
+    const int routed_l = c->n_experts > 0 && !q36_dense_l(c, i), SI = m->L[i].sh_I;   /* a Flint dense layer routes nothing */
+    int flags = (routed_l ? 1 : 0) | (SI > 0 ? 2 : 0) | (m->L[i].sh_gate && SI > 0 ? 4 : 0);
     CcEw p = {CC_EW_COMBINE, n * c->hidden, c->hidden, 1, flags, 1, 0, 0, 0, 0, 0, 1.f};
     return cc_ew(ch->x, ch->x, routed, ch->ds, ch->sgd, &p);
 }
@@ -712,7 +792,7 @@ static void q36cc_dm_end(Q36CChain *ch) { if (ch->dm_held) { qt_chain_hold(0); c
 static int q36cc_dm_layer(Q36CChain *ch, Model *m, Layer *l, int i, int n, unsigned *v) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
     int ng = c->n_group > 1 && c->n_group <= E ? c->n_group : 1, io = i * ch->rows * K;
-    CcRoute rp = {n, E, K, 0, 0, E, 0, 0, io, K, io, K, ng, ng > 1 ? c->topk_group : 1, 1, 1.f, 1.f, 0.f};
+    CcRoute rp = {n, E, K, c->router_sigmoid ? 1 : 0, 0, E, 0, 0, io, K, io, K, ng, ng > 1 ? c->topk_group : 1, 1, 1.f, 1.f, 0.f};
     int part;
     CcBuf *tab = q36cc_dm_tab(ch, i, n, &part);
     CcMoe mp = {n, K, D, I, ch->dm_fmt, ch->dm_gs, 0, 1, i * E, 0, D, io, K, io, K, 0, D, -1, E, tab == ch->dm_tabb, 0};
@@ -788,6 +868,7 @@ static int q36cc_rows_max(Q36CChain *ch, Model *m) {
     if (env) return ch->rows_max = env;
     Cfg *c = &m->c; int D = c->hidden, I = c->inter, L = c->n_layers, K = c->topk > 0 ? c->topk : 1;
     int E = c->n_experts > 0 ? c->n_experts : 1, SI = c->shared_inter > 0 ? c->shared_inter : 1;
+    if (c->dense_layer && c->dense_inter > SI) SI = c->dense_inter;   /* Flint's dense layers: a wider MLP */
     int qo = c->q_heads * c->q_head_dim, kvo = c->kv_heads * c->k_head_dim, vd = c->dn_vheads * c->dn_vdim;
     /* q36cc_bufs' device rows and the routed experts' (q36cc_dm_begin), per row */
     size_t row = ((size_t)6 * D + qo + 2 * kvo + (size_t)c->q_heads * c->head_dim + 2 * (size_t)c->dn_conv_dim + 2 * vd +
@@ -861,6 +942,9 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         if (dm) memset(ch->dm_ran, 0, (size_t)L);
         if (!q36cc_frame_begin(ch) || !cc_write(ch->x, 0, xh + (size_t)c0 * D, (size_t)n * D * sizeof(float)) ||
             !q36cc_push_state(ch, m, pb)) goto lost;
+        /* the angles to the device once a step: a RoPE that read them where the host wrote them
+         * paid the bus on every element, 11-16 us a call (Flint: 70 calls a token) */
+        if (half && !cc_copy(ch->csd, 0, ch->cs, 0, (size_t)n * 2 * half)) goto lost;
         if (dm && q36cc_dm_tab(ch, 0, n, &(int){0}) == ch->dm_tabb && !q36cc_stage_from(ch, m, 0)) goto lost;   /* the first staged layer's copy */
         int ok = 1, pending = 0, pend_i = -1;   /* pend_i: the hybrid layer the host serves after recording the next */
         unsigned pend_v = 0;
@@ -875,12 +959,18 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
             ok = ok && (c->is_attn[i] ? q36cc_attention(ch, m, l, i, n, pb) : q36cc_deltanet(ch, m, l, i, n, c0, ns));
             if (ok && lf) ok = cc_copy(ch->lfd, (size_t)i * 3 * D, ch->tmp, (size_t)(n - 1) * D, D);
             CcEw add = {CC_EW_ADD, n * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
+            if (c->muse) {   /* Muse Spark: the branch normalised, then the residual gate */
+                CcNorm pn = {n, D, 1, 0, D, D, 0, D, D, 0, 0, CC_NORM_NOW, c->post_eps, 1.f};
+                CcEw g = {CC_EW_RESGATE, n * D, D, 1, 0, 1, 0, 0, 0, (int)ch->o_ra[i] + D, (int)ch->o_ra[i], 1.f};
+                ok = ok && cc_norm(ch->tmp, ch->prm, ch->tmp, &pn) && cc_ew(ch->x, ch->x, ch->tmp, ch->prm, ch->prm, &g);
+            } else
             ok = ok && cc_ew(ch->x, ch->x, ch->tmp, NULL, NULL, &add);
             if (ok && lf) ok = cc_copy(ch->lfd, ((size_t)i * 3 + 1) * D, ch->x, (size_t)(n - 1) * D, D);
             ok = ok && q36cc_norm(ch->x, 0, ch->prm, ch->o_post[i], ch->h2, 0, n, D, c->eps);
+            const int routed_l = E > 0 && !q36_dense_l(c, i);   /* a Flint dense layer: its MLP only */
             int dpart = 0;
-            if (dm) (void)q36cc_dm_tab(ch, i, n, &dpart);
-            if (ok && dm && (n <= Q36CC_DM_ROWS || !dpart)) {   /* routed in the frame, the residents (and a prompt chunk's
+            if (dm && routed_l) (void)q36cc_dm_tab(ch, i, n, &dpart);
+            if (ok && dm && routed_l && (n <= Q36CC_DM_ROWS || !dpart)) {   /* routed in the frame, the residents (and a prompt chunk's
                                                               * host pool) here; a hybrid layer's host share once the next is recorded */
                 unsigned v = 0;
                 ch->dm_ran[i] = 1;
@@ -889,9 +979,14 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
                 pend_i = i; pend_v = v; routed = ch->dm_y; pending = 1;
                 continue;
             }
-            if (ok && E > 0) {
-                ok = cc_matmul(ch->t_gate[i], ch->h2, 0, ch->lg, 0, n) &&
-                     cc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E) && cc_copy(ch->h2d, 0, ch->h2, 0, (size_t)n * D);
+            if (ok && routed_l) {
+                ok = cc_matmul(ch->t_gate[i], ch->h2, 0, ch->lg, 0, n) && cc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E);
+                if (c->muse) {   /* Muse Spark: the experts read the rows at their width, normalised */
+                    CcNorm pn = {n, q36_eh(c), 1, 0, q36_eh(c), q36_eh(c), 0, q36_eh(c), q36_eh(c), (int)ch->o_pre[i], 0, CC_NORM_ADD1, c->eps, 1.f};
+                    ok = ok && cc_matmul(ch->t_ld[i], ch->h2, 0, ch->lat, 0, n) && cc_norm(ch->lat, ch->prm, ch->lat, &pn) &&
+                         cc_copy(ch->latd, 0, ch->lat, 0, (size_t)n * q36_eh(c));
+                } else
+                ok = ok && cc_copy(ch->h2d, 0, ch->h2, 0, (size_t)n * D);
                 if (ok && pend_v) { ok = q36cc_dm_serve(ch, m, pend_i, n, pend_v); pend_v = 0; }   /* before a wait for the frame */
                 double t0 = tm_now();
                 ok = ok && cc_submit(1);   /* A1 */
@@ -908,8 +1003,8 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
                 /* A2: the shared expert, while the host computes the routed experts */
                 ok = q36cc_frame_begin(ch) && q36cc_shared(ch, m, l, i, n) && cc_submit(0);
                 double t1 = tm_now();
-                moe_ex(m, l, i, (float *)cc_ptr(ch->h2d), n, ch->host_routed, (const float *)cc_ptr(ch->lgd), 1);
-                memcpy(cc_ptr(ch->routed), ch->host_routed, (size_t)n * D * sizeof(float));
+                moe_ex(m, l, i, (float *)cc_ptr(c->muse ? ch->latd : ch->h2d), n, ch->host_routed, (const float *)cc_ptr(ch->lgd), 1);
+                memcpy(cc_ptr(ch->routed), ch->host_routed, (size_t)n * q36_eh(c) * sizeof(float));
                 double t2 = tm_now();
                 tm_add(n, 2, t2 - t1); ch->host_ms += t2 - t1;
                 ok = ok && q36cc_frame_begin(ch);
