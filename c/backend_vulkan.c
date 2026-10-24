@@ -666,9 +666,15 @@ static void up_img_free(uint8_t *p, int aligned) {
 #endif
     free(p);
 }
-/* Copies straight from host memory on this device (up_import): VK_EXT_external_memory_host
- * enabled, staged uploads on, COLI_VK_UP_IMPORT not 0. After up_init. */
-static void up_import_init(VkUp *u, VkPhysicalDevice phys, int has_hostmem, const char *who) {
+static int up_import_probe(VkUp *u, int dev, double ms[2]);
+/* Copies straight from host memory on device dev (up_import): VK_EXT_external_memory_host
+ * enabled, staged uploads on, COLI_VK_UP_IMPORT not 0. Unset, they are measured against
+ * the staging buffer first (up_import_probe) and kept only where they are faster: an
+ * import costs the driver a pin and an unpin of every page, which on some devices takes
+ * longer than the copy into the staging buffer it saves (an RTX 3090 or 5070: ~0.4 ms an
+ * import, against ~0.002 ms on an Intel UHD 770). A COLI_VK_STAGED_FAULT test keeps them
+ * on without measuring, so the probe does not reach its fault point. After up_init. */
+static void up_import_init(VkUp *u, int dev, VkPhysicalDevice phys, int has_hostmem, const char *who) {
     u->imp_align = 0; u->imp_props = NULL;
 #ifdef VK_EXT_external_memory_host
     const char *e = getenv("COLI_VK_UP_IMPORT");
@@ -679,10 +685,25 @@ static void up_import_init(VkUp *u, VkPhysicalDevice phys, int has_hostmem, cons
     u->imp_props = (void *)vkGetDeviceProcAddr(u->dev, "vkGetMemoryHostPointerPropertiesEXT");
     if (!u->imp_props) return;
     u->imp_align = hp.minImportedHostPointerAlignment ? (size_t)hp.minImportedHostPointerAlignment : 4096;
+    char how[160] = "COLI_VK_UP_IMPORT=0 stages every copy";
+    if (!(e && *e) && !coli_vk_fault_set()) {
+        double ms[2];
+        int r = up_import_probe(u, dev, ms);
+        if (r == 0) {
+            fprintf(stderr, "[VK] %sstaged uploads: every copy through the staging buffer, faster here than imports "
+                    "of host memory (48 MiB: %.1f ms staged, %.1f ms imported; COLI_VK_UP_IMPORT=1 imports)\n",
+                    who, ms[0], ms[1]);
+            u->imp_align = 0; u->imp_props = NULL;
+            return;
+        }
+        if (r > 0)
+            snprintf(how, sizeof how, "faster here: 48 MiB %.1f ms imported, %.1f ms staged; "
+                     "COLI_VK_UP_IMPORT=0 stages every copy", ms[1], ms[0]);
+    }
     fprintf(stderr, "[VK] %sstaged uploads: copied straight from host memory where its pages import "
-            "(%zu KiB pages; COLI_VK_UP_IMPORT=0 stages every copy)\n", who, u->imp_align >> 10);
+            "(%zu KiB pages; %s)\n", who, u->imp_align >> 10, how);
 #else
-    (void)phys; (void)has_hostmem; (void)who;
+    (void)dev; (void)phys; (void)has_hostmem; (void)who;
 #endif
 }
 static int up_init(VkUp *u) {
@@ -1411,7 +1432,7 @@ int coli_vk_init(const char *spv_path) {
             up_destroy(&g_up[0]);
             g_up[0].on = g_up[0].shared = 0;
         }
-        up_import_init(&g_up[0], G.phys, G.has_hostmem, "");
+        up_import_init(&g_up[0], 0, G.phys, G.has_hostmem, "");
         if (g_up[0].on) {
             VkUp *u = &g_up[0];
             fprintf(stderr, "[VK] memory: staged uploads, resident data in device-local memory (type %u, %llu MiB heap) "
@@ -1791,6 +1812,63 @@ static void up_sharing(const VkUp *u, VkBufferCreateInfo *bi) {
         bi->queueFamilyIndexCount = u->nfams; bi->pQueueFamilyIndices = u->fams;
     }
 }
+/* up_import_init's measurement: 48 MiB to a scratch device-local buffer as the tier commits
+ * them, one expert (3 matrices of 4 MiB) and then a group of 9 (st_fill_group's), from fresh
+ * host images (up_img_alloc), staged and imported, each way twice, interleaved. ms[0] the
+ * best staged time, ms[1] the best imported. 1 = imports faster, 0 = staged faster, -1 =
+ * not measured (no scratch memory, a refused import or a failed copy): imports stay on, as
+ * before. The exit report's counters leave the probe out. */
+#ifdef VK_EXT_external_memory_host
+static int up_import_probe(VkUp *u, int dev, double ms[2]) {
+    enum { NI = 12, NE = 3 };
+    const size_t B = (size_t)4 << 20;
+    ms[0] = ms[1] = 1e30;
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = NI * B,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    up_sharing(u, &bi);
+    VkBuffer d = VK_NULL_HANDLE; VkDeviceMemory m = VK_NULL_HANDLE;
+    if (vkCreateBuffer(u->dev, &bi, NULL, &d) != VK_SUCCESS) return -1;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(u->dev, d, &req);
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size,
+        .memoryTypeIndex = u->mt_dev};
+    if (!(req.memoryTypeBits & (1u << u->mt_dev)) || vkAllocateMemory(u->dev, &ai, NULL, &m) != VK_SUCCESS ||
+        vkBindBufferMemory(u->dev, d, m, 0) != VK_SUCCESS) {
+        vkDestroyBuffer(u->dev, d, NULL);
+        if (m) vkFreeMemory(u->dev, m, NULL);
+        return -1;
+    }
+    unsigned long long keep[7] = {u->bytes, u->copies, u->submits, u->imp_bytes, u->imp_copies, u->imp_refused,
+                                  u->blocks_filled};
+    uint8_t *img[NI] = {0}, al[NI];
+    int ok = 1;
+    pthread_mutex_lock(&u->mx);
+    for (int r = 0; r < 2 && ok; r++)
+        for (int w = 0; w < 2 && ok; w++) {
+            for (int i = 0; i < NI && ok; i++) ok = (img[i] = up_img_alloc(dev, B, &al[i])) != NULL;
+            double t0 = vk_now();
+            for (int c = 0; c < 2 && ok; c++) {   /* the expert, then the group */
+                for (int i = c ? NE : 0; i < (c ? NI : NE) && ok; i++) {
+                    size_t z = 0, off = (size_t)i * B, len = B;
+                    ok = w ? up_add_host(u, dev, img[i], B, 1, &d, &off, &z, &len)
+                           : up_add(u, dev, d, off, B, up_fill_bytes, img[i]);
+                }
+                ok = up_finish(u, dev) && ok;
+            }
+            double t = vk_now() - t0;
+            for (int i = 0; i < NI; i++) { up_img_free(img[i], al[i]); img[i] = NULL; }
+            if (ok && t < ms[w]) ms[w] = t;
+        }
+    pthread_mutex_unlock(&u->mx);
+    u->bytes = keep[0]; u->copies = keep[1]; u->submits = keep[2]; u->imp_bytes = keep[3]; u->imp_copies = keep[4];
+    u->imp_refused = keep[5]; u->blocks_filled = keep[6];
+    vkDestroyBuffer(u->dev, d, NULL); vkFreeMemory(u->dev, m, NULL);
+    if (!ok) return -1;
+    return ms[1] < ms[0];
+}
+#else
+static int up_import_probe(VkUp *u, int dev, double ms[2]) { (void)u; (void)dev; ms[0] = ms[1] = 0; return -1; }
+#endif
 /* A fresh device-local block, filled with zeros before its first tensor. A contributor
  * measured on an RX 580 (RADV, Polaris) that without this first touch the results
  * read from a fresh block differed slightly and from run to run (#1338); the fill value
@@ -3055,7 +3133,7 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
             up_destroy(u); u->on = u->shared = 0;
         } else fprintf(stderr, "[VK] dev2 memory: staged uploads, experts in device-local memory (type %u) copied from "
                        "host staging memory (type %u) (%s)\n", u->mt_dev, u->mt_stage, u->why);
-        up_import_init(u, G2.phys, G2.has_hostmem, "dev2 ");
+        up_import_init(u, 1, G2.phys, G2.has_hostmem, "dev2 ");
     }
     G2.sh_qmm = load_spv(G2.dev, spv_path);
     if (!G2.sh_qmm) return 0;

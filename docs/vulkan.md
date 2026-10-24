@@ -3258,13 +3258,27 @@ second time. It applies to:
   converted in, which is allocated aligned to the device's import alignment;
 - the trunk's rows from the weights themselves, when they need no padding.
 
-An import lives until its command buffer's fence. Pages the driver will not import (some
-file-backed mappings, a refusal) are staged as before. The second device (`COLI_VK_DEV2`)
-does the same. `COLI_VK_UP_IMPORT=0` stages every copy; a `[VK] staged uploads: copied
-straight from host memory` line says imports are on, and the exit report counts the
-imported bytes and copies and the refused ones. On Lavapipe the results are the same bits
-either way. On a discrete card it removes a host copy of every uploaded byte, which matters
-most for the tier's warm start and the trunk's placement; its speed there was not measured.
+An import lives until its command buffer's fence. As with staged copies, a slot is
+submitted once its copies reach 16 MiB, so the next imports overlap them. Pages the driver
+will not import (some file-backed mappings, a refusal) are staged as before. The second
+device (`COLI_VK_DEV2`) does the same. On Lavapipe the results are the same bits either way.
+
+An import saves the CPU's copy of every byte, but the driver pins its pages and unpins them
+after the copy, and that is not free everywhere. Measured outside the engine, from fresh
+host images of 5 MiB, the imports submitted every 16 MiB:
+
+| device | an import + its release | one expert (3 × 5 MiB), staged / imported | 64 experts, staged / imported |
+|---|---|---|---|
+| RTX 3090 (no Resizable BAR, PCIe 4.0 x8) | ~0.4 ms | 8.8 / 6.9 GB/s | 13.1 / 10.2 GB/s |
+| RTX 5070 | ~0.4 ms | 10.1 / 7.3 GB/s | 11.6 / 12.4 GB/s |
+| Intel UHD 770 | ~0.002 ms | 3.5 / 4.2 GB/s | 7.4 / 8.8 GB/s |
+
+So the default is measured: with `COLI_VK_UP_IMPORT` unset, 48 MiB go to the device at start
+both ways (one expert's three 4 MiB matrices, then a group of nine), each twice, and the
+imports stay on only if they were faster. A `[VK] staged uploads:` line gives both times.
+`COLI_VK_UP_IMPORT=1` imports, `=0` stages every copy, and a `COLI_VK_STAGED_FAULT` test
+keeps the imports on without measuring. The exit report counts the imported bytes and
+copies and the refused ones.
 
 **The rule** (`place_decide` in `backend_vulkan.c`). `COLI_VK_STAGED=1` stages,
 `COLI_VK_STAGED=0` keeps the mapped path. Unset: staged when the host-visible
