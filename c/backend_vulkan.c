@@ -304,6 +304,7 @@ typedef struct {
     VkCommandPool cpool; VkCommandBuffer cmd[VK_UP_SLOTS]; VkFence fence[VK_UP_SLOTS];
     int pending[VK_UP_SLOTS];         /* submitted and not waited for */
     int cur, open; size_t used;       /* the slot being filled: commands recorded, bytes used */
+    size_t imp_used;                  /* and the bytes its copies take straight from host memory */
     VkBuffer sbuf; VkDeviceMemory smem; uint8_t *sptr;   /* VK_UP_SLOTS slots of VK_UP_SLOT bytes */
     int fill;                         /* zero-fill a fresh device-local block before its first use */
     int failed;                       /* the upload under way failed (cleared by up_finish) */
@@ -1641,7 +1642,7 @@ static int up_open(VkUp *u) {
     if (r == VK_SUCCESS && up_fault("record")) r = VK_ERROR_OUT_OF_HOST_MEMORY;
     if (r == VK_SUCCESS) r = vkBeginCommandBuffer(u->cmd[u->cur], &bi);
     if (r != VK_SUCCESS) return up_fail(u, r, "command buffer");
-    u->open = 1; u->used = 0;
+    u->open = 1; u->used = 0; u->imp_used = 0;
     return 1;
 }
 static int up_submit(VkUp *u, int dev) {
@@ -1733,17 +1734,21 @@ static int up_import(VkUp *u, const void *src, size_t bytes, VkBuffer *buf, VkDe
 }
 /* Copies of n ranges of one host region (src: base, bytes in all), each region's
  * src_off[i], len[i] to dst[i] at dst_off[i], straight from the imported pages. 0 = not
- * imported (the caller stages); nothing was recorded then. */
-static int up_add_host(VkUp *u, const void *src, size_t bytes, int n, const VkBuffer *dst, const size_t *dst_off,
-                       const size_t *src_off, const size_t *len) {
+ * imported (the caller stages); nothing was recorded then. A slot whose copies reach
+ * VK_UP_SLOT bytes, staged or imported, is submitted, as up_add does: the next imports
+ * then overlap its copies, and at most a slot's worth of pages per slot stays imported.
+ * A refused submit is this upload's failure (up_finish), the copies count as recorded. */
+static int up_add_host(VkUp *u, int dev, const void *src, size_t bytes, int n, const VkBuffer *dst,
+                       const size_t *dst_off, const size_t *src_off, const size_t *len) {
     VkBuffer b; VkDeviceSize o;
     if (!up_import(u, src, bytes, &b, &o)) return 0;
     for (int i = 0; i < n; i++) {
         if (!len[i]) continue;
         VkBufferCopy c = {o + src_off[i], dst_off[i], len[i]};
         vkCmdCopyBuffer(u->cmd[u->cur], b, dst[i], 1, &c);
-        u->imp_bytes += len[i]; u->imp_copies++;
+        u->imp_bytes += len[i]; u->imp_copies++; u->imp_used += len[i];
     }
+    if (u->used + u->imp_used >= VK_UP_SLOT) up_submit(u, dev);
     return 1;
 }
 /* Always called, also after a failed up_add: the slots sent are waited for. 1 = all on
@@ -1999,7 +2004,7 @@ static int upload_tensor_pool(VkWPool *P, ColiVkTensor **out, const void *weight
         pthread_mutex_lock(&u->mx);
         /* rows without padding: straight from the weights when their pages import */
         size_t z = 0;
-        int ok = ((rows.cpu_rb == rows.stride && up_add_host(u, weights, t->wbytes, 1, &t->wbuf, &z, &z, &t->wbytes)) ||
+        int ok = ((rows.cpu_rb == rows.stride && up_add_host(u, P->dev, weights, t->wbytes, 1, &t->wbuf, &z, &z, &t->wbytes)) ||
                   up_add(u, P->dev, t->wbuf, 0, t->wbytes, up_fill_rows, &rows)) &&
                  up_add(u, P->dev, t->sbuf, 0, sb, up_fill_bytes, fmt == 10 || fmt == 11 || fmt == 14 || bd_fmt(fmt) ? (const void *)&one : scales);
         ok = up_finish(u, P->dev) && ok;
@@ -5790,7 +5795,7 @@ int coli_vk_tensor_commit(ColiVkTensor *const *t, int n) {
         /* straight from the host image when its pages import (up_import), else staged */
         VkBuffer dst[2] = {t[k]->wbuf, t[k]->sbuf};
         size_t doff[2] = {0, 0}, soff[2] = {0, t[k]->wbytes}, len[2] = {t[k]->wbytes, sb};
-        ok = up_add_host(u, t[k]->img, t[k]->wbytes + sb, 2, dst, doff, soff, len) ||
+        ok = up_add_host(u, dev, t[k]->img, t[k]->wbytes + sb, 2, dst, doff, soff, len) ||
              (up_add(u, dev, t[k]->wbuf, 0, t[k]->wbytes, up_fill_bytes, t[k]->img) &&
               up_add(u, dev, t[k]->sbuf, 0, sb, up_fill_bytes, t[k]->img + t[k]->wbytes));
         if (ok && k == 0 && n > 1 && up_fault("commit")) ok = up_fail(u, VK_ERROR_OUT_OF_DEVICE_MEMORY, "commit");
