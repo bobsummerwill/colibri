@@ -90,6 +90,7 @@ typedef struct { int S, VH, KH, VD, Ktot, cv_off, cv_row, b_off, b_row, a_off, a
 #define CC_EW_GATE_ADD 8
 #define CC_EW_SIGMUL   9    /* y = a * sigmoid(b) (cc_muse_ready) */
 #define CC_EW_RESGATE  10   /* y = e[col] * a + c[col] * b (cc_muse_ready) */
+#define CC_EW_F16      11   /* y = a clamped to +-65504, rounded to the nearest float16, as kv16.h (cc_kv16_ready) */
 typedef struct { int op, n, D, C, flags, e_row, y_off, a_off, b_off, c_off, e_off; float fc; } CcEw;
 /* chain_qsa.comp (mode 0: nb block keys from b0; mode 1: S rows' selections) */
 typedef struct { int mode, ID, R, b0, half_, S, pos_base, budget, IQ, q_off, q_row, nbmax, sel_row; float eps;
@@ -250,6 +251,12 @@ typedef struct ColiCudaChainOps {
     /* muse: 1 when the norm takes CC_NORM_PRESCALE and ew CC_EW_SIGMUL and CC_EW_RESGATE (an
      * older backend's kernels would skip them without a word) */
     int  (*muse)(void);
+    /* attn_wr: attn_w over a cache that is a ring of `ring` rows (position t in row t % ring,
+     * p->a.cap == ring): a sliding layer's (qwen36 Flint, Muse Spark), whose rows must hold
+     * the step's rows and their windows (ring >= win + S - 1); 0: attn_w */
+    int  (*attn_wr)(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *p, int ring);
+    /* kv16: 1 when ew takes CC_EW_F16 (an older backend's kernel would skip it without a word) */
+    int  (*kv16)(void);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -315,6 +322,14 @@ static inline int cc_moe_stage(CcBuf *b, size_t slot_bytes, int slots) { return 
 static inline int cc_attn_w_ready(void) { const ColiCudaChainOps *t = cc_ops(); return t && t->size >= offsetof(ColiCudaChainOps, attn_w) + sizeof t->attn_w; }
 static inline int cc_attn_w(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *p) {
     return cc_attn_w_ready() ? cc_ops()->attn_w(q, kc, vc, o, gate, snk, p) : 0;
+}
+static inline int cc_attn_wr_ready(void) { const ColiCudaChainOps *t = cc_ops(); return t && t->size >= offsetof(ColiCudaChainOps, attn_wr) + sizeof t->attn_wr; }
+static inline int cc_attn_wr(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *p, int ring) {
+    return cc_attn_wr_ready() ? cc_ops()->attn_wr(q, kc, vc, o, gate, snk, p, ring) : 0;
+}
+static inline int cc_kv16_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, kv16) + sizeof t->kv16 && t->kv16 && t->kv16();
 }
 static inline int cc_muse_ready(void) {
     const ColiCudaChainOps *t = cc_ops();

@@ -49,6 +49,9 @@ static const CuTierOps *cut_ops(void) {
 #define coli_vk_tier_pool_limit_dev(...) (cut_ops()->tier_pool_limit_dev(__VA_ARGS__))
 #define coli_vk_tier_extra_pool_limit(...) (cut_ops()->tier_extra_pool_limit(__VA_ARGS__))
 #define coli_vk_tier_host_pool(...) (cut_ops()->tier_host_pool(__VA_ARGS__))
+/* the CUDA tier's host pool is page-locked memory of its own (cudaHostAlloc), not a Vulkan
+ * heap the driver sizes: no room reported, the pool sized from the RAM as before */
+#define coli_vk_tier_host_heap_room() ((size_t)0)
 #define coli_vk_block_elems(...) (cut_ops()->block_elems(__VA_ARGS__))
 #define coli_vk_tensor_row_bytes(...) (cut_ops()->tensor_row_bytes(__VA_ARGS__))
 #define coli_vk_tensor_scale_count(...) (cut_ops()->tensor_scale_count(__VA_ARGS__))

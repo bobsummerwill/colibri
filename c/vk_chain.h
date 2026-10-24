@@ -193,6 +193,7 @@ int  vkc_dnrec(int KD, VkcBuf *cv, VkcBuf *ab, VkcBuf *z, VkcBuf *st, VkcBuf *pr
 #define VKC_EW_GATE_ADD 8
 #define VKC_EW_SIGMUL   9    /* y = a * sigmoid(b) */
 #define VKC_EW_RESGATE  10   /* y = e[col] * a + c[col] * b (alpha, beta a column) */
+#define VKC_EW_F16      11   /* y = a clamped to +-65504 and rounded to the nearest float16 (kv16.h: a KV cache in float16) */
 typedef struct { int op, n, D, C, flags, e_row, y_off, a_off, b_off, c_off, e_off; float fc; } VkcEw;
 int  vkc_ew(VkcBuf *y, VkcBuf *a, VkcBuf *b, VkcBuf *c, VkcBuf *e, const VkcEw *p);
 /* chain_qsa.comp (mode 0: nb block keys from b0; mode 1: the selection of S rows, run as two dispatches that write the
@@ -307,6 +308,8 @@ typedef struct {
     ColiVkTensor *o;              /* [D x H*V]; NULL: the context stays in s->ctx */
     VkcBuf *prm;                  /* the norm weights: q latent at q_norm (unused with q_lora 0), */
     size_t q_norm, kv_norm;       /*   kv latent at kv_norm (floats) */
+    int kv16;                     /* the new latent and rope rows rounded to float16 as they are written
+                                   * (the host keeps them in float16: colibri's KV16) */
 } VkcMla;
 typedef struct { VkcBuf *qa, *q, *kv, *qabs, *clat, *ctx; int rows; } VkcMlaScratch;
 typedef struct { VkcBuf *lat, *rope; int cap; } VkcMlaCache;   /* [cap][K] and [cap][R] (rope NULL with R 0) */
@@ -485,6 +488,9 @@ int vkc_prewarm(const VkcPrewarm *w);
  * (qmatmul_gemm_bd.comp), else only the GEMV's few rows a step suit them */
 int vkc_gemm_bd_ready(void);
 int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBuf *y, const VkcMoe *p);
+/* chain_moe_gv.comp's int4 fast path (each lane's steps loaded ahead, the loop's bits):
+ * 1 on, 0 off, -1 from COLI_VK_MOE_GV_HQ (default on). For tests. */
+void vkc_moe_gv_hq(int on);
 /* A GGUF's experts (blocks, gfmt and dfmt both types bdstep_i8.glsl has) in the CPU's
  * integer form: the input rows quantized to int8 per 32, packed 4 x 8 integer dot products
  * (ggml_quants.h's gq_quant_act_ref and gq_dot_i8, the same integers and scales). On by

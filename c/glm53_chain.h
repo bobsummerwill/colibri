@@ -484,7 +484,7 @@ static int g53c_setup_dev(GModel *m, int d) {
         if (c->is_full[i])
             ch->mla[i] = (VkcMla){c->n_heads, c->qk_nope, 0, c->v_head, c->kv_lora, D, c->q_lora, c->eps,
                                   1.0f / sqrtf((float)c->qk_nope), VKC_ROPE_HALF, l->qa.vk, l->qb.vk, l->kva.vk, NULL,
-                                  l->kvb_kt.vk, l->kvb_v.vk, l->o.vk, ch->prm, ch->o_qn[i], ch->o_kn[i]};
+                                  l->kvb_kt.vk, l->kvb_v.vk, l->o.vk, ch->prm, ch->o_qn[i], ch->o_kn[i], 0};
         if (!d) g53_dho_drop_layer(m, i);   /* COLI_VK_DENSE_HOST: all of the layer is there, its host copies go */
         vkc_fit_mark(fit, i - lo);
     }
@@ -622,7 +622,7 @@ static int g53c_push(G53Chain *ch, const GModel *m, const GSession *s, int start
         int t0 = ch->kv_valid[i], n = start - t0;
         if (ch->pool_valid[i] > start / c->index_kpool) ch->pool_valid[i] = start / c->index_kpool;   /* rows from start change */
         if (ch->ks.on) {      /* the split: the window placed, its latent rows below start uploaded */
-            VkcKvPart pl = {1, K, ls->latent, 0, ch->kv[i].lat, 0};
+            VkcKvPart pl = {1, K, ls->latent, 0, ch->kv[i].lat, 0, 0};
             vkc_kv_place(&ch->ks, ch->mla_ord[i], start, n_rows);
             ok = vkc_kv_push(&ch->ks, ch->mla_ord[i], &pl, 1, start);
         }

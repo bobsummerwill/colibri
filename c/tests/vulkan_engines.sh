@@ -1822,7 +1822,58 @@ qwen36_gguf_chain_gates() {
   CPUENV=GQ_EXACT=1 dmoe_gate qwen36 "chain qwen36 GGUF, the host pool's experts on the CPU" all GQ_EXACT=1 COLI_VK_TIER_GB=0.0004 \
     COLI_VK_TIER_HOST=1 SNAP=qwen36_gguf_tiny -- 8 8 qwen36_gguf_tiny/ref.json
   grep -q "host pool on, [1-9]" vk.log || { cat vk.log; fail "chain qwen36 GGUF hybrid: no expert in the host pool"; }
+  # the pool leaves the RAM of the KV cache the engine allocates after it (#2314: the pool took
+  # that room and the cache's allocation failed at start)
+  grep -q "host pool on, [1-9].* of RAM left for the KV and state the engine allocates later" vk.log ||
+    { cat vk.log; fail "chain qwen36 GGUF hybrid: the host pool left no room for the KV cache"; }
   grep -q "hybrid layer steps, [1-9][0-9]* host pool pairs on the CPU" vk.log || { cat vk.log; fail "chain qwen36 GGUF hybrid: no pair on the CPU"; }
+  # the host pool within the driver's heap for it (#2314: Windows leaves about half the RAM,
+  # and the blocks past it were refused): a heap whose room past the 2 GiB the staging keeps
+  # holds a few experts, the pool takes those, the engine's cache keeps the rest (and so the
+  # CPU computes those experts: no layer's routed experts all in the frame)
+  CPUENV=GQ_EXACT=1 dmoe_gate qwen36 "chain qwen36 GGUF, the host pool within the driver's heap" none GQ_EXACT=1 COLI_VK_TIER_GB=0.0004 \
+    COLI_VK_TIER_HOST=1 COLI_VK_TIER_HOST_HEAP_GB=2.001 SNAP=qwen36_gguf_tiny -- 8 8 qwen36_gguf_tiny/ref.json
+  grep -q "host pool on, [1-9].*not all of them: the driver's heap for it leaves" vk.log || { cat vk.log; fail "chain qwen36 GGUF: the host pool past the driver's heap"; }
+}
+# Flint (two dense layers before the experts' ones, sliding-window layers, sinks) in serve
+# mode, the chain against the CPU frame for frame. A dense layer's K/V rows reach the
+# host's cache only from q36c_forward_seg's own read-back, and two things read them there:
+# the CPU's decode after the device's prompt (COLI_VK_CHAIN=2; before the read-back, a
+# different second turn on Lavapipe too), and a cache that grows on a turn that reuses
+# state, whose mirrors are made again from the host (CHAIN_SERVE_CONTINUE; on a discrete
+# card, where the prompt runs on the chain, an agent's continued turn answered "!!!!").
+# The GGUF read in place (gguf.json, as tools/gguf_import.py makes it); the tier off keeps
+# the experts in float (the tier holds a GGUF's F32 experts as int8).
+flint_chain_serve() {
+  rm -rf flint_tiny
+  $PY tools/make_flint_tiny.py --out flint_tiny --emit-ref flint_tiny/ref.json --gguf flint_tiny/model.gguf --gguf-experts F32
+  rm -f flint_tiny/model.safetensors
+  $PY -c "import sys; sys.path.insert(0, 'tests'); from prefix_serve_harness import ensure_byte_tokenizer as t; from pathlib import Path; t(Path('flint_tiny'))"
+  printf '{"format": "colibri-gguf-v1", "gguf": "%s/flint_tiny/model.gguf", "mode": "link", "arch": "flint", "parts": 1}\n' "$PWD" > flint_tiny/gguf.json
+  CHAIN_SERVE_CONTINUE=1 $PY tests/vulkan_chain_serve.py ./qwen36 flint_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0
+  COLI_VK_CHAIN=2 CHAIN_SERVE_CONTINUE=1 $PY tests/vulkan_chain_serve.py ./qwen36 flint_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0
+  # the sliding layers' KV in a ring of window + 9 rows, on the host and on the device: the
+  # same turns (a pin restored, a prefix reused, a cache that grows), the CPU's frames
+  CHAIN_SERVE_CONTINUE=1 CHAIN_SERVE_EXPECT='keep a ring of 14 rows' $PY tests/vulkan_chain_serve.py ./qwen36 flint_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0 Q36_KV_RING_SPARE=9
+  COLI_VK_CHAIN=2 CHAIN_SERVE_CONTINUE=1 CHAIN_SERVE_EXPECT='keep a ring of 14 rows' $PY tests/vulkan_chain_serve.py ./qwen36 flint_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0 Q36_KV_RING_SPARE=9
+  # the KV cache in float16, as a serve keeps it: the chain rounds its rows as the host does
+  for mode in 1 2; do
+    COLI_VK_CHAIN=$mode CHAIN_SERVE_KV16=1 CHAIN_SERVE_CONTINUE=1 CHAIN_SERVE_EXPECT='KV cache: float16' $PY tests/vulkan_chain_serve.py ./qwen36 flint_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0 Q36_KV_RING_SPARE=9
+  done
+  # two conversations, the sliding layers' rings in each one's place: one after the other,
+  # and at once (their decode rows in the same steps)
+  CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_INTERLEAVE=1 CHAIN_SERVE_CONTINUE=1 CHAIN_SERVE_EXPECT='the dense chain keeps each conversation' \
+    $PY tests/vulkan_chain_serve.py ./qwen36 flint_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0 Q36_KV_RING_SPARE=9 KV_SLOTS=2
+  CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_EXPECT='decode steps of several conversations in the chain \([0-9]* rows, [1-9]' \
+    $PY tests/vulkan_chain_serve.py ./qwen36 flint_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0 Q36_KV_RING_SPARE=9 KV_SLOTS=2
+  # Muse Spark (attention only, its prefixes reused in part): three conversations at once, a
+  # pin one of them saved rewinding another, whose ring's window must come up again from the
+  # host (its numbers run larger: 1e-3)
+  $PY tools/make_muse_tiny.py --out muse_tiny --emit-ref muse_tiny/ref.json --experts F32 > /dev/null
+  $PY -c "import sys; sys.path.insert(0, 'tests'); from prefix_serve_harness import ensure_byte_tokenizer as t; from pathlib import Path; t(Path('muse_tiny'))"
+  printf '{"format": "colibri-gguf-v1", "gguf": "%s/muse_tiny/model.gguf", "mode": "link", "arch": "muse", "parts": 1}\n' "$PWD" > muse_tiny/gguf.json
+  CHAIN_SERVE_TOL=1e-3 CHAIN_SERVE_SLOTS=3 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_EXPECT='decode steps of several conversations in the chain \([0-9]* rows, [1-9]' \
+    $PY tests/vulkan_chain_serve.py ./qwen36 muse_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0 KV_SLOTS=3
 }
 family_qwen_chain() {
   make qwen36 qwen38 tests/test_vk_chain VK=1
@@ -1887,12 +1938,40 @@ family_qwen_chain() {
   DMOE=1 lost_late qwen36 "chain qwen36 device lost, the routed experts in the frame" 4 rebuild COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
   # the prefix-reuse contract with the state on the device, and a serve session
   QWEN36_TINY=$PWD/qwen36_tiny_c COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_USAGE=$PWD/chain.usage $PY tests/test_qwen36_prefix_serve.py
+  # a STOP or CANCEL at every boundary between two prompt chunks of 8 rows (#2290): the
+  # prompt dropped, the chain's state from zeros, the retry's logits a cold run's
+  make tests/test_qwen36_prefill_control VK=1
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_CHAIN_ROWS=8 COLI_DENSE_I8=0 QWEN36_TINY=qwen36_tiny_c \
+    ./tests/test_qwen36_prefill_control 8 | tee prefill_control.log
+  grep -q "the dense chain, 0 failures" prefill_control.log || fail "chain qwen36 prompt control"
   $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0
+  CHAIN_SERVE_KV16=1 CHAIN_SERVE_EXPECT='KV cache: float16' $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0
+  # KV_SLOTS > 1: each conversation's state on the device (qwen36_chain.h, q36c_conv_*). The
+  # turns moving between two conversations, one's prompt reused after the other's ran; then
+  # two and three at once, their decode rows in the same steps; then fewer places than
+  # conversations (COLI_VK_CHAIN_MUX): places handed over, steps on the host's path; then the
+  # device lost mid-step, every conversation's state rebuilt on the CPU (the text the CPU's)
+  CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_INTERLEAVE=1 CHAIN_SERVE_CONTINUE=1 CHAIN_SERVE_EXPECT='the dense chain keeps each conversation' \
+    $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=2
+  for n in 2 3; do
+    CHAIN_SERVE_SLOTS=$n CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_EXPECT='decode steps of several conversations in the chain \([0-9]* rows, [1-9]' \
+      $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=$n
+  done
+  # one conversation past the places' first 2048 rows: its mirrors grow, the others' stay
+  CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_LONG=2600 CHAIN_SERVE_EXPECT='decode steps of several conversations in the chain \([0-9]* rows, [1-9]' \
+    $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=2
+  for k in 0 1; do
+    CHAIN_SERVE_SLOTS=3 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_EXPECT='on the device, [1-9][0-9]* handed over' \
+      $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=3 COLI_VK_CHAIN_MUX=$k
+  done
+  CHAIN_SERVE_SLOTS=3 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_TEXT=1 CHAIN_SERVE_EXPECT='rebuilding the state of' \
+    $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=3 COLI_VK_CHAIN_FAULT=120
   # COLI_VK_CHAIN=2, prompts on the device and decode on the CPU: the state crosses
   # between them at every turn's first decode step and next prompt
   CHAINMODE=2 chain_gate qwen36 "chain qwen36 prompts only" 1 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
   COLI_VK_CHAIN=2 $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0
   qwen36_gguf_chain_gates
+  flint_chain_serve
 
   # qwen38: every resident format, prefill batching, every expert form, MTP
   $PY tools/make_qwen38_tiny.py --out qwen38_tiny
@@ -2376,7 +2455,10 @@ mla_toks() {  # <engine> <log>
 }
 mla_gate() {
   local eng=$1 tag=$2 tol=$3; shift 3
-  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  # COLI_SPEC_GATE=0 first (a gate's own setting follows it and wins): the lookup drafts'
+  # gate decides from measured times, so two runs could verify different steps and write
+  # different numbers of logit rows, and logits_close would compare nothing
+  local envs=(COLI_SPEC_GATE=0); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   rm -f chain.usage cpu.f32 vk.f32
   env "${envs[@]}" COLI_USAGE=chain.usage USAGE_SAVE=0 DUMP=cpu.f32 ./"$eng" "$@" > cpu.log 2>&1 || true
   if [ -n "${FAULT_BACK:-}" ]; then
@@ -4200,6 +4282,10 @@ kv_split_colibri() {
   kv_mla_gate colibri "kv colibri n-gram drafts" 1 8 4 $G DRAFT=3 -- 64 16 16
   kv_mla_gate colibri "kv colibri MTP depth 2" 1 8 4 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 -- 64 16 16
   kv_mla_gate colibri "kv colibri tier off" 1 8 4 $G COLI_VK_TIER=0 -- 64 16 16
+  # KV16: the host's latent rows in float16 (the split uploads them widened, the host part
+  # reads them as they are, the chain rounds its new rows alike; the cold-device family below
+  # runs it with the shadow)
+  kv_mla_gate colibri "kv colibri KV16" 0 8 4 $G KV16=1 -- 64 16 16   # tokens: see dense-only's KV16 gates
   # prompts only: the prompt and the drafts' verify rows on the device, decode on the CPU
   CHAINMODE=2 kv_mla_gate colibri "kv colibri prompts only, drafts" 1 8 4 $G DRAFT=3 -- 64 16 16
   # COLI_VK_KV_SPLIT=0: the whole mirrors, as before the split

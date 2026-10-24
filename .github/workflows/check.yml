@@ -201,6 +201,11 @@ jobs:
             python tools/make_flint_tiny.py --out /tmp/flint_$experts --emit-ref /tmp/flint_$experts/ref.json \
               --gguf /tmp/flint_$experts/model.gguf --gguf-experts $experts
             COLI_CUDA=0 COLI_VULKAN=0 SNAP=/tmp/flint_$experts/model.gguf ./qwen36 16 8 /tmp/flint_$experts/ref.json
+            # the KV cache in float16, as a serve keeps it (a .json reference keeps float32 unless Q36_KV says)
+            COLI_CUDA=0 COLI_VULKAN=0 Q36_KV=f16 SNAP=/tmp/flint_$experts/model.gguf ./qwen36 16 8 /tmp/flint_$experts/ref.json
+            # the sliding layers' KV in a ring of window + 9 rows (the least spare), shorter than the run
+            COLI_CUDA=0 COLI_VULKAN=0 Q36_KV_RING_SPARE=9 SNAP=/tmp/flint_$experts/model.gguf ./qwen36 16 8 /tmp/flint_$experts/ref.json 2> ring.log
+            grep -q 'sliding-window layers keep a ring of 14 rows' ring.log || { cat ring.log; exit 1; }
           done
       # Muse Spark's layer (residual gates, the experts at their own width between two
       # projections, a norm on every expert's output, capped logits) against
@@ -211,6 +216,8 @@ jobs:
           cd c
           python tools/make_muse_tiny.py --out /tmp/muse_F32 --emit-ref /tmp/muse_F32/ref.json --experts F32
           COLI_CUDA=0 COLI_VULKAN=0 SNAP=/tmp/muse_F32/model.gguf ./qwen36 16 8 /tmp/muse_F32/ref.json
+          COLI_CUDA=0 COLI_VULKAN=0 Q36_KV_RING_SPARE=9 SNAP=/tmp/muse_F32/model.gguf ./qwen36 16 8 /tmp/muse_F32/ref.json 2> ring.log
+          grep -q 'sliding-window layers keep a ring of 14 rows' ring.log || { cat ring.log; exit 1; }
           # Q8_0: the experts' inputs round to int8 from sums whose order differs from one CPU
           # to the next (a code apart moved a 0.106 margin at the 16th token on AVX-VNNI), so
           # this one is shorter and wider apart

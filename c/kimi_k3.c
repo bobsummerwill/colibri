@@ -302,7 +302,8 @@ static int k3_cap_for_ram(double budget_gb, double resident_gb, double reserve_g
 
 /* Memory the OS says is still reclaimable without swapping, in GB; 0 if unknown.
  * The same quantity colibri.c's cap_for_ram() budgets against -- Linux
- * MemAvailable, Windows ullAvailPhys, macOS free+inactive+purgeable. #855. */
+ * MemAvailable, Windows ullAvailPhys bounded by the commit still grantable
+ * (compat_meminfo), macOS free+inactive+purgeable. #855. */
 static double k3_mem_avail(void){
 #ifdef _WIN32
     double total=0, avail=0; compat_meminfo(&total,&avail); return avail;
@@ -638,6 +639,7 @@ static float g_k3_topp=0.f;              /* K3_TOPP: routed-expert top-p pruning
 enum { K3_CKPT_MAX = 8 };
 static size_t k3_ckpt_blob_floats(const Model *m); /* def. with the ckpt block */
 static double k3_ckpt_reserve_gb(const Model *m, int slots);
+static double g_k3_ram_later;            /* the KV cache and checkpoints the serve allocates after the plan (bytes) */
 static int g_k3_ckpt_slots=0;            /* COLI_K3_CKPT: recurrent-state checkpoint
                                           * slots. STRICTLY OPT-IN, 0 = off (default,
                                           * engine behaves exactly as before). */
@@ -1364,7 +1366,7 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
 #endif
         g_k3_vk=coli_vk_init_env_tier("kimi_k3",vkt_wanted()&&any_sparse&&!cuda_on);
         k3_dho_decide(m,vkt_wanted()&&any_sparse&&!cuda_on,cuda_on);   /* COLI_VK_DENSE_HOST, before the cache is sized */
-    }
+    } else if(!(getenv("K3_VK")&&*getenv("K3_VK"))) coli_vk_say_unused("kimi_k3");   /* #2289 (K3_VK=0 closes it on purpose) */
 #endif
 #ifdef COLI_METAL
     { const char *ev=getenv("K3_METAL");
@@ -1452,6 +1454,7 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
          * slots now: RAM_GB is a whole-process ceiling even for opt-in memory. */
         double ckpt_gb = k3_ckpt_reserve_gb(m,g_k3_ckpt_slots);
         double reserve = 2.5 + 1.2 + kv_gb + ckpt_gb;
+        g_k3_ram_later = (kv_gb + ckpt_gb) * 1e9;   /* allocated once it serves: the tier's host pool leaves it (#2314) */
         double for_experts = 0.0;
 
         double slot_gb = (double)m->e_slot/1e9;
@@ -2421,6 +2424,7 @@ static int k3_tier_open(Model *m, VktFmt gu, VktFmt dn, VktFmt *lgu, VktFmt *ldn
                   .max_rows=K3_VK_ROWS*c->topk,
                   .ram_reserve=(size_t)(m->e_slot+8192)*(size_t)cap*(size_t)nmoe,
                   .ram_floor=(size_t)(m->e_slot+8192)*(size_t)c->topk*(size_t)nmoe,.ram_given=k3_vk_ram_given,
+                  .ram_later=(size_t)g_k3_ram_later,
                   .dense_bytes=dense_bytes,
                   .in_ram=k3_vk_in_ram,.ram_ctx=m,
                   .load=k3_vk_load,.release=k3_vk_unhold,.load_ctx=m,.load_batch=k3_vk_load_batch};
@@ -2441,7 +2445,7 @@ static int k3_tier_open(Model *m, VktFmt gu, VktFmt dn, VktFmt *lgu, VktFmt *ldn
             expert_read(m,pl[i],pe[i],&tmp);
             VktExpertSrc src=k3_vk_src(m,pl[i],tmp.buf);
             XT(put)(pl[i],pe[i],&src);
-            free(tmp.base);
+            compat_aligned_free(tmp.base);   /* expert_read's posix_memalign: _aligned_malloc on Windows (compat.h), never free() (#2311) */
         }
         XT(put_done)();
         XT(warm_report)("kimi_k3", n, now_s() - t0);
@@ -4731,13 +4735,13 @@ static void kimi_segment_model_destroy(KimiSegmentEngine *engine) {
         if (model->ecache) {
             LCache *cache = &model->ecache[layer];
             for (int slot = 0; slot < cache->cap; slot++)
-                free(cache->s[slot].base);
+                compat_aligned_free(cache->s[slot].base);   /* expert_read's posix_memalign */
             free(cache->slot_by_expert); free(cache->s);
         }
     }
     for (size_t slot = 0; slot < sizeof(model->ws) / sizeof(model->ws[0]);
          slot++)
-        free(model->ws[slot].base);
+        compat_aligned_free(model->ws[slot].base);
     free(model->final_norm); free(model->out_sw);
     w_release_host(&model->lm_head);
     free(model->kstate); free(model->cwq); free(model->cwk); free(model->cwv);

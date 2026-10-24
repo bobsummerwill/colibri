@@ -90,7 +90,7 @@ $env:SNAP = "$env:TEMP\vkprobe"; $env:COLI_VULKAN = "1"; $env:COLI_NO_OMP_TUNE =
 |---|---|---|
 | Routed experts | on with `COLI_VULKAN=1` (`COLI_VK_TIER=0` turns it off) | The shared routed-expert tier ([below](#the-routed-expert-tier-vk_tierc)): warm from `.coli_usage` at startup, then adapting while you chat, under a budget (`COLI_VK_TIER_GB`). The resident experts of each MoE step, prefill included, run as one async batch while the CPU loads and computes the others; they need **no RAM slot and no disk read**. Shown as the `vk` bucket in the hit-rate line, and in a `[VK] tier colibri run:` line at exit. `COLI_VK_EXPERTS=N`, the fixed top-N set this engine used to upload, is a deprecated alias: N caps the tier at N experts, `0` turns it off. |
 | Dense projections | `COLI_VK_DENSE=1` | q_a+kv_a fused into one submit, q_b, o; shared expert as a single fused expert-group submit. Resident int4/int8 weights upload once. |
-| MLA attention core | `COLI_VK_ATTN=1` | One dispatch per layer: absorbed query, scores over the KV window, softmax, weighted latent, value rows, **fused with the o-projection** (the context vector never leaves the GPU). The latent/rope KV lives in a persistent per-layer device mirror, appended ~2.3 KB/token/layer with the same invalidation points as the CUDA KV shadow. |
+| MLA attention core | `COLI_VK_ATTN=1` | One dispatch per layer: absorbed query, scores over the KV window, softmax, weighted latent, value rows, **fused with the o-projection** (the context vector never leaves the GPU). The latent/rope KV lives in a persistent per-layer device mirror, appended ~2.3 KB/token/layer with the same invalidation points as the CUDA KV shadow. The mirror grows with the conversation (256 rows a layer, then powers of two up to the context), filled again from the host when it grows; a layer the device has no room for computes its attention on the CPU, and one line says so. |
 
 The `PIN_GB=0` (with `PIN` still set) in the example is deliberate: the expert
 tier warms from the same history a RAM pin would, so the pin's RAM is better
@@ -943,7 +943,9 @@ fixed set it replaces served S <= 4 only.
   deprecated alias: `N` caps the tier at N experts, `0` turns it off as `COLI_VK_TIER=0`
   does, and a line says so. `COLI_VK_RESERVE_GB` (the old reserve, 3 GB) adds what it
   asks beyond `COLI_VK_TIER_RESERVE_GB`. With `COLI_VK_ATTN=1` the absorb core's KV
-  mirror (`CTX` rows a layer) is reserved too. The dense set (`COLI_VK_DENSE=1`) is
+  mirror (`CTX` rows a layer) is reserved too, at most half of what the device has free:
+  the gateway's automatic context (131072 tokens on a large RAM) asked GLM-5.3 for 23.6 GB
+  of mirror on a 24 GB card and left the tier no expert (#2314). The dense set (`COLI_VK_DENSE=1`) is
   uploaded before the tier sizes itself, so the budget is what remains; the trunk's
   default here stays off. On an integrated GPU the tier takes its default share of RAM
   after the expert cache's (the startup reservation of the fixed set is gone).
@@ -1763,7 +1765,24 @@ rebuilds the KDA state on the CPU from the input rows the chain records since th
 copy was last current (embedding rows, or the vision tower's), a prefill's worth of CPU
 work.
 
-**Several conversations at once (the other engines).** qwen36, qwen38, OLMoE, Inkling,
+**Several conversations at once (qwen36).** With `KV_SLOTS` above 1 the chain keeps each
+conversation's state on the device (its KV mirrors, DeltaNet state and conv ring), in as
+many places as the device's free memory takes once the expert tier has its budget
+(`COLI_VK_CHAIN_MUX` caps them). A prompt runs on the chain in its conversation's place,
+which keeps its state for the next turn; a decode step runs one row of every active
+conversation in one forward, the projections, the router and the routed experts over all
+the rows, each row's attention and DeltaNet on its own place, its new K/V rows to its
+conversation's host cache. A conversation without a place takes the least recently used
+one (that conversation's DeltaNet state goes to the host first); a step with a row whose
+conversation has no place runs on the host's path. A device lost mid-step rebuilds every
+conversation's state that was on the device from its prefix record, on the CPU. The end
+of a turn prints `[VK] qwen36 chain: KV_SLOTS=n: s decode steps of several conversations
+in the chain (r rows, ... a step), h on the host's path; p conversations' state on the
+device, e handed over`. The second device's chain, a partial chain and the KV split keep
+the older way: the chain runs each conversation's prompts, its state handed over through
+the host when the conversation changes, and the decode steps run on the host's path.
+
+**Several conversations at once (the other engines).** qwen38, OLMoE, Inkling,
 Kimi K3, MiMo, DeepSeek V4 and V4.1 decode `KV_SLOTS`' conversations together too, but
 their dense chain keeps one conversation's state on the device, so it stays off with
 more than one slot (a `[VK] <engine>: KV_SLOTS=n: the dense chain is off` line says
@@ -2213,6 +2232,18 @@ so, a token is one frame.
   on an RTX PRO 4000: a layer 47-53 us (as the CUDA chain's 51), the gate and up pass 80
   -> 66 us and down 29 -> 17 in the chain profile, the decode 67.3-68.4 -> 76.5-78.3 tok/s,
   the teacher-forced loss the same (1.7576). `COLI_VK_MOE_GV=0` keeps chain_moe.comp's.
+- int4 per group (4) with groups of whole steps: the loop of a lane's steps waits for each
+  load in turn, which on a Radeon 8060S (RADV) left a Qwen3.6 layer at 160 us, 78 GB/s.
+  Where a row is a whole number of steps a lane at the lanes chosen above (Qwen3.6's 2048
+  and 512 inputs: eight), the pipeline built with `HQ` (a specialization constant, with the
+  steps a lane in `NQ`) loads every step and scale of the lane first, gate's and up's
+  together, then sums them; each step's product is rounded before it is added in both that
+  path and the loop (`precise`), so the two give the same bits (tests/test_vk_chain checks
+  it) and the tier's small experts, on the loop, stay the chain's. Gate and up as two
+  loops instead of one interleaved took the loop alone 160 -> 119 us. Radeon 8060S,
+  Qwen3.6's shapes (`COLI_VK_CHAIN_BENCH=moe`, K 8 of 256): one row 160 -> 100 us, two
+  282 -> 166, three 385 -> 239; Qwen3.6-35B-A3B int4-g64 decode 45.0 -> 50.3 tok/s with the
+  same text. `COLI_VK_MOE_GV_HQ=0` keeps the loop.
 - The books follow at the frame's end, from the ids that come down with it: the history
   (`.coli_usage`), the HITS bitmap, the tier's heat (`vkt_dev_count`); the tier's line
   counts them as `in the dense chain: N routed experts with no host step`.

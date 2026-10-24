@@ -142,12 +142,15 @@ int  coli_vk_expert_group2(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
 
 /* MLA absorb attention core (decode). The KV latent/rope caches live in persistent
  * per-layer device buffers: _ensure allocates a layer's cache at max_rows (once; resize
- * via _reset), _row mirrors one host row (absolute position), _reset drops all layers.
+ * via _reset); _grow gives it room for `need` rows, growing in powers of two up to
+ * max_rows (1: it had them, 2: a new buffer, its rows to mirror again from 0, 0: no room
+ * on the device); _row mirrors one host row (absolute position), _reset drops all layers.
  * The caller keeps a valid-watermark and re-mirrors rows after any invalidation.
  * absorb runs S causal query rows over cache rows [st0, T) in one submit:
  * q [S,H*(Q+R)] roped, kv_b [H*(Q+V), K] uploads once (fmt 1=int8/2=int4),
  * ctx out [S,H*V]. Returns 0 -> caller falls back to CPU. */
 int  coli_vk_kv_ensure(int layer, int max_rows, int K, int Rd);
+int  coli_vk_kv_grow(int layer, int need, int max_rows, int K, int Rd);
 int  coli_vk_kv_row(int layer, int pos, const float *L, const float *R);
 void coli_vk_kv_reset(void);
 int  coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc, int fmt, int grp,
@@ -208,6 +211,7 @@ void coli_vk_tier_pool_limit_dev(int dev, size_t bytes);   /* dev 1: COLI_VK_DEV
  * through its mapping, never staged. 1 when the device can: a discrete card with
  * bufferDeviceAddress and a host-visible type in system RAM. */
 int  coli_vk_tier_host_pool(void);
+size_t coli_vk_tier_host_heap_room(void);   /* what the driver leaves in that pool's system-RAM heap (0: unknown) */
 /* The tier's extra layers (an MTP head's experts, another size than the main ones'):
  * a pool of their own on the primary device (pool 4), its budget, and a tensor in it
  * (as coli_vk_tier_tensor). */
@@ -447,6 +451,9 @@ const char *coli_vk_device_name(void);
  * coli_vk_init_env_tier(engine, 0). */
 int coli_vk_init_env(const char *engine);
 int coli_vk_init_env_tier(const char *engine, int tier_on);
+/* "[VK] <engine>: COLI_VULKAN is not set: the Vulkan device stays unused", once a process
+ * (coli_vk_init_env_tier says it; an engine that skips the call says it itself) */
+void coli_vk_say_unused(const char *engine);
 /* Where an engine's dense (resident, non-expert) matrices run, the one rule every
  * engine follows. COLI_VK_DENSE set and non-empty: 0 keeps them on the CPU, any other
  * number puts them on the device. Unset: the engine's default `def`, except that with
@@ -514,7 +521,7 @@ typedef struct {
 } ColiVkCore;
 int  coli_vk_core(ColiVkCore *out);
 /* A resident tensor's buffers (VkBuffer as void *) and layout; 0 for a COLI_VK_DEV2 one. */
-typedef struct { void *wbuf, *sbuf; int fmt, I, O, rowWords, gs; } ColiVkTensorInfo;
+typedef struct { void *wbuf, *sbuf; int fmt, I, O, rowWords, gs; int wide; } ColiVkTensorInfo;   /* wide: off the f16 cooperative-matrix GEMMs */
 int  coli_vk_tensor_info(const ColiVkTensor *t, ColiVkTensorInfo *out);
 /* The chain's fence wait failed: the device is lost, the backend stops. */
 void coli_vk_mark_lost(void);

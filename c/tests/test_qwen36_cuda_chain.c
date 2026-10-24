@@ -148,6 +148,7 @@ static int same_logits(const float *a, const float *b, int n, const char *what) 
 }
 
 int main(void) {
+    setenv("Q36_KV", "f32", 1);   /* the host's K/V rows compared below as floats */
     setenv("COLI_CUDA", "1", 1); setenv("COLI_GPUS", "0", 1); setenv("QT_NO_WARMSTART", "1", 1);
     setenv("COLI_LMHEAD_GPU", "0", 1);
     setenv("COLI_DENSE_IDOT", "0", 1);          /* f32 activations on the CPU too: the chain's arithmetic */
@@ -180,7 +181,8 @@ int main(void) {
         int kv_ok = 1;
         for (int h = 0; h < KV; h++) {
             size_t off = (size_t)h * CAP * HD;
-            if (maxdiff(m.K[1] + off, ref.K[1] + off, (size_t)4 * HD) > 1e-4 || maxdiff(m.V[1] + off, ref.V[1] + off, (size_t)4 * HD) > 1e-4) kv_ok = 0;
+            if (maxdiff((const float *)m.K[1] + off, (const float *)ref.K[1] + off, (size_t)4 * HD) > 1e-4 ||
+                maxdiff((const float *)m.V[1] + off, (const float *)ref.V[1] + off, (size_t)4 * HD) > 1e-4) kv_ok = 0;
         }
         ck(kv_ok, "the K/V rows reached the host cache as the CPU path wrote them");
     }
@@ -251,7 +253,10 @@ int main(void) {
       /* cc_ops() caches the table once per process: ask the engine's gate directly */
       ck(coli_cuda_chain_ops() == NULL, "the backend has no table");
       fake_chain_absent = 0;
-      ck(q36cc_setup(&m2, 2) == NULL, "KV_SLOTS > 1 keeps the chain off");
+      /* KV_SLOTS > 1: the chain stays on, each conversation's state in a place of its own
+       * (q36cc_conv_*, serve_mux) */
+      Q36CChain *c2 = q36cc_setup(&m2, 2);
+      ck(c2 != NULL && c2->ok, "KV_SLOTS > 1 keeps the chain on");
       (void)m2; }
 
     printf(" F. speculative steps under the tier\n");

@@ -29,6 +29,13 @@
 layout(local_size_x = 256) in;
 layout(constant_id = 0) const int XS = 1024;   // staged vec4s
 layout(constant_id = 1) const int FMT = 4;
+// HQ 1 (FMT 4, the host's int4 fast path): a lane's NQ steps of a row, every one of them,
+// loaded with their scales before the first is decoded (a lane of the loop waits for each
+// load in turn: Qwen3.6's layer on a Radeon 8060S, one row, 160 -> 97 us). The same steps,
+// products and adds in the same order as the loop (rowpart4), so a row has the loop's bits;
+// taken where the row is NQ steps a lane exactly and the expert's groups whole steps.
+layout(constant_id = 2) const int HQ = 0;
+layout(constant_id = 3) const int NQ = 8;
 
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer WRef4 { uvec4 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer SRef { float v[]; };
@@ -131,6 +138,30 @@ float rowpart(WRef4 w, SRef sc, uint row, uint rw4, uint ng, uint gs, int nq, in
     }
     return acc;
 }
+// FMT 4 with groups of whole steps: a row's steps q0, q0 + qs, ... below nq, each step's
+// product rounded and then added (precise: the compiler fuses neither, so the HQ path
+// below, which unrolls the same sums, keeps their bits)
+float rowpart4(WRef4 w, SRef sc, uint row, uint rw4, uint ng, uint gs, int nq, int q0, int qs) {
+    precise float acc = 0.0;
+    for (int q = q0; q < nq; q += qs) {
+        precise float d = dot4(w.v[row * rw4 + uint(q)], q * 8) * sc.v[row * ng + uint(q * 32) / gs];
+        acc += d;
+    }
+    return acc;
+}
+// HQ: rowpart4 for a row of exactly NQ steps a lane, every load issued before the first sum
+float rowpart_hq(WRef4 w, SRef sc, uint row, uint rw4, uint ng, uint gs, int lane, int lpr) {
+    uvec4 v[NQ]; float c[NQ];
+    [[unroll]] for (int t = 0; t < NQ; t++) {
+        int q = lane + t * lpr;
+        v[t] = w.v[row * rw4 + uint(q)];
+        c[t] = sc.v[row * ng + uint(q * 32) / gs];
+    }
+    precise float acc = 0.0;
+    [[unroll]] for (int t = 0; t < NQ; t++) { precise float d = dot4(v[t], (lane + t * lpr) * 8) * c[t]; acc += d; }
+    return acc;
+}
+bool hq(int nq, int lpr) { return HQ != 0 && nq == NQ * lpr; }
 float lanes_sum(float v, int lpr) {
     for (int off = lpr / 2; off > 0; off >>= 1) v += subgroupShuffleXor(v, uint(off));
     return v;
@@ -164,7 +195,15 @@ void main() {
             WRef4 wg = WRef4(ke_w[k][0]), wu = WRef4(ke_w[k][2]);
             SRef sg_ = SRef(ke_w[k][1]), su = SRef(ke_w[k][3]);
             float g = 0.0, uu = 0.0;
-            if (live) {
+            // FMT 4 with whole-step groups: gate's and up's loads ahead together (HQ), or
+            // the loop of the same sums
+            if (live && FMT == 4 && gs % 32u == 0u && hq(nq, lpr)) {
+                g = rowpart_hq(wg, sg_, uint(o), rws / 4u, ng, gs, lane, lpr);
+                uu = rowpart_hq(wu, su, uint(o), rws / 4u, ng, gs, lane, lpr);
+            } else if (live && FMT == 4 && gs % 32u == 0u) {
+                g = rowpart4(wg, sg_, uint(o), rws / 4u, ng, gs, nq, lane, lpr);
+                uu = rowpart4(wu, su, uint(o), rws / 4u, ng, gs, nq, lane, lpr);
+            } else if (live) {
                 for (int q = lane; q < nq; q += lpr) {
                     uint at = uint(o) * (rws / 4u) + uint(q);
                     uvec4 vg = wg.v[at], vu = wu.v[at];
@@ -203,7 +242,10 @@ void main() {
         int o = o0 + sub;
         bool live = o < hi;
         int oc = min(o, p.D - 1);
-        float d = live ? rowpart(wd, sd, uint(oc), rws / 4u, ng, gs, nq, lane, lpr) : 0.0;
+        bool w4 = FMT == 4 && gs % 32u == 0u;
+        float d = !live ? 0.0 : w4 && hq(nq, lpr) ? rowpart_hq(wd, sd, uint(oc), rws / 4u, ng, gs, lane, lpr)
+                              : w4 ? rowpart4(wd, sd, uint(oc), rws / 4u, ng, gs, nq, lane, lpr)
+                              : rowpart(wd, sd, uint(oc), rws / 4u, ng, gs, nq, lane, lpr);
         d = lanes_sum(d, lpr);
         if (lane == 0 && live) yo[p.y_off + j * p.y_row + o] = FMT != 4 && FMT != 7 ? d * sd.v[oc] : d;
     }

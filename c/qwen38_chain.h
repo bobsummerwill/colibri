@@ -922,8 +922,8 @@ static int q38c_push_kv(Q38Chain *ch, Model *m, int i, int pos_base, int n_rows)
     int D = c->head_dim, KVH = c->kv_heads, ID = c->idx_dim, R = c->idx_ratio;
     if (ch->pk_valid[i] > pos_base / R) ch->pk_valid[i] = pos_base / R;   /* blocks this step rewrites */
     if (ch->ks.on) {   /* the split: the window placed, the K/V rows below pos_base of its blocks uploaded */
-        VkcKvPart pt[2] = {{KVH, D, m->K[i], (size_t)m->kv_cap * D, ch->kc[i], 0},
-                           {KVH, D, m->V[i], (size_t)m->kv_cap * D, ch->vc[i], 0}};
+        VkcKvPart pt[2] = {{KVH, D, m->K[i], (size_t)m->kv_cap * D, ch->kc[i], 0, 0},
+                           {KVH, D, m->V[i], (size_t)m->kv_cap * D, ch->vc[i], 0, 0}};
         vkc_kv_place(&ch->ks, ch->attn_ord[i], pos_base, n_rows);
         ok = vkc_kv_push(&ch->ks, ch->attn_ord[i], pt, 2, pos_base);
     }
@@ -1005,7 +1005,7 @@ static int q38c_attention(Q38Chain *ch, Model *m, Layer *l, int i, int n, int pb
         ri[s] = (VkcRegion){(size_t)(pb + s) * ID, (size_t)s * ipw + (size_t)IQ * ID, (size_t)ID};
     }
     size_t ko = (size_t)ch->attn_ord[i] * q38c_kv_stride(ch, c);
-    VkcKvPart pk_ = {KVH, D, m->K[i], (size_t)m->kv_cap * D, ch->kc[i], 0}, pv_ = {KVH, D, m->V[i], (size_t)m->kv_cap * D, ch->vc[i], 0};
+    VkcKvPart pk_ = {KVH, D, m->K[i], (size_t)m->kv_cap * D, ch->kc[i], 0, 0}, pv_ = {KVH, D, m->V[i], (size_t)m->kv_cap * D, ch->vc[i], 0, 0};
     ok = (ch->ks.on ? vkc_kv_store(&ch->ks, ch->attn_ord[i], &pk_, ch->k, 0, (size_t)kvo, (size_t)D, pb, n) &&
                       vkc_kv_store(&ch->ks, ch->attn_ord[i], &pv_, ch->v, 0, (size_t)kvo, (size_t)D, pb, n)
                     : vkc_copy_regions(ch->kc[i], ch->k, rg, n * KVH) && vkc_copy_regions(ch->vc[i], ch->v, rg, n * KVH)) &&
@@ -1033,7 +1033,7 @@ static int q38c_attention(Q38Chain *ch, Model *m, Layer *l, int i, int n, int pb
     if (ch->ks.on) {   /* the split: the selection's listed positions in two parts */
         VkcKvGqa a = {&ch->ks, ch->attn_ord[i], ch->q, ch->kc[i], ch->vc[i], ch->q, ch->sel, NULL, ch->ctx, n, QH, KVH, D, D, pb,
                       0, 0, 0, 0, qo, 2 * D, 1, D, qo, 2 * D, QH * D, 0, q38c_selrow(c), 1.f / sqrtf((float)D),
-                      m->K[i], m->V[i], (size_t)m->kv_cap * D, (size_t)D, (size_t)m->kv_cap * D, (size_t)D};
+                      m->K[i], m->V[i], (size_t)m->kv_cap * D, (size_t)D, (size_t)m->kv_cap * D, (size_t)D, 0};
         return ok && vkc_qsa(ch->ip, NULL, ch->pk[i], NULL, ch->qsc, ch->sel, &ps) && vkc_kv_gqa(&a) &&
                vkc_matmul(q38c_t(&l->o), ch->ctx, 0, ch->blk, 0, n);
     }

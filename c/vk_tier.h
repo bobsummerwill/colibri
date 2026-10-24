@@ -192,6 +192,12 @@ typedef struct {
      * Without it the pool leaves ram_reserve to the caches and takes what is left. */
     size_t ram_floor;
     void (*ram_given)(void *ctx, size_t bytes);   /* with ram_ctx */
+    /* Optional: the RAM the engine still allocates once it serves (the KV cache at the served
+     * context, each conversation's, and the attention's scratch). The free RAM the host pool
+     * is sized from does not show it yet; the pool leaves it. Without it the pool took the
+     * room of GLM-5.3's KV cache at 131072 tokens, and the cache's allocation then failed at
+     * start (#2314). */
+    size_t ram_later;
     size_t dense_bytes;            /* dense weights the engine puts on the device after vkt_init */
     size_t chain_bytes;            /* what the dense chain allocates at its first forward, after the
                                       tier has filled the device (its KV mirror, a prompt chunk): left free */

@@ -2392,7 +2392,7 @@ static void d2_init(long long fit0, long long all, int act) {
     double room = heap_free - env_gb("COLI_VK_RESERVE2_GB", 0.5) * GiB, want = room;
     if (di.shares_ram) {
         double avail = (double)mem_available();
-        double ram_room = avail > 0 ? avail - (double)T.c.ram_reserve - (double)T.c.dense_bytes - 2.0 * GiB : room;
+        double ram_room = avail > 0 ? avail - (double)T.c.ram_reserve - (double)T.c.dense_bytes - (double)T.c.ram_later - 2.0 * GiB : room;
         if (ram_room / 4 < want) want = ram_room / 4;
     }
     if (want < 0) want = 0;
@@ -2445,9 +2445,36 @@ static void host_init(long long all) {
     long long left = all - T.dmax[0] - T.dmax[1];
     if (left <= 0) return;
     const double GiB = 1073741824.0;
-    double want = g && *g ? atof(g) * GiB : (double)mem_available() - 4.0 * GiB;
+    double want = g && *g ? atof(g) * GiB : (double)mem_available() - 4.0 * GiB - (double)T.c.ram_later;
+    /* The driver's heap for the system RAM the device reads (coli_vk_tier_host_heap_room) is
+     * not all the RAM: about half of it on Windows, three quarters with NVIDIA's on Linux.
+     * Past its room the pool's blocks are refused, and the experts planned there were in
+     * neither the pool nor the engine's cache, which had given them up (ram_given): they came
+     * from disk. #2314: Kimi K3 and GLM-5.3 on 256 GB under Windows held 170 and 147 GB
+     * against 214 and 223, read 1.5 to 3 times as much and decoded at 0.3 and 0.4 tok/s
+     * against 0.4 and 0.6. The pool takes at most the heap's room less 2 GiB (the uploads'
+     * staging lives there too); the RAM it does not take (cut) stays the engine's cache's. */
+    size_t heap = coli_vk_tier_host_heap_room();
+    double cut = 0;
+    char hh[32] = "";
+    if (heap && want > (double)heap - 2.0 * GiB) {
+        cut = want - ((double)heap - 2.0 * GiB);
+        want -= cut;
+        human((double)heap, hh, sizeof hh);
+    }
+    /* what it leaves for the state the engine allocates once it serves (ram_later) */
+    char hl[96] = "";
+    if (T.c.ram_later && !(g && *g)) {
+        char x[32];
+        snprintf(hl, sizeof hl, "; %s of RAM left for the KV and state the engine allocates later",
+                 human((double)T.c.ram_later, x, sizeof x));
+    }
     size_t blk = coli_vk_block_bytes((size_t)256 << 20);
-    if (want < (double)T.exp_bytes || blk < T.exp_bytes) return;
+    if (want < (double)T.exp_bytes || blk < T.exp_bytes) {
+        if (hh[0]) fprintf(stderr, VKT_TAG " tier %s: host pool off: the driver leaves %s of system RAM for the device\n", T.engine, hh);
+        else if (hl[0]) fprintf(stderr, VKT_TAG " tier %s: host pool off: no room past the RAM it leaves (%s)\n", T.engine, hl + 2);
+        return;
+    }
     size_t full = (size_t)want / blk, rest = (size_t)want - full * blk;
     long long fit = (long long)full * (long long)(blk / T.exp_bytes) + (long long)(rest / T.exp_bytes);
     /* Every expert, the device's too, where RAM holds them (T.full, not beside a second
@@ -2464,7 +2491,10 @@ static void host_init(long long all) {
      * them keeps ram_reserve, and the pool takes what is left. */
     size_t given = 0;
     if (fit < left && !(g && *g)) {
-        want -= T.c.ram_given ? (double)T.c.ram_floor : (double)T.c.ram_reserve;
+        /* the caches' least out of the RAM's share (want + cut): what the heap cut off is RAM
+         * beside the pool already */
+        double least = T.c.ram_given ? (double)T.c.ram_floor : (double)T.c.ram_reserve;
+        want -= least > cut ? least - cut : 0;
         if (want < (double)T.exp_bytes) return;
         full = (size_t)want / blk; rest = (size_t)want - full * blk;
         fit = (long long)full * (long long)(blk / T.exp_bytes) + (long long)(rest / T.exp_bytes);
@@ -2485,12 +2515,13 @@ static void host_init(long long all) {
     if (T.full)
         fprintf(stderr, VKT_TAG " tier %s: host pool on, %lld experts in %s of system RAM the device reads over PCIe (every expert "
                         "of the model: the %lld its memory leaves and a copy of its own, from which the routed ones move up, up "
-                        "to %d a forward; COLI_VK_TIER_PROMOTE sets it, COLI_VK_TIER_HOST=0 off)\n",
-                T.engine, held, human((double)lim, hb, sizeof hb), left, T.promote_rate);
+                        "to %d a forward; COLI_VK_TIER_PROMOTE sets it, COLI_VK_TIER_HOST=0 off%s)\n",
+                T.engine, held, human((double)lim, hb, sizeof hb), left, T.promote_rate, hl);
     else
         fprintf(stderr, VKT_TAG " tier %s: host pool on, %d experts in %s of system RAM the device reads over PCIe "
-                        "(the %lld its memory leaves%s; COLI_VK_TIER_HOST=0 off, COLI_VK_TIER_HOST_GB sets it)\n",
-                T.engine, T.dmax[2], human((double)lim, hb, sizeof hb), left, fit < left ? ", not all of them" : "");
+                        "(the %lld its memory leaves%s%s%s%s; COLI_VK_TIER_HOST=0 off, COLI_VK_TIER_HOST_GB sets it)\n",
+                T.engine, T.dmax[2], human((double)lim, hb, sizeof hb), left, fit < left ? ", not all of them" : "",
+                hh[0] ? ": the driver's heap for it leaves " : "", hh, hl);
 }
 
 int vkt_host_pool_on(void) { return T.on && T.dmax[2] > 0; }
@@ -2553,7 +2584,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     if (cap && *cap) want = atof(cap) * GiB;
     else if (T.uma) {
         double avail = (double)mem_available();
-        double ram_room = avail > 0 ? avail - (double)T.c.ram_reserve - (double)T.c.dense_bytes - 2.0 * GiB : room;
+        double ram_room = avail > 0 ? avail - (double)T.c.ram_reserve - (double)T.c.dense_bytes - (double)T.c.ram_later - 2.0 * GiB : room;
         want = ram_room / 4;
     } else want = room;
     if (want > room) want = room;

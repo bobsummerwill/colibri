@@ -1297,7 +1297,11 @@ uint64_t coli_v4_os_available_memory(void) {
     MEMORYSTATUSEX status;
     memset(&status, 0, sizeof(status));
     status.dwLength = sizeof(status);
-    return GlobalMemoryStatusEx(&status) ? (uint64_t)status.ullAvailPhys : 0;
+    /* the commit still grantable bounds it too: what decides whether the next malloc
+     * succeeds (compat_meminfo_gb, #1375) */
+    if (!GlobalMemoryStatusEx(&status)) return 0;
+    return status.ullAvailPageFile && status.ullAvailPageFile < status.ullAvailPhys
+        ? (uint64_t)status.ullAvailPageFile : (uint64_t)status.ullAvailPhys;
 #elif defined(__APPLE__)
     /* No /proc and no _SC_AVPHYS_PAGES on macOS. "Available" is what the
      * kernel could hand out without swapping: free + inactive pages -- the
@@ -14659,6 +14663,28 @@ static void v4_vkt_unhold(void *ctx, void *h) {
     coli_expert_release((ColiExpertStore *)ctx, &hold->view);
     free(hold->buffer); free(hold);
 }
+/* The state the serve's sessions allocate after the tier starts, every slot at the
+ * context: the window and compressed KV and the indexer's keys (as the RAM plan's
+ * context_bytes counts them), and the prompt's two arrays of hyper-connection streams,
+ * of which a prompt segment's rows are written (V4_PREFILL_SEGMENT, 4096). Pages the RAM
+ * does not count until they are written, which the tier's host pool must leave. */
+static size_t v4_state_later(const ColiV4Engine *engine) {
+    const ColiDeepSeekV4Config *c = &engine->config;
+    uint64_t t = (uint64_t)engine->runtime.context_tokens;
+    if (t > (uint64_t)c->max_position_embeddings) t = (uint64_t)c->max_position_embeddings;
+    uint64_t b = (uint64_t)c->num_hidden_layers * c->sliding_window * c->head_dim * sizeof(float);
+    for (int layer = 0; layer < c->num_hidden_layers && layer < c->compress_ratio_count; layer++) {
+        int ratio = c->compress_ratios[layer];
+        if (!ratio) continue;
+        uint64_t rows = (t + (uint64_t)ratio - 1) / (uint64_t)ratio;
+        b += rows * c->head_dim * sizeof(float);
+        if (ratio == 4) b += rows * c->index_head_dim * sizeof(float);
+    }
+    const char *sg = getenv("V4_PREFILL_SEGMENT");
+    uint64_t seg = sg ? (uint64_t)(atoi(sg) < 64 ? 64 : atoi(sg)) : 4096;
+    b += 2 * (t < seg ? t : seg) * (uint64_t)c->hc_mult * c->hidden_size * sizeof(float);
+    return (size_t)(b * (uint64_t)(g_v4_mux_slots > 1 ? g_v4_mux_slots : 1));
+}
 static void v4_vk_tier_start(const ColiV4Engine *engine) {
     const ColiDeepSeekV4Config *c = &engine->config;
     ColiExpertStore *store = engine->experts;
@@ -14727,6 +14753,7 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
                     .act_limit = c->swiglu_limit, .max_rows = 128 * c->num_experts_per_tok,
                     .ram_reserve = st.capacity_bytes > st.resident_bytes
                         ? (size_t)(st.capacity_bytes - st.resident_bytes) : 0,
+                    .ram_later = v4_state_later(engine),
                     /* what the device has still to take: matrices placed already
                      * (the dense weights on the device only) are in its usage */
                     .dense_bytes = v4_tier_dense_bytes(engine),

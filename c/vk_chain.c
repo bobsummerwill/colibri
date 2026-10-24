@@ -116,6 +116,7 @@ typedef struct {
     int moe_xs, moe_xs_bd; uint8_t moe_tried[2][10];          /* their largest staging floats (0: the device cannot); made once asked for */
     VkPipeline moe_f[3][10]; uint8_t moe_f_tried[3][10];      /* chain_moe.comp for one of our formats (FMTC 1, 2, 4), by staging size */
     VkShaderModule mod_moe_gv; VkPipeline moe_gv[3][10]; uint8_t moe_gv_tried[3][10];   /* chain_moe_gv.comp: a decode's passes in our formats */
+    VkPipeline moe_gvq[10][17]; uint8_t moe_gvq_tried[10][17];   /* its int4 fast path (HQ), by staging and steps a lane */
     VkShaderModule mod_moe_i8; VkPipeline moe_i8[10]; uint8_t moe_i8_tried[10];   /* chain_moe_i8.spv, by its codes' size */
     struct { int8_t i8, b; uint8_t tg, td, tried; VkPipeline p; } moe_bt[32]; int moe_nbt;   /* the block formats' of one layer's types (BTG, BTD) */
     int idot, idot_set;                                       /* the integer form on (vkc_moe_set_idot: -1 = the device's default) */
@@ -1367,7 +1368,7 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
         VkPipeline gp = nr > 1 ? (xg ? KC.gemv4xn : KC.gemv4n) : xg ? KC.gemv4x : KC.gemv4;
         ok = record(gp, bd, 4, &pc7, sizeof pc7, (uint32_t)wg, (uint32_t)((S + nr - 1) / nr), 1);
     }
-    else if (path >= 0 && KC.tg && (ti->fmt == 1 || ti->fmt == 2 || (ti->fmt == 4 && ti->gs >= 8 && ti->gs % 8 == 0)) &&
+    else if (path >= 0 && KC.tg && !ti->wide && (ti->fmt == 1 || ti->fmt == 2 || (ti->fmt == 4 && ti->gs >= 8 && ti->gs % 8 == 0)) &&
              ti->I % 64 == 0 && ti->O % 128 == 0 && ti->rowWords % 4 == 0) {
         ok = record(KC.tg, bd, 4, &pc, sizeof pc, (uint32_t)((S + 63) / 64), (uint32_t)(ti->O / 128), 1);
         KC.st.tile_gemms += ok;
@@ -2061,21 +2062,32 @@ static VkPipeline moe_pipe_f(int bd, int n, int fmt, int tg, int td) {
 }
 static VkPipeline moe_pipe(int bd, int n) { return moe_pipe_f(bd, n, 0, 0, 0); }
 /* chain_moe_gv.comp for format fmt (1, 2, 4) and input rows of n floats (a multiple of 32):
- * NULL where the row does not fit the staging or COLI_VK_MOE_GV=0 */
+ * NULL where the row does not fit the staging or COLI_VK_MOE_GV=0. int4 with a scale per
+ * gs inputs (4) whose rows are a whole number of steps a lane at coli_vk_gv_lanes, up to 16
+ * (Qwen3.6's 2048 and 512 inputs: 8): the shader's HQ build, each lane's steps loaded ahead
+ * with the loop's bits (a Radeon 8060S's Qwen3.6 layer, one row: 160 -> 100 us).
+ * COLI_VK_MOE_GV_HQ=0 keeps the loop. */
+static int g_gv_hq = -1;   /* the fast path: -1 from COLI_VK_MOE_GV_HQ (vkc_moe_gv_hq) */
+void vkc_moe_gv_hq(int on) { g_gv_hq = on; }
 static VkPipeline moe_gv_pipe(int fmt, int n) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_VK_MOE_GV"); on = !(e && *e == '0'); }
+    int hq = g_gv_hq;
+    if (hq < 0) { const char *e = getenv("COLI_VK_MOE_GV_HQ"); hq = !(e && *e == '0'); }
     int fi = moe_fi(fmt), cap = KC.moe_xs / 4;
     if (!on || !fi || !cap || n < 32 || n % 32) return VK_NULL_HANDLE;
     int need = n / 4 + n / 32 + 1, b = stage_of(need, cap);
     if (need > stage_vec4(b, cap)) return VK_NULL_HANDLE;
-    VkPipeline *pp = &KC.moe_gv[fi - 1][b];
-    if (*pp || KC.moe_gv_tried[fi - 1][b]) return *pp;
-    KC.moe_gv_tried[fi - 1][b] = 1;
+    int steps = n / 32, l = coli_vk_gv_lanes(fmt, n), nq = hq && fmt == 4 && steps % l == 0 ? steps / l : 0;
+    if (nq > 16) nq = 0;
+    VkPipeline *pp = nq ? &KC.moe_gvq[b][nq] : &KC.moe_gv[fi - 1][b];
+    uint8_t *tried = nq ? &KC.moe_gvq_tried[b][nq] : &KC.moe_gv_tried[fi - 1][b];
+    if (*pp || *tried) return *pp;
+    *tried = 1;
     if (!KC.mod_moe_gv && !(KC.mod_moe_gv = load_module(KC.core.spv_path, "chain_moe_gv.spv"))) return VK_NULL_HANDLE;
-    int32_t v[2] = {stage_vec4(b, cap), fmt};
-    VkSpecializationMapEntry me[2] = {{0, 0, 4}, {1, 4, 4}};
-    VkSpecializationInfo si = {2, me, sizeof v, v};
+    int32_t v[4] = {stage_vec4(b, cap), fmt, nq > 0, nq ? nq : 8};
+    VkSpecializationMapEntry me[4] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}};
+    VkSpecializationInfo si = {4, me, sizeof v, v};
     return *pp = make_pipe(KC.mod_moe_gv, &si);
 }
 /* The routed experts in the CPU's integer form (chain_moe_i8.spv, bdstep_i8.glsl): the
@@ -2596,6 +2608,11 @@ int vkc_mla_qkv(const VkcMla *m, VkcMlaScratch *s, VkcBuf *x, size_t x_off, int 
         VkcMlaRow rq = {S * H, H, m->R, m->R, m->rope_style, m->Q, H * QR, QR, m->Q, H * QR, QR, 0, m->R, 0, 0, 0, 0.f};
         VkcMlaRow rk = {S, 1, m->R, m->R, m->rope_style, m->K, KR, 0, pos_base * m->R, m->R, 0, 0, m->R, 0, 0, 0, 0.f};
         ok = vkc_mla_rope(s->q, cs, s->q, &rq) && vkc_mla_rope(s->kv, cs, c->rope, &rk);
+    }
+    if (ok && m->kv16) {   /* the rows as the host's float16 cache holds them, before anything reads them */
+        VkcEw rl = {VKC_EW_F16, S * m->K, m->K, 0, 0, 0, pos_base * m->K, pos_base * m->K, 0, 0, 0, 1.f};
+        VkcEw rr = {VKC_EW_F16, S * m->R, m->R, 0, 0, 0, pos_base * m->R, pos_base * m->R, 0, 0, 0, 1.f};
+        ok = vkc_ew(c->lat, c->lat, NULL, NULL, NULL, &rl) && (m->R == 0 || vkc_ew(c->rope, c->rope, NULL, NULL, NULL, &rr));
     }
     if (ok && down)
         ok = vkc_copy(down, down_off, c->lat, (size_t)pos_base * m->K, (size_t)S * m->K) &&
@@ -3200,6 +3217,7 @@ void vkc_shutdown(void) {
     }
     if (KC.mod_moe) vkDestroyShaderModule(KC.dev, KC.mod_moe, NULL);
     for (int f = 0; f < 3; f++) for (int b = 0; b < 10; b++) if (KC.moe_gv[f][b]) vkDestroyPipeline(KC.dev, KC.moe_gv[f][b], NULL);
+    for (int b = 0; b < 10; b++) for (int q = 0; q < 17; q++) if (KC.moe_gvq[b][q]) vkDestroyPipeline(KC.dev, KC.moe_gvq[b][q], NULL);
     if (KC.mod_moe_gv) vkDestroyShaderModule(KC.dev, KC.mod_moe_gv, NULL);
     if (KC.mod_gemm) vkDestroyShaderModule(KC.dev, KC.mod_gemm, NULL);
     if (KC.mod_dnrec) vkDestroyShaderModule(KC.dev, KC.mod_dnrec, NULL);

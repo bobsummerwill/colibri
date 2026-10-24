@@ -164,6 +164,7 @@ static int q36_mc_input(Model *m, const int *tok, const float *hid, int R, int p
         rg[s * KV + h] = (CcRegion){((size_t)h * g->cap + pos0 + s) * kvd, (size_t)s * kvo + (size_t)h * kvd, (size_t)kvd};
     CcNorm kn = {R * KV, kvd, KV, 0, kvo, kvd, 0, kvo, kvd, (int)g->o_kn, 0, CC_NORM_ADD1, c->eps, 1.f};
     CcRope kr = {R * KV, KV, 0, kvo, kvd, half, 0, 2 * half};
+    CcEw r16 = {CC_EW_F16, R * kvo, kvo, 0, 0, 0, 0, 0, 0, 0, 0, 1.f};   /* the rows as the host's cache keeps them */
     int ok = cc_write(g->emb, 0, em, (size_t)R * D * 4) && (!hid || cc_write(g->hin, 0, hid, (size_t)R * D * 4)) &&
              (!half || cc_write(g->cs, 0, cs, (size_t)R * 2 * half * 4)) &&
              q36_mc_norm(g->emb, 0, D, g->o_en, g->cat, 0, 2 * D, R, D, c->eps) &&
@@ -172,6 +173,7 @@ static int q36_mc_input(Model *m, const int *tok, const float *hid, int R, int p
              q36_mc_norm(g->x, 0, D, g->o_in, g->nrm, 0, D, R, D, c->eps) &&
              cc_matmul(g->lk, g->nrm, 0, g->k, 0, R) && cc_matmul(g->lv, g->nrm, 0, g->v, 0, R) &&
              cc_norm(g->k, g->prm, g->k, &kn) && (!half || cc_rope(g->k, g->cs, &kr)) &&
+             (!q36_kv16() || !cc_kv16_ready() || (cc_ew(g->k, g->k, NULL, NULL, NULL, &r16) && cc_ew(g->v, g->v, NULL, NULL, NULL, &r16))) &&
              cc_copy_regions(g->kc, g->k, rg, R * KV) && cc_copy_regions(g->vc, g->v, rg, R * KV);
     (void)p;
     free(em); free(cs); free(rg);

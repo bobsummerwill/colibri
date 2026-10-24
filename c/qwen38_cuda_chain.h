@@ -1002,6 +1002,7 @@ static int q38cc_layer_cmp(const void *a, const void *b) {
     const Q38CCHot *x = (const Q38CCHot *)a, *y = (const Q38CCHot *)b;
     return x->i != y->i ? x->i - y->i : x->e - y->e;
 }
+static size_t q38_state_later(Model *m);   /* qwen38.c: the KV and state a serve allocates once it runs */
 static void q38cc_pool_init(Model *m) {
     Q38CChain *ch = q38cc_of(m);
     const char *on = getenv("COLI_CUDA_CHAIN_POOL"), *gbs = getenv("COLI_CUDA_CHAIN_POOL_GB");
@@ -1038,7 +1039,10 @@ static void q38cc_pool_init(Model *m) {
         for (int k = 0; k < left; k++) out += hot[k].i == i;
         grow += (double)(room < out ? room : out) * (double)stride;
     }
-    double want = gbs && *gbs ? atof(gbs) * GiB : compat_mem_available_gb() * 1e9 - 4.0 * GiB - grow;
+    /* and the KV and state the serve allocates once it runs, which the free RAM does not show
+     * yet (#2314: a host pool took the room of a 131072-token KV cache, whose allocation failed) */
+    const double later = (double)q38_state_later(m);
+    double want = gbs && *gbs ? atof(gbs) * GiB : compat_mem_available_gb() * 1e9 - 4.0 * GiB - grow - later;
     size_t blk = (size_t)256 << 20;
     int per = (int)(blk / stride);
     long long fit = want > 0 ? (long long)(want / (double)stride) : 0;
@@ -1048,11 +1052,12 @@ static void q38cc_pool_init(Model *m) {
     int full = 0;
     {   void *ab; size_t as, au, ad; int an;
         if (!(gbs && *gbs) && q38cc_promote_rate() > 0 && left + on_card == all &&
-            compat_mem_available_gb() * 1e9 - 4.0 * GiB >= (double)all * stride && qt_chain_arena(&ab, &as, &au, &ad, &an)) { full = 1; fit = all; }
+            compat_mem_available_gb() * 1e9 - 4.0 * GiB - later >= (double)all * stride && qt_chain_arena(&ab, &as, &au, &ad, &an)) { full = 1; fit = all; }
     }
     if (per < 1 || fit < 1) {
-        fprintf(stderr, "[chain] qwen38: no RAM for a host pool (%.1f GiB free less 4 GiB and the RAM cache's %.1f GiB to come; "
-                        "COLI_CUDA_CHAIN_POOL_GB sets it)\n", compat_mem_available_gb() * 1e9 / GiB, grow / GiB);
+        fprintf(stderr, "[chain] qwen38: no RAM for a host pool (%.1f GiB free less 4 GiB, the RAM cache's %.1f GiB to come "
+                        "and the serve's KV and state, %.1f GiB; COLI_CUDA_CHAIN_POOL_GB sets it)\n",
+                compat_mem_available_gb() * 1e9 / GiB, grow / GiB, later / GiB);
         free(hot);
         return;
     }

@@ -3716,7 +3716,7 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
          * COLI_VK_DENSE_HOST's host copies of those layers given back, before the expert cache
          * sizes itself from the free memory and before the tier */
         g53c_start(m);
-    }
+    } else coli_vk_say_unused("glm53");   /* #2289 */
 #endif
     /* La cache si dimensiona qui, non prima: quanto si puo' spendere dipende
      * da quanto hanno gia' preso i pesi, e prima del ciclo sui layer non
@@ -5537,6 +5537,22 @@ static size_t g53_tier_dense_bytes(const GModel *m) {
 #endif
     (void)m; return 0;
 }
+/* The state a serve allocates once it runs: every slot's session at GLM53_MAXT
+ * (session_open's latent, index keys and gates; the KDA layers' state), which the
+ * tier's host pool must leave in RAM. Read before slots_init, as it reads them. */
+static size_t g53_state_later(const GModel *m) {
+    const Cfg *c = &m->c;
+    const char *ks = getenv("KV_SLOTS"), *mt = getenv("GLM53_MAXT");
+    int slots = ks ? atoi(ks) : 1, t = mt ? atoi(mt) : 8192;
+    if (slots < 1) slots = 1;
+    if (slots > GLM53_MAX_SLOTS) slots = GLM53_MAX_SLOTS;
+    if (t < 64) t = 64;
+    size_t b = 0;
+    for (int i = 0; i < c->n_layers; i++)
+        if (c->is_full[i]) b += (size_t)t * (size_t)(c->kv_lora + 2 * c->index_hd) * sizeof(float);
+        else if (c->kda_proj) b += (size_t)c->kda_heads * c->kda_hd * c->kda_hd * sizeof(float);
+    return b * (size_t)slots;
+}
 static void glm53_vk_tier_start(GModel *m) {
     if (!g53_tier_dev()) return;
     const Cfg *c = &m->c;
@@ -5593,6 +5609,7 @@ static void glm53_vk_tier_start(GModel *m) {
                         .max_rows = GLM53_VK_ROWS * c->topk,
                         .ram_reserve = (size_t)cap * (size_t)sparse * (size_t)m->e_slot,
                         .ram_floor = (size_t)c->topk * (size_t)sparse * (size_t)m->e_slot, .ram_given = glm53_ram_given,
+                        .ram_later = g53_state_later(m),
                         /* a partial chain: nothing more of the trunk goes up, but the chain's first
                          * forward allocates its scratch and the N layers' MLA caches */
                         .dense_bytes = g53_tier_dense_bytes(m),

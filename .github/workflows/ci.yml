@@ -1727,6 +1727,10 @@ jobs:
           cd c
           SNAP=./glm_tiny TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ORACLE_TF_MAX_MISMATCHES=2 ./colibri 64 16 16
           SNAP=./glm_tiny COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 64 16 16
+          # the latent KV cache in float16, as a serve keeps it (an oracle run keeps float32 unless KV16 says)
+          KV16=1 SNAP=./glm_tiny TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ORACLE_TF_MAX_MISMATCHES=2 ./colibri 64 16 16 > kv16.log 2>&1 || { cat kv16.log; exit 1; }
+          cat kv16.log
+          grep -q "latent KV cache in float16" kv16.log && ! grep -q "oracle run keeps" kv16.log
       - name: Oracle allowance and failure regressions
         run: cd c && python3 tests/test_glm_oracle.py
       - name: The MTP head under the draft gate (docs/speculative.md)

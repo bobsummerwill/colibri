@@ -175,6 +175,53 @@ static void s_run_case(const char *name, float tol){
     if(!fails) fprintf(stderr,"[info] %s: adopt exact, rows valid, prefix+hist intact\n",name);
 }
 
+/* KV16: float16 rows (2 bytes a value) in Lc8/Rc8 and no scales at all */
+static void s_run_kv16(void){
+    static Model m;
+    memset(&m,0,sizeof(m));
+    m.c.n_layers=NL; m.c.kv_lora=KVL; m.c.qk_rope=KVR;
+    int lb=2*KVL, rb=2*KVR;
+    KVState *donor=calloc(1,sizeof(KVState)), *recv=calloc(1,sizeof(KVState));
+    m.kv=donor; kv_alloc(&m,MAXT);
+    CHECK(donor->Lc8&&donor->Rc8&&!donor->Lsc&&!donor->Rsc, "KV16: byte rows and no scales");
+    for(int l=0;l<NL+1;l++)
+        for(int t=0;t<BLEN;t++){
+            float Ls[KVL], Rs[KVR];
+            for(int i=0;i<KVL;i++) Ls[i]=s_frand();
+            for(int i=0;i<KVR;i++) Rs[i]=s_frand();
+            kv16_pack((uint16_t *)coli_kv_row8(donor->Lc8[l],t,lb),Ls,KVL);
+            kv16_pack((uint16_t *)coli_kv_row8(donor->Rc8[l],t,rb),Rs,KVR);
+        }
+    m.kv=recv; kv_alloc(&m,MAXT);
+    int *dhist=malloc(sizeof(int)*MAXT), *rhist=malloc(sizeof(int)*MAXT);
+    for(int t=0;t<BLEN;t++) dhist[t]=2000+t;
+    for(int t=0;t<MAXT;t++) rhist[t]=-1;
+    for(int l=0;l<NL+1;l++){
+        for(int t=0;t<FROM;t++){
+            float Ls[KVL], Rs[KVR];
+            for(int i=0;i<KVL;i++) Ls[i]=s_frand()+10.f;
+            for(int i=0;i<KVR;i++) Rs[i]=s_frand()-10.f;
+            kv16_pack((uint16_t *)coli_kv_row8(recv->Lc8[l],t,lb),Ls,KVL);
+            kv16_pack((uint16_t *)coli_kv_row8(recv->Rc8[l],t,rb),Rs,KVR);
+        }
+        uint8_t *preL=malloc((size_t)FROM*lb), *preR=malloc((size_t)FROM*rb);
+        memcpy(preL,recv->Lc8[l],(size_t)FROM*lb); memcpy(preR,recv->Rc8[l],(size_t)FROM*rb);
+        memset(coli_kv_row8(recv->Lc8[l],FROM,lb),0xA5,(size_t)AN*lb);
+        memset(coli_kv_row8(recv->Rc8[l],FROM,rb),0xA5,(size_t)AN*rb);
+        coli_kv_share_adopt_rows(&m.c,recv,donor,rhist,dhist,FROM,AN);
+        CHECK(memcmp(coli_kv_row8(recv->Lc8[l],FROM,lb),coli_kv_row8(donor->Lc8[l],FROM,lb),(size_t)AN*lb)==0,
+              "KV16: Lc8 adopted rows differ (l=%d)",l);
+        CHECK(memcmp(coli_kv_row8(recv->Rc8[l],FROM,rb),coli_kv_row8(donor->Rc8[l],FROM,rb),(size_t)AN*rb)==0,
+              "KV16: Rc8 adopted rows differ (l=%d)",l);
+        CHECK(memcmp(recv->Lc8[l],preL,(size_t)FROM*lb)==0, "KV16: receiver Lc8 prefix clobbered (l=%d)",l);
+        CHECK(memcmp(recv->Rc8[l],preR,(size_t)FROM*rb)==0, "KV16: receiver Rc8 prefix clobbered (l=%d)",l);
+        free(preL); free(preR);
+    }
+    for(int t=FROM;t<BLEN;t++) CHECK(rhist[t]==dhist[t],"KV16: hist not adopted at %d",t);
+    free(dhist); free(rhist);
+    if(!fails) fprintf(stderr,"[info] KV16: adopt exact, rows valid, prefix+hist intact\n");
+}
+
 int main(void){
     /* KV8 with per-row scales and with 128-wide group scales (the asymmetric
      * stride trap: Lsc multi-float vs Rsc single float per row). */
@@ -185,8 +232,9 @@ int main(void){
     g_tq=1; g_tq_bits=4; g_tq_codec=1; s_run_case("KV_TQ codec=1 bits=4",0.60f);
     g_tq=1; g_tq_bits=4; g_tq_codec=0; s_run_case("KV_TQ codec=0 bits=4",0.60f);
     g_tq=0;
+    g_kv16=1; s_run_kv16(); g_kv16=0;
 
     if(fails){ fprintf(stderr,"%d failure(s)\n",fails); return 1; }
-    printf("OK kv_share_kv8: cross-slot adoption copies KV8/KV_TQ rows+scales exactly\n");
+    printf("OK kv_share_kv8: cross-slot adoption copies KV8/KV_TQ rows+scales and KV16 rows exactly\n");
     return 0;
 }

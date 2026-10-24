@@ -1831,6 +1831,17 @@ static void test_moe(const char *what, int D, int I, int E, int S, int K, int fg
         double e2 = 0;
         for (int s = 0; s < S; s++) { double r = relerr(got2 + (size_t)s * yrow + 1, ref + (size_t)s * yrow + 1, (size_t)D, 1e-3); if (r > e2) e2 = r; }
         CHECK(rec2 && e2 < 2e-4 && !bad(got2, (size_t)S * yrow), "moe %s (fmt %d/%d named): rel err %.2e", what, fg, fd, e2);
+        /* int4 rows of whole steps a lane: chain_moe_gv.comp's fast path (HQ) took them;
+         * the loop gives the same bits */
+        if (rec2 && n1.moe_gv > n0.moe_gv && fg == 4 && fd == 4 && gs % 32 == 0) {
+            vkc_moe_gv_hq(0);
+            int rec3 = vkc_begin() && vkc_moe(xb, ib, wb, tb, hb, yb, &mp) && vkc_submit(1);
+            vkc_moe_gv_hq(-1);
+            float *got3 = down(yb, 0, (size_t)S * yrow);
+            CHECK(rec3 && !memcmp(got2, got3, (size_t)S * yrow * 4), "moe %s: the int4 fast path gives the loop's bits", what);
+            if (rec3 && !memcmp(got2, got3, (size_t)S * yrow * 4)) printf("  moe %s: the int4 fast path gives the loop's bits\n", what);
+            free(got3);
+        }
         free(got2);
         /* chain_moe_gv.comp took the run: the tier's small experts run the same kernel
          * (backend_vulkan.c, xb_cgv_record), so each pair's down row, an expert and a row a
@@ -4098,6 +4109,14 @@ int main(int argc, char **argv) {
             g_moe_named_only = 1;
             /* the expert batch is sized for one shape at a time */
             if (coli_vk_xb_init(2048, 256, COLI_VK_ACT_SWIGLU, 0, 0, 0)) test_moe("gv int4-g64, D 2048", 2048, 256, 6, 2, 3, 4, 4, 64, 0, 0.f);
+            /* Qwen3.6's shapes, top 8 over three rows: both passes on the int4 fast path (HQ,
+             * eight steps a lane), the tier's small experts on the loop, the same bits. Its
+             * draws leave the generator as they found it: the cases after keep their data */
+            if (coli_vk_xb_init(2048, 512, COLI_VK_ACT_SWIGLU, 0, 0, 0)) {
+                unsigned r0 = rng;
+                test_moe("gv int4-g64, Qwen3.6's 2048 x 512", 2048, 512, 16, 3, 8, 4, 4, 64, 0, 0.f);
+                rng = r0;
+            }
             if (coli_vk_xb_init(1024, 128, COLI_VK_ACT_SWIGLU, 0, 0, 0)) {
                 test_moe("gv int8 rows", 1024, 128, 6, 2, 3, 1, 1, 32, 0, 0.f);
                 test_moe("gv int4 rows", 1024, 128, 6, 2, 3, 2, 2, 32, 0, 0.f);

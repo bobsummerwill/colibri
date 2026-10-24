@@ -892,7 +892,7 @@ static int v41c_attention(V41Chain *ch, Model *m, int i, const V41Fwd *f) {
                  v41c_rope(ch, m, ch->ikey[i], np, 1, g0 * ihd + ihd - rd, ihd, 0, bc, r * rd, 0) &&
                  v41c_rope(ch, m, cb, np, 1, (int)co + hd - rd, hd, 0, bc, r * rd, 0);
             if (ok && sp) {   /* into their slots, and down for the host's ckv once the frame is through */
-                VkcKvPart pt = {1, hd, l->ckv, 0, ch->ckv[i], 0};
+                VkcKvPart pt = {1, hd, l->ckv, 0, ch->ckv[i], 0, 0};
                 ok = vkc_kv_store(&ch->ks, ch->sli[i], &pt, cb, 0, (size_t)hd, 0, g0, np) &&
                      vkc_copy(ch->cdn, 0, cb, 0, (size_t)np * hd);
                 vkc_kv_done(&ch->ks, ch->sli[i], g0 + np);
@@ -928,7 +928,7 @@ static int v41c_attention(V41Chain *ch, Model *m, int i, const V41Fwd *f) {
     VkcHgemv g = {0, nr, og, ol, ol, 0, 0, qrow, pg, 0, og * ol, ol, 0, 0, 0};
     if (ch->ks.on && r > 0) {   /* stage selected cold rows, preserving the original sparse attention order */
         int own = c->index_owner[i], li = ch->sli[own];
-        VkcKvPart pt = {1, hd, m->L[own].ckv, 0, ch->ckv[own], 0};
+        VkcKvPart pt = {1, hd, m->L[own].ckv, 0, ch->ckv[own], 0, 0};
         VkcKvDs d = {&ch->ks, li, ch->q, ch->win[i], ch->ckv[own], ch->prm, ch->list, ch->heads, nr, nh, hd, a.cnt, 0, LR,
                      ch->Wd, 0, 0, qrow, (int)ch->o_sink[i], 0, 0, qrow, (pb + nr) / r, a.scale, m->L[own].ckv};
         /* the blocks pinned since the chunk began, and the table, before this read */
@@ -1170,7 +1170,7 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
         for (int i = 0; ch->ks.on && i < L && ok; i++) {   /* the split: each table's window over this chunk's new rows */
             if (ch->sli[i] < 0) continue;
             int r = c->compress_ratio[i], g0 = pb / r;
-            VkcKvPart pt = {1, hd, m->L[i].ckv, 0, ch->ckv[i], 0};
+            VkcKvPart pt = {1, hd, m->L[i].ckv, 0, ch->ckv[i], 0, 0};
             vkc_kv_place(&ch->ks, ch->sli[i], g0, (pb + nr) / r - g0);
             ok = vkc_kv_push(&ch->ks, ch->sli[i], &pt, 1, g0);
         }

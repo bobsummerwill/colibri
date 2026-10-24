@@ -1205,6 +1205,15 @@ static int olmoe_vk_gguf_forms(const Model *m, VktFmt *gu, VktFmt *dn, VktFmt **
     else { free(lgu); free(ldn); }
     return 1;
 }
+/* The KV a serve allocates once it runs (every slot at CTX, at most 4096 positions;
+ * malloc'd pages the RAM does not count yet), which the tier's host pool must leave. */
+static size_t olm_kv_later(const Model *m) {
+    const Cfg *c = &m->c;
+    int t = getenv("CTX") ? atoi(getenv("CTX")) : 4096;
+    if (t < 1 || t > 4096) t = 4096;
+    return 2 * (size_t)c->n_layers * c->n_heads * (size_t)t * c->head_dim * sizeof(float) *
+           (size_t)(g_olm_mux_slots > 1 ? g_olm_mux_slots : 1);
+}
 static void olmoe_vk_tier_start(Model *m) {
     Cfg *c = &m->c;
     if (!vkt_wanted() || c->n_experts < 1) return;
@@ -1230,6 +1239,7 @@ static void olmoe_vk_tier_start(Model *m) {
                     .act = VKT_ACT_SWIGLU, .max_rows = OLMOE_VK_ROWS * c->topk,
                     .ram_reserve = slotb * (size_t)m->cache[0].cap * (size_t)c->n_layers,
                     .ram_floor = slotb * (size_t)c->topk * (size_t)c->n_layers, .ram_given = olmoe_vk_ram_given,
+                    .ram_later = olm_kv_later(m),
                     .dense_bytes = dense, .in_ram = olmoe_vk_in_ram, .ram_ctx = m,
                     .load = olmoe_vk_load, .release = olmoe_vk_release, .load_ctx = m,
                     .stage = 1};   /* the chain (decided after the tier) stages a prompt chunk's host pool experts */

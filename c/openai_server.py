@@ -196,6 +196,9 @@ class GenerationScheduler:
         self.queue = collections.deque()
         self.active = 0
         self.closed = False
+        # True while serve() starts a dead engine again (keep_engine): nothing is admitted,
+        # so a request waits in the queue for the new engine instead of failing on the old
+        self.paused = False
         self.admitted = 0
         self.completed = 0
         self.failed = 0
@@ -215,7 +218,7 @@ class GenerationScheduler:
             if self.closed:
                 raise APIError(503, "The inference scheduler is shutting down.", None,
                                "scheduler_closed", "server_error")
-            if self._available_slot(slot) is None and len(self.queue) >= self.max_queue:
+            if (self.paused or self._available_slot(slot) is None) and len(self.queue) >= self.max_queue:
                 self.rejected += 1
                 raise APIError(429, "The inference queue is full.", None, "queue_full",
                                "rate_limit_error", {"Retry-After": "1"})
@@ -239,7 +242,7 @@ class GenerationScheduler:
                     self.condition.notify_all()
                     raise APIError(429, "Timed out waiting for the inference engine.", None,
                                    "queue_timeout", "rate_limit_error", {"Retry-After": "1"})
-                available = self._available_slot(slot, ticket)
+                available = None if self.paused else self._available_slot(slot, ticket)
                 if available is not None:
                     break
                 self.condition.wait(min(remaining, 0.25))
@@ -264,6 +267,15 @@ class GenerationScheduler:
                 setattr(self, outcome, getattr(self, outcome) + 1)
                 self._observe("slot_duration_seconds", time.monotonic() - admitted_at)
                 self.condition.notify_all()
+
+    def pause(self):
+        with self.condition:
+            self.paused = True
+
+    def resume(self):
+        with self.condition:
+            self.paused = False
+            self.condition.notify_all()
 
     def _available_slot(self, slot, ticket=None):
         # Caller holds the condition lock. Pinned waiters reserve only their
@@ -6339,6 +6351,12 @@ class Engine:
                                            name="colibri-stdout", daemon=True)
         self.dispatcher.start()
 
+    @property
+    def alive(self):
+        """The process runs and its output is still read: after the dispatcher stops, every
+        request fails, so an engine whose process outlived its reader counts as gone too."""
+        return not self.closed and self.dispatcher_error is None and self.process.poll() is None
+
     @staticmethod
     def _stats(fields):
         if len(fields) < 5 or fields[0] != "STAT":
@@ -6734,7 +6752,12 @@ class Engine:
                  gbytes_before_ext=False):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
-        payload = prompt.encode("utf-8")
+        # GLM's ids=1 intake consumes decimal token IDs directly, without a
+        # detokenize/re-tokenize round trip. The completion route checks the
+        # list and engine capability before it reaches this wire builder.
+        token_ids = isinstance(prompt, list)
+        payload = (" ".join(map(str, prompt)).encode("ascii") if token_ids
+                   else prompt.encode("utf-8"))
         if b"\0" in payload:
             raise APIError(400, "NUL bytes are not supported in prompts.", "messages")
         gpayload = grammar.encode("utf-8") if grammar else b""
@@ -6798,11 +6821,13 @@ class Engine:
             ext += f" logprobs={int(logprobs)}"
         if pin:
             ext += " pin=1"
+        if token_ids:
+            ext += " ids=1"
         # `gbytes_before_ext` asks for the 7th numeric field ahead of the extension keys
         # even with no grammar or audio payload to describe. It defaults to False, so
         # every caller that does not ask keeps the wire it had.
         gbytes_field = (f" {len(xpayload)}"
-                        if (xpayload or (ext and gbytes_before_ext)) else "")
+                        if (xpayload or token_ids or (ext and gbytes_before_ext)) else "")
         header = (f"SUBMIT {request_id} {cache_slot} {len(payload)} {max_tokens} "
                   f"{temperature:.8g} {top_p:.8g}"
                   + (prefix_field if prefix_field else gbytes_field)
@@ -6839,9 +6864,28 @@ class Engine:
         cancel_sent = False
         stop_sent = False
         accepted = False
+        produced = False   # a DATA or TOOL frame came: the engine is past the prompt
+        cancel_at = 0.0
         # DATA's numeric tail, in emission order. Stays empty when logprobs is 0, because
         # the dispatcher never parses a tail for a request that did not ask for one.
         generated_logprobs = []
+
+        def _cancel():
+            # #2290: the client left mid-turn. The admission (the slot) stays this
+            # request's until the engine stops, so say so: without a line the server
+            # looks healthy and idle while every later request queues behind it.
+            nonlocal cancel_sent, cancel_at
+            cancel_sent = True
+            cancel_at = time.monotonic()
+            sys.stderr.write(f"[api] {request_id}: the client left while the engine was "
+                             f"{'generating' if produced else 'reading the prompt'}; "
+                             "cancelling, the slot frees when the engine stops\n")
+            self._write_frame(request_id, f"CANCEL {request_id}\n".encode(), "CANCEL")
+
+        def _cancelled():
+            sys.stderr.write(f"[api] {request_id}: the engine stopped "
+                             f"{time.monotonic() - cancel_at:.1f} s after the cancel; the slot is free\n")
+            return ClientCancelled()
 
         def _accept(info):
             # #597: commit exactly once, on the first of ACCEPT / DATA / DONE. A new engine sends
@@ -6872,8 +6916,7 @@ class Engine:
                 # orphaned generation. Wait for the engine's ERROR CANCELLED /
                 # DONE frame; ClientCancelled is raised when it arrives.
                 if not cancel_sent and not stop_sent and cancelled and cancelled():
-                    cancel_sent = True
-                    self._write_frame(request_id, f"CANCEL {request_id}\n".encode(), "CANCEL")
+                    _cancel()
                 elif not cancel_sent and not stop_sent and pending.failed is not None:
                     # A fault was recorded for this request, so nothing it generates from
                     # here can reach the client. The turn is still the engine's -- the
@@ -6896,6 +6939,7 @@ class Engine:
                 _accept(value)
             elif kind == "data":
                 _accept({"prompt_tokens": None})
+                produced = True
                 # The dispatcher wraps the payload in a tuple only when a logprob record
                 # rides along; bare bytes is the non-opted-in shape.
                 data, record = value if isinstance(value, tuple) else (value, None)
@@ -6910,8 +6954,7 @@ class Engine:
                         # Same admission-holding rule as the idle branch above:
                         # send CANCEL, then keep consuming frames until the
                         # engine acknowledges with ERROR CANCELLED or DONE.
-                        cancel_sent = True
-                        self._write_frame(request_id, f"CANCEL {request_id}\n".encode(), "CANCEL")
+                        _cancel()
             elif kind == "echo":
                 # Lettura del prefill: arriva PRIMA di ogni DATA e non e' testo
                 # generato, quindi non passa da decode() e non entra nella
@@ -6921,14 +6964,14 @@ class Engine:
                     on_echo(value)
             elif kind == "tool":
                 _accept({"prompt_tokens": None})
+                produced = True
                 if not cancel_sent and not stop_sent:
                     decode_tool(value)
                     if stopped and stopped():
                         stop_sent = True
                         self._write_frame(request_id, f"STOP {request_id}\n".encode(), "STOP")
                     elif cancelled and cancelled():
-                        cancel_sent = True
-                        self._write_frame(request_id, f"CANCEL {request_id}\n".encode(), "CANCEL")
+                        _cancel()
             elif kind == "done":
                 _accept({"prompt_tokens": None})
                 if cancel_sent:
@@ -6936,7 +6979,7 @@ class Engine:
                     # (or honored it at a token boundary and still framed a
                     # DONE). Either way the client is gone: the ack is what
                     # mattered, the output is not deliverable.
-                    raise ClientCancelled()
+                    raise _cancelled()
                 tail = decoder.decode(b"", final=True)
                 if tail:
                     on_text(tail)
@@ -6956,8 +6999,12 @@ class Engine:
                 # scheduler's outcome, and tries to write a 500 to a socket that is already
                 # closed. An ERROR carrying any other text is the engine's own account of
                 # why the turn ended; that is news, and it is still reported as a failure.
-                raise ClientCancelled()
+                raise _cancelled()
             else:
+                if token_ids and isinstance(value, RuntimeError) and str(value) == "BAD_REQUEST":
+                    raise APIError(400, "The engine rejected this token-ID `prompt` "
+                                   "(check IDs against the model vocabulary).",
+                                   "prompt", "invalid_value") from value
                 raise value
 
     def close(self):
@@ -7012,6 +7059,12 @@ def is_image_engine(engine):
     Decided by the engine object, not by the ARCH global, so a server built in a
     test (or embedded) with an ImageEngine behaves as one."""
     return getattr(engine, "modality", "text") == "image"
+
+
+def engine_alive(engine):
+    """False once the served engine has died: Engine and ImageEngine say so through
+    `alive`; an object without it (a test double, an embedder's engine) is taken as running."""
+    return getattr(engine, "alive", True)
 
 
 # The endpoints that only make sense for a chat model, refused with a pointer
@@ -7116,6 +7169,11 @@ class APIServer(ThreadingHTTPServer):
         self.compactions = CompactionMemory()
         self.context_limit = None
         self.tokens_per_char = None
+        # serve() starts a dead engine again (keep_engine); an embedder that does not run
+        # it gets "engine_down" from /health instead of "restarting"
+        self.keeps_engine = False
+        self.engine_restarts = 0
+        self.engine_swap = threading.Lock()   # a restart's swap against serve()'s teardown
 
     def model_entry(self):
         """The /v1/models object. An image model says so, and carries the size
@@ -7646,6 +7704,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.wfile.write(data)
                 return
             if path == "/health":
+                if not engine_alive(self.server.engine) or self.server.scheduler.paused:
+                    # The HTTP side answering is not the service answering (#2290): a
+                    # supervisor or a load balancer sees the engine gone while it is.
+                    self.send_json(503, {"status": "restarting" if self.server.keeps_engine
+                                         else "engine_down"}, request_id,
+                                   {"Retry-After": "5"})
+                    return
                 # Liveness is always public; hardware/scheduler internals only when a
                 # request is authed (or no key set), so a configured key isn't leaked
                 # past a bare 200 to an unauthenticated probe. (#SEC-8)
@@ -7653,6 +7718,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 if self._is_authed():
                     payload["arch"] = ARCH            # which family answers: coli chat reads it
                     payload["scheduler"] = self.server.scheduler.snapshot()
+                    payload["engine_restarts"] = self.server.engine_restarts
                     payload["kv_slots"] = self.server.kv_slots
                     payload["input_modalities"] = self.server.input_modalities()
                     payload["continue_assistant"] = os.environ.get("COLI_CONTINUE_ASSISTANT", "1") != "0" and ARCH in CONTINUATION_FAMILIES
@@ -9434,11 +9500,81 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def completion(self, body, request_id):
         prompt = body.get("prompt")
+        if isinstance(prompt, list):
+            if not getattr(self.server.engine, "supports_tok_ids", False):
+                raise APIError(400, "Token-ID `prompt` is not supported by this engine.",
+                               "prompt", "unsupported_parameter")
+            if not prompt or any(isinstance(token, bool) or not isinstance(token, int) or
+                                 not 0 <= token <= 2147483647 for token in prompt):
+                raise APIError(400, "`prompt` must be a non-empty array of non-negative "
+                               "32-bit token IDs.", "prompt", "invalid_value")
+            self.generation(body, prompt, request_id, False)
+            return
         if not isinstance(prompt, str):
             raise APIError(400, "Colibri currently requires `prompt` to be a string.", "prompt")
         if not prompt:
             raise APIError(400, "`prompt` must not be empty.", "prompt")
         self.generation(body, prompt, request_id, False)
+
+
+ENGINE_WATCH_S = 0.5            # how often keep_engine looks at the engine
+ENGINE_RESTART_DELAYS = (2.0, 60.0)   # first wait after a failed start, and the ceiling
+# A stop that reached the engine as well (Ctrl-C goes to the whole process group, and a
+# service manager may signal it too) ends serve() within one serve_forever poll, 0.5 s:
+# keep_engine waits this long first, so a server on its way out loads nothing.
+ENGINE_STOP_GRACE_S = 1.0
+
+
+def keep_engine(server, start, stopping, watch=ENGINE_WATCH_S, delays=ENGINE_RESTART_DELAYS,
+                grace=ENGINE_STOP_GRACE_S):
+    """Start the engine again whenever it dies under a live server (#2290).
+
+    The HTTP side outlives an engine that crashed, ran out of memory or was killed; before
+    this, /health said "ok" and every later request failed until a person restarted both.
+    While the new engine loads, admission is paused: a request waits in the queue (up to
+    the queue timeout) for it instead of failing on the old one, and /health answers 503.
+    A start that fails is tried again after 2 s, then twice as long each time up to 60 s:
+    the memory the dead engine held may take a moment to come back. Runs until `stopping`
+    is set; serve() runs it on its own thread."""
+    while not stopping.wait(watch):
+        dead = server.engine
+        if engine_alive(dead):
+            continue
+        server.scheduler.pause()
+        if stopping.wait(grace):
+            return
+        cause = (getattr(dead, "dispatcher_error", None) or getattr(dead, "dead", None)
+                 or "it exited")
+        print(f"[gateway] the engine stopped ({cause}); starting it again", file=sys.stderr)
+        try:
+            dead.close()          # reaps the process and fails what it still held
+        except Exception as error:
+            print(f"[gateway] closing the dead engine: {error}", file=sys.stderr)
+        # what /v1/systemone photographed lived in the dead engine's KV
+        server.pinned_prefixes.clear()
+        delay, ceiling = delays
+        fresh = None
+        while fresh is None:
+            try:
+                fresh = start()
+            except Exception as error:
+                if stopping.is_set():
+                    return
+                print(f"[gateway] the engine did not start ({error}); "
+                      f"trying again in {delay:g} s", file=sys.stderr)
+                if stopping.wait(delay):
+                    return
+                delay = min(delay * 2, ceiling)
+        with server.engine_swap:
+            if not stopping.is_set():
+                server.engine, fresh = fresh, None
+                server.engine_restarts += 1
+        if fresh is not None:     # the server stopped while it loaded
+            fresh.close()
+            return
+        server.scheduler.resume()
+        print(f"[gateway] the engine is running again (restart {server.engine_restarts})",
+              file=sys.stderr)
 
 
 def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
@@ -9476,6 +9612,7 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
     server = APIServer((host, port), None, model_id, api_key, max_tokens, origins,
                        max_queue, queue_timeout, kv_slots, allowed_hosts=allowed_hosts)
     runtime = None
+    stopping = threading.Event()
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     try:
         family = pending_family or resolve_model(model).descriptor
@@ -9500,19 +9637,25 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
         if kv_slots > family.limits.max_kv_slots:
             raise ValueError(f"{family.id} engine supports at most "
                              f"{family.limits.max_kv_slots} KV slot(s)")
+        def start_engine():
+            if family.modality == "image":
+                # Its own process class: the image engine speaks a line-and-JSON
+                # protocol with binary frames, not the text engines' byte stream.
+                image = image_engine.ImageEngine(engine, model, env=env)
+                # Same lifetime rule as the text engines on Windows: a job object
+                # takes the engine down with this server, however the server ends.
+                image._win_job = _win_kill_on_close_job(getattr(image.process, "pid", None))
+                return image
+            return Engine(engine,model,cap,max_tokens,env,kv_slots,family)
+
         if family.modality == "image":
-            # Its own process class: the image engine speaks a line-and-JSON
-            # protocol with binary frames, not the text engines' byte stream.
-            runtime = image_engine.ImageEngine(engine, model, env=env)
-            # Same lifetime rule as the text engines on Windows: a job object
-            # takes the engine down with this server, however the server ends.
-            runtime._win_job = _win_kill_on_close_job(getattr(runtime.process, "pid", None))
+            runtime = start_engine()
             print(f"[image] {model_id}: default {runtime.info['default_width']}x"
                   f"{runtime.info['default_height']}, {runtime.info['default_steps']} steps",
                   file=sys.stderr)
         else:
             try:
-                runtime = Engine(engine,model,cap,max_tokens,env,kv_slots,family)
+                runtime = start_engine()
             except EngineLoadError as error:
                 # The engine said why: one line naming the kind, not a traceback
                 # that ends in "exited unexpectedly".
@@ -9530,6 +9673,10 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
                   + (" (the engine loaded no vision tower; a picture gets a 400)"
                      if family.capabilities.image and runtime.vision is False else ""),
                   file=sys.stderr)
+        server.keeps_engine = True
+        watchdog = threading.Thread(target=keep_engine, args=(server, start_engine, stopping),
+                                    name="colibri-engine-watchdog", daemon=True)
+        watchdog.start()
         print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)
         signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
         # On Windows SIGTERM is never delivered (os.kill is TerminateProcess);
@@ -9547,11 +9694,14 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
         except KeyboardInterrupt:
             pass
     finally:
+        with server.engine_swap:
+            stopping.set()
         signal.signal(signal.SIGTERM, previous_sigterm)
         server.scheduler.close()
         server.server_close()
-        if runtime is not None:
-            runtime.close()
+        # the engine running now: keep_engine may have replaced the first one
+        for running in {id(e): e for e in (server.engine, runtime) if e is not None}.values():
+            running.close()
 
 
 def main():

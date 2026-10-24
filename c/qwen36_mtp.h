@@ -19,8 +19,8 @@ typedef struct {
     float last_p;                    /* the newest draft's probability under the head */
     int pick_id, pick_ok;            /* q36_mg_row's compact pick (a listed vocabulary) */
     int *vid;                        /* Q36_MTP_VOCAB_IDS: row j of dvoc scores id vid[j] (NULL: id j) */
-    float *Kc, *Vc; int stride;      /* the head's KV rows [KV][stride][hd] */
-    float **Kp, **Vp;                /* the model's per-layer pointers and the head's after them */
+    void *Kc, *Vc; int stride;       /* the head's KV rows [KV][stride][hd], q36_kv_es() bytes an element */
+    void **Kp, **Vp;                 /* the model's per-layer pointers and the head's after them */
     /* where the head is: rows up to `len` read; `pend` the model's row at len (before the
      * final norm), waiting for the token at len + 1; `done`: the row at done_pos already
      * run by a draft with token done_tok */
@@ -147,23 +147,23 @@ static int q36_mtp_load(Model *m) {
 static int q36_mtp_kv(Model *m) {
     Cfg *c = &m->c; Q36Mtp *p = &g_q36_mtp;
     if (p->stride != m->max_t || !p->Kc) {
-        size_t n = (size_t)c->kv_heads * m->max_t * c->k_head_dim;
-        float *kc = calloc(n, sizeof(float)), *vc = calloc(n, sizeof(float));
+        size_t n = (size_t)c->kv_heads * m->max_t * c->k_head_dim, es = q36_kv_es();
+        void *kc = calloc(n, es), *vc = calloc(n, es);
         if (!kc || !vc) { free(kc); free(vc); p->on = 0; return 0; }
         if (p->Kc && p->Vc) {
             int keep = p->stride < m->max_t ? p->stride : m->max_t;
             for (int h = 0; h < c->kv_heads; h++) {
-                memcpy(kc + (size_t)h*m->max_t*c->k_head_dim, p->Kc + (size_t)h*p->stride*c->k_head_dim,
-                       (size_t)keep*c->k_head_dim*sizeof(float));
-                memcpy(vc + (size_t)h*m->max_t*c->k_head_dim, p->Vc + (size_t)h*p->stride*c->k_head_dim,
-                       (size_t)keep*c->k_head_dim*sizeof(float));
+                memcpy(q36_kv_ptr(kc, (int64_t)h*m->max_t*c->k_head_dim), q36_kv_ptr(p->Kc, (int64_t)h*p->stride*c->k_head_dim),
+                       (size_t)keep*c->k_head_dim*es);
+                memcpy(q36_kv_ptr(vc, (int64_t)h*m->max_t*c->k_head_dim), q36_kv_ptr(p->Vc, (int64_t)h*p->stride*c->k_head_dim),
+                       (size_t)keep*c->k_head_dim*es);
             }
         }
         free(p->Kc); free(p->Vc); p->Kc = kc; p->Vc = vc; p->stride = m->max_t;
     }
     if (!p->Kp) {
-        p->Kp = malloc(sizeof(float *) * (size_t)(c->n_layers + 1));
-        p->Vp = malloc(sizeof(float *) * (size_t)(c->n_layers + 1));
+        p->Kp = malloc(sizeof(void *) * (size_t)(c->n_layers + 1));
+        p->Vp = malloc(sizeof(void *) * (size_t)(c->n_layers + 1));
         if (!p->Kp || !p->Vp) { p->on = 0; return 0; }
     }
     for (int i = 0; i < c->n_layers; i++) { p->Kp[i] = m->K[i]; p->Vp[i] = m->V[i]; }
@@ -276,8 +276,8 @@ static void q36_mtp_kv_rows(Model *m, const int *tok, const float *hid, int R, i
         if (m->mpos || m->rope_delta) { int p3[3]; mrope_at(m, pos0 + r, p3); rope_head_mrope(kh, p3, c->mrope_section, c->rotary_dim, c->theta); }
         else rope_head_partial(kh, pos0 + r, c->rotary_dim, kvd, c->theta);
         size_t dst = ((size_t)h * m->max_t + pos0 + r) * kvd;
-        memcpy(p->Kc + dst, kh, (size_t)kvd * sizeof(float));
-        memcpy(p->Vc + dst, v + (int64_t)r * kvo + h * kvd, (size_t)kvd * sizeof(float));
+        q36_kv_put(p->Kc, (int64_t)dst, kh, kvd);
+        q36_kv_put(p->Vc, (int64_t)dst, v + (int64_t)r * kvo + h * kvd, kvd);
     }
     free(cat); free(x); free(nrm); free(k); free(v);
     p->kv_rows += (unsigned long long)R; p->kv_ms += (now_s() - t0) * 1e3;
@@ -389,6 +389,7 @@ static int q36_mg_input(Model *m, const int *tok, const float *hid, int R, int p
         rg[s * KV + h] = (VkcRegion){((size_t)h * g->cap + pos0 + s) * kvd, (size_t)s * kvo + (size_t)h * kvd, (size_t)kvd};
     VkcNorm kn = {R * KV, kvd, KV, 0, kvo, kvd, 0, kvo, kvd, (int)g->o_kn, 0, VKC_NORM_ADD1, c->eps, 1.f};
     VkcRope kr = {R * KV, KV, 0, kvo, kvd, half, 0, 2 * half};
+    VkcEw r16 = {VKC_EW_F16, R * kvo, kvo, 0, 0, 0, 0, 0, 0, 0, 0, 1.f};   /* the rows as the host's cache keeps them */
     Q36Mtp *p = &g_q36_mtp;
     int ok = q36_mg_norm(g->emb, 0, D, g->o_en, g->cat, 0, 2 * D, R, D, c->eps) &&
              q36_mg_norm(hid ? g->hin : g->hid, 0, D, g->o_hn, g->cat, D, 2 * D, R, D, c->eps) &&
@@ -397,6 +398,7 @@ static int q36_mg_input(Model *m, const int *tok, const float *hid, int R, int p
              vkc_matmul(vk_qw_tensor(&p->L.k), g->nrm, 0, g->k, 0, R) &&
              vkc_matmul(vk_qw_tensor(&p->L.v), g->nrm, 0, g->v, 0, R) &&
              vkc_norm(g->k, g->prm, g->k, &kn) && (!half || vkc_rope(g->k, g->cs, &kr)) &&
+             (!q36_kv16() || (vkc_ew(g->k, g->k, NULL, NULL, NULL, &r16) && vkc_ew(g->v, g->v, NULL, NULL, NULL, &r16))) &&
              vkc_copy_regions(g->kc, g->k, rg, R * KV) && vkc_copy_regions(g->vc, g->v, rg, R * KV);
     free(rg);
     return ok;
@@ -543,7 +545,7 @@ static void q36_mtp_rows(Model *m, const int *tok, const float *hid, int R, int 
     }
     matmul_d(x, cat, &p->eh, R, 2 * D, D);
     for (int r = 0; r < R; r++) rmsnorm_row(nrm + (int64_t)r * D, x + (int64_t)r * D, p->L.in_ln, D, c->eps);
-    float **K0 = m->K, **V0 = m->V;
+    void **K0 = m->K, **V0 = m->V;
     m->K = p->Kp; m->V = p->Vp;
     attention(m, &p->L, c->n_layers, nrm, R, pos0, tmp);
     m->K = K0; m->V = V0;

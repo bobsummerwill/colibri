@@ -2181,12 +2181,22 @@ static void vk_tier_start(Model *m) {
     }
     int cap = 0, nmoe = 0;
     for (int li = 0; li < c->n_layers; li++) if (c->moe[li]) { nmoe++; if (m->cache[li].cap > cap) cap = m->cache[li].cap; }
+    /* the KV caches kv_alloc made (a sliding layer's ring, a full layer's context), each
+     * conversation's: RAM only once written, so the free RAM the host pool is sized from
+     * does not show them yet (#2314) */
+    size_t later = 0;
+    for (int li = 0; li < c->n_layers; li++) {
+        const int k = c->swa[li];
+        later += (size_t)m->L[li].rows * c->kv_heads[k] * ((size_t)c->head_dim[k] + c->v_dim[k]) * sizeof(float);
+    }
+    later *= (size_t)(g_mimo_mux_slots > 1 ? g_mimo_mux_slots : 1);
     VktConfig vc = {.engine = "mimo", .layers = c->n_layers, .experts = c->n_experts,
                     .hidden = c->hidden, .inter = c->moe_inter, .topk = c->topk,
                     .gate_up = f, .down = fd, .layer_gate_up = lgu, .layer_down = ldn, .act = VKT_ACT_SWIGLU,
                     .max_rows = MIMO_VK_ROWS * c->topk,
                     .ram_reserve = (size_t)(m->e_bytes + 8192) * (size_t)cap * (size_t)nmoe,
                     .ram_floor = (size_t)(m->e_bytes + 8192) * (size_t)c->topk * (size_t)nmoe, .ram_given = vk_ram_given,
+                    .ram_later = later,
                     .dense_bytes = mimo_tier_dense_bytes(m),
                     .in_ram = vk_in_ram, .ram_ctx = m,
                     .load = mimo_vk_load, .release = mimo_vk_release, .load_ctx = m, .load_batch = mimo_vk_load_batch};
@@ -2213,7 +2223,7 @@ static void vk_tier_start(Model *m) {
             expert_read(m, pl[i], pe[i], &tmp);
             VktExpertSrc src = mimo_vk_src(m, pl[i], tmp.buf);
             XT(put)(pl[i], pe[i], &src);
-            free(tmp.base);
+            compat_aligned_free(tmp.base);   /* expert_read's posix_memalign: _aligned_malloc on Windows (compat.h), never free() */
         }
         XT(put_done)();
         m->hits = hits; m->miss = miss; m->bytes_read = bytes;

@@ -1615,6 +1615,14 @@ static int g_kv8_gs=0;                          /* KV8_GS=<n>: one scale per n l
                                                  * instead of per row (FlashMLA uses 128 on the
                                                  * 512-dim latent). 0 = per-row (unchanged). */
 static int g_tq=0, g_tq_bits=4, g_tq_codec=1;   /* KV_TQ: codec 1=rotated int4 (default), 0=PolarQuant */
+static int g_kv16=0;                            /* KV16 (default where the paths read it): the latent KV
+                                                 * in float16, 2 bytes a value in Lc8/Rc8, no scale */
+#include "kv16.h"
+/* Lc/Rc stay NULL and the rows are bytes in Lc8/Rc8: KV8, KV_TQ, KV16 */
+static inline int kv_coded(void){ return g_kv8 || g_tq || g_kv16; }
+/* a latent (kv_lora) and a roped-key (qk_rope) row's bytes in Lc8/Rc8 */
+static inline int kv_lrow_bytes(int kv_lora){ return g_tq ? coli_kvq_row_bytes(kv_lora,g_tq_bits,g_tq_codec) : g_kv16 ? 2*kv_lora : kv_lora; }
+static inline int kv_rrow_bytes(int qk_rope){ return g_tq ? coli_kvq_row_bytes(qk_rope,g_tq_bits,g_tq_codec) : g_kv16 ? 2*qk_rope : qk_rope; }
 #include "kv_persist.h"
 #include "telemetry.h"
 
@@ -5088,6 +5096,10 @@ static unsigned metal_fused_layer_fmt_miss(const Layer *l){
  * inline the one-shot path's three-way branch so each representation keeps
  * its exact accumulation order. */
 static void kv_lc_rows_f32(Model *m, int layer, int64_t t0, int64_t n, float *dst, Cfg *c){
+    if(g_kv16){   /* float16: widened, exact */
+        kv16_unpack(dst, (const uint16_t *)coli_kv_row8(m->Lc8[layer],t0,2*c->kv_lora), n*c->kv_lora);
+        return;
+    }
     if(g_tq){
         int lbb=coli_kvq_row_bytes(c->kv_lora,g_tq_bits,g_tq_codec);
         for(int64_t t=t0;t<t0+n;t++)
@@ -5142,7 +5154,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
      * (its absorb kernel is int4-only, grouped served only outside MOE-exact
      * mode); the four allowlist checks are the same discipline extended to
      * the tensors that flow through the shared per-fmt shader. */
-    if(g_metal_enabled && !kvs && !g_kv8 && !g_tq && g_absorb!=0 && (S<=4 || g_metal_prefill) && m->kv_start[layer]==0
+    if(g_metal_enabled && !kvs && !kv_coded() && g_absorb!=0 && (S<=4 || g_metal_prefill) && m->kv_start[layer]==0
        && D==6144 && H==64 && c->q_lora==2048 && c->kv_lora==512 && c->qk_nope==192
        && c->qk_rope==64 && vh==256
        && !(metal_fused_layer_fmt_miss(l) & METAL_FUSED_ATTN_TENSORS)){
@@ -5297,6 +5309,14 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                                   ks->Lsc[layer]+(int64_t)pos*coli_kv8_nscale(c->kv_lora,g_kv8_gs),
                                   c->kv_lora, g_kv8_gs);
             ks->Rsc[layer][pos]=coli_kv8_quant_row(Rs, coli_kv_row8(ks->Rc8[layer],pos,c->qk_rope), c->qk_rope);
+        } else if(g_kv16){
+            /* KV16: the float32 path's norm and rope on comp's row (scratch, never read again),
+             * then each value to the nearest float16 (kv16.h) */
+            float *Ls=comp+(int64_t)s*cw, *Rs=Ls+c->kv_lora;
+            rmsnorm(Ls, Ls, l->kv_a_ln, c->kv_lora, c->eps);
+            rope_interleave(Rs, pos, c);
+            kv16_pack((uint16_t *)coli_kv_row8(ks->Lc8[layer],pos,2*c->kv_lora), Ls, c->kv_lora);
+            kv16_pack((uint16_t *)coli_kv_row8(ks->Rc8[layer],pos,2*c->qk_rope), Rs, c->qk_rope);
         } else {
             float *Ldst=coli_kv_row(ks->Lc[layer],pos,c->kv_lora);
             float *Rdst=coli_kv_row(ks->Rc[layer],pos,c->qk_rope);
@@ -5400,9 +5420,9 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
      * not allocated under KV8/KV_TQ. Quantized KV takes the CPU consumer below (which decodes
      * the byte cache natively); the fp8/int4 CUDA kernels are the follow-up PR. */
     cuda_absorb=layer<c->n_layers&&!kvs&&g_cuda_enabled&&getenv("COLI_CUDA_ATTN")&&
-                atoi(getenv("COLI_CUDA_ATTN"))&&c->kv_lora<=512&&!g_kv8&&!g_tq;
+                atoi(getenv("COLI_CUDA_ATTN"))&&c->kv_lora<=512&&!kv_coded();
     /* Non-silent: say so ONCE so a CUDA operator isn't puzzled by CPU-bound attention. */
-    if((g_kv8||g_tq) && g_cuda_enabled && getenv("COLI_CUDA_ATTN") && atoi(getenv("COLI_CUDA_ATTN"))){
+    if(kv_coded() && g_cuda_enabled && getenv("COLI_CUDA_ATTN") && atoi(getenv("COLI_CUDA_ATTN"))){
         static int kvq_cuda_noted=0;
         if(!kvq_cuda_noted){ kvq_cuda_noted=1;
             fprintf(stderr,"[%s] no CUDA attention kernels for quantized KV yet: "
@@ -5435,7 +5455,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
          * f32 rows this branch reads (kvs[s]->Lc/Rc) are not even allocated; quantized
          * ragged rows take the CPU ragged path instead, which decodes the byte cache
          * natively. A quantized ragged gather is follow-up-PR work. */
-        if(kvs&&!g_kv8&&!g_tq&&g_cuda_enabled&&getenv("COLI_CUDA_ATTN")&&atoi(getenv("COLI_CUDA_ATTN"))&&
+        if(kvs&&!kv_coded()&&g_cuda_enabled&&getenv("COLI_CUDA_ATTN")&&atoi(getenv("COLI_CUDA_ATTN"))&&
            !dnsel&&l->kv_b.cuda_eligible&&l->o.cuda_eligible&&
            qt_cuda_upload(&l->kv_b)&&qt_cuda_upload(&l->o)){
             const float **rl=malloc((size_t)S*sizeof(*rl)),**rr=malloc((size_t)S*sizeof(*rr));
@@ -5475,7 +5495,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             cuda_core=cuda_projected=coli_cuda_attention_project_batch(l->kv_b.cuda,l->o.cuda,out,Q,
                 coli_kv_row(m->Lc[layer],st0,kvl),coli_kv_row(m->Rc[layer],st0,c->qk_rope),
                 S,H,c->qk_nope,c->qk_rope,vh,kvl,nt,c->attn_scale);
-        } else if(S<=4&&g_cuda_enabled&&!g_kv8&&!g_tq&&getenv("COLI_CUDA_ATTN")&&atoi(getenv("COLI_CUDA_ATTN"))&&
+        } else if(S<=4&&g_cuda_enabled&&!kv_coded()&&getenv("COLI_CUDA_ATTN")&&atoi(getenv("COLI_CUDA_ATTN"))&&
            l->kv_b.cuda_eligible&&qt_cuda_upload(&l->kv_b)){   /* quant guard: absorb/kvdev read f32 Lc/Rc rows */
             cuda_core=1;
             for(int s=0;s<S&&cuda_core;s++){
@@ -5533,17 +5553,28 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
          * the MTP layer, or any backend failure — output identical either way. */
         if(!cuda_core&&g_vk_attn&&!kvs&&!positions&&S<=4&&layer<c->n_layers&&
            VK_FMT_OK(&l->kv_b)&&VK_MAY(&l->kv_b)&&kvl<=512&&c->qk_nope<=256&&c->qk_rope<=64&&
-           m->vk_kv_valid&&m->Lc[layer]&&m->Rc[layer]){   /* f32 KV only: a quantized-KV cache
+           m->vk_kv_valid&&(g_kv16 ? m->Lc8&&m->Lc8[layer]&&m->Rc8[layer] : m->Lc[layer]&&m->Rc[layer])){
+                                               /* f32 or float16 KV: a quantized-KV cache
                                                 * (upstream #399 KV8/TQ leaves Lc/Rc NULL)
                                                 * falls back to the CPU path until the VK
-                                                * mirror learns fp8 */
+                                                * mirror learns fp8; float16 rows go up
+                                                * widened, the floats the CPU reads */
             int dsa_on=0; if(dnsel) for(int s=0;s<S;s++) if(dnsel[s]>0) dsa_on=1;
             int st0=m->kv_start[layer], T=pos_base+S;
-            if(!dsa_on&&T<=m->max_t&&coli_vk_kv_ensure(layer,m->max_t,kvl,c->qk_rope)){
+            int grown=!dsa_on&&T<=m->max_t ? coli_vk_kv_grow(layer,T,m->max_t,kvl,c->qk_rope) : 0;
+            if(grown==2) m->vk_kv_valid[layer]=0;   /* a grown mirror: its rows again from the host */
+            if(grown){
                 int ok=1;
-                for(int t=m->vk_kv_valid[layer];t<T&&ok;t++)
+                for(int t=m->vk_kv_valid[layer];t<T&&ok;t++){
+                    if(g_kv16){
+                        float lf[512], rf[64];
+                        kv16_unpack(lf,(const uint16_t *)coli_kv_row8(m->Lc8[layer],t,2*kvl),kvl);
+                        kv16_unpack(rf,(const uint16_t *)coli_kv_row8(m->Rc8[layer],t,2*c->qk_rope),c->qk_rope);
+                        ok=coli_vk_kv_row(layer,t,lf,rf);
+                    } else
                     ok=coli_vk_kv_row(layer,t,coli_kv_row(m->Lc[layer],t,kvl),
                                       coli_kv_row(m->Rc[layer],t,c->qk_rope));
+                }
                 if(ok){
                     m->vk_kv_valid[layer]=T;
                     const void *kw=l->kv_b.fmt==1?(const void*)l->kv_b.q8:(const void*)l->kv_b.q4;
@@ -5629,6 +5660,19 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                     }
                     for(int d=0;d<c->qk_rope;d++) ar+=qr[d]*coli_fp8_lut[kr[d]];
                     a+=ar*ks->Rsc[layer][t];
+                } else if(g_kv16){
+                    /* float16 rows: the float32 path's dot over the floats they hold */
+                    const uint16_t *Lt=(const uint16_t *)coli_kv_row8(ks->Lc8[layer],t,2*kvl);
+                    const uint16_t *kr=(const uint16_t *)coli_kv_row8(ks->Rc8[layer],t,2*c->qk_rope);
+                    int i=0;
+#if defined(KV16_F16C)
+                    __m256 acc=_mm256_setzero_ps();
+                    for(;i+8<=kvl;i+=8)
+                        acc=_mm256_fmadd_ps(_mm256_loadu_ps(qabs+i), _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(Lt+i))), acc);
+                    a=hsum256(acc);
+#endif
+                    for(;i<kvl;i++) a+=qabs[i]*kv16_to(Lt[i]);
+                    for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kv16_to(kr[d]);
                 } else {
                 const float *Lt=coli_kv_row(ks->Lc[layer],t,kvl);
                 const float *kr=coli_kv_row(ks->Rc[layer],t,c->qk_rope);
@@ -5666,7 +5710,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             }
             softmax(sc,nt);
             float clat[512]; memset(clat,0,kvl*sizeof(float));
-            if(exact_verify_on()&&g_spec_live&&!tq1&&!g_tq&&!g_kv8){
+            if(exact_verify_on()&&g_spec_live&&!tq1&&!kv_coded()){
                 /* #689 exact verify: clat[i] = sum_t sc[t]*Lt[i] as an exact dot over t per column
                  * (transposed walk: cache-unfriendly, verify rows only). NOT taken on the quantised
                  * KV paths (tq1 / TQ / kv8): those keep the float context dot, so COLI_EXACT_VERIFY
@@ -5702,6 +5746,9 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                         float a=sc[jj]*Ls_t[0];             /* la scala si fonde nel peso */
                         for(int i=0;i<kvl;i++) clat[i]+=a*coli_fp8_lut[Lt[i]];
                     }
+                } else if(g_kv16){
+                    /* clat += sc[jj] * Lt over the floats a float16 row holds (kv16_axpy: lane by lane) */
+                    kv16_axpy(clat, sc[jj], (const uint16_t *)coli_kv_row8(ks->Lc8[layer],t,2*kvl), kvl);
                 } else {
                 const float *Lt=coli_kv_row(ks->Lc[layer],t,kvl);
                 /* MLA-absorb value mix: clat += sc[jj] * Lt (AXPY over kvl).
@@ -5774,7 +5821,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         /* quantized KV: dequantize each tile's latent rows into an f32 staging
          * buffer for the kv_b matmul — same codecs as the one-shot path, tile-
          * sized instead of context-sized (#1151 follow-up) */
-        float *Lf_tile=(g_kv8||g_tq)?falloc(tile*c->kv_lora):NULL;
+        float *Lf_tile=kv_coded()?falloc(tile*c->kv_lora):NULL;
         float *ml=falloc((int64_t)S*H*2);              /* running (max, sum) per (row, head) */
         double tac=now_s(), kvb_acc=0;
         #pragma omp parallel for collapse(2) schedule(static)
@@ -5812,6 +5859,9 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                         const uint8_t *kr=coli_kv_row8(m->Rc8[layer],t0+jj,c->qk_rope);
                         float ar=0; for(int d=0;d<c->qk_rope;d++) ar+=qr[d]*coli_fp8_lut[kr[d]];
                         a+=ar*m->Rsc[layer][t0+jj];
+                    } else if(g_kv16){
+                        const uint16_t *kr=(const uint16_t *)coli_kv_row8(m->Rc8[layer],t0+jj,2*c->qk_rope);
+                        for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kv16_to(kr[d]);
                     } else {
                         const float *kr=m->Rc[layer]+(t0+jj)*c->qk_rope;
                         for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
@@ -5870,7 +5920,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                     float *Lg=falloc(un*c->kv_lora); int64_t w=0;
                     for(int64_t r=0;r<kvb_rows;r++){
                         if(want[r]){
-                            if(g_kv8||g_tq)              /* quantized latent: dequant the row (#1151 follow-up) */
+                            if(kv_coded())               /* quantized latent: dequant the row (#1151 follow-up) */
                                 kv_lc_rows_f32(m,layer,(int64_t)stL+r,1,Lg+w*c->kv_lora,c);
                             else
                                 memcpy(Lg+w*c->kv_lora,
@@ -5913,6 +5963,11 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                                         Lf+(int64_t)(t-stL)*c->kv_lora, c->kv_lora, g_kv8_gs); }
             matmul_qt(kvb_all+(int64_t)stL*kvb_dim, Lf, &l->kv_b, Tk-stL);
             free(Lf);
+        } else if(g_kv16){
+            float *Lf=falloc((int64_t)(Tk-stL)*c->kv_lora);
+            kv_lc_rows_f32(m,layer,stL,Tk-stL,Lf,c);
+            matmul_qt(kvb_all+(int64_t)stL*kvb_dim, Lf, &l->kv_b, Tk-stL);
+            free(Lf);
         } else
             matmul_qt(kvb_all+(int64_t)stL*kvb_dim, m->Lc[layer]+(int64_t)stL*c->kv_lora, &l->kv_b, Tk-stL);
     }
@@ -5945,6 +6000,9 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 const uint8_t *kr=coli_kv_row8(m->Rc8[layer],t,c->qk_rope);
                 float ar=0; for(int d=0;d<c->qk_rope;d++) ar+=qr[d]*coli_fp8_lut[kr[d]];
                 a+=ar*m->Rsc[layer][t];
+            } else if(g_kv16){
+                const uint16_t *kr=(const uint16_t *)coli_kv_row8(m->Rc8[layer],t,2*c->qk_rope);
+                for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kv16_to(kr[d]);
             } else {
                 const float *kr=m->Rc[layer]+(int64_t)t*c->qk_rope;
                 for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
@@ -8087,7 +8145,7 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
      * matmul_qt_ex/matmul_fp8. Fixing WP_() and wiring fmt=8 through bind_gemv
      * is the same deferred follow-up noted in attention_rows, not done in this
      * round. */
-    if(g_metal_enabled && !kvs && !g_kv8 && !g_tq && S<=4 && li<c->n_layers && l->sparse
+    if(g_metal_enabled && !kvs && !kv_coded() && S<=4 && li<c->n_layers && l->sparse
        && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[li]==0
        && D==6144 && c->n_heads==64 && c->q_lora==2048 && c->kv_lora==512
        && c->qk_nope==192 && c->qk_rope==64 && c->v_head==256
@@ -8305,7 +8363,7 @@ static void kv_alloc(Model *m, int max_t){
         free(k->Lc[i]); free(k->Rc[i]); } free(k->Lc); free(k->Rc); }
     if(k->Lc8){ for(int i=0;i<c->n_layers+1;i++){
         free(k->Lc8[i]); free(k->Rc8[i]);
-        free(k->Lsc[i]); free(k->Rsc[i]); }
+        if(k->Lsc) free(k->Lsc[i]); if(k->Rsc) free(k->Rsc[i]); }
         free(k->Lc8); free(k->Rc8); free(k->Lsc); free(k->Rsc);
         k->Lc8=k->Rc8=NULL; k->Lsc=k->Rsc=NULL; }
     if(k->Ic){ for(int i=0;i<c->n_layers;i++) free(k->Ic[i]); free(k->Ic); k->Ic=NULL; }
@@ -8316,22 +8374,24 @@ static void kv_alloc(Model *m, int max_t){
     k->max_t=max_t;
     int NR=c->n_layers+1;                        /* riga extra: KV del layer MTP */
     k->Lc=calloc(NR,sizeof(float*)); k->Rc=calloc(NR,sizeof(float*));
-    if(g_kv8 || g_tq){
+    if(kv_coded()){
         /* KV8: byte fp8 + una scala f32 per riga. KV_TQ: byte polari impacchettati +
-         * raggio f32 per riga. In entrambi i casi Lc/Rc restano NULL e le righe hanno
-         * larghezza in BYTE lb/rb — KV8: kv_lora/qk_rope (1 byte/valore); TQ:
+         * raggio f32 per riga. KV16: float16, 2 byte a valore, nessuna scala (Lsc/Rsc NULL).
+         * In tutti i casi Lc/Rc restano NULL e le righe hanno larghezza in BYTE lb/rb
+         * (kv_lrow_bytes/kv_rrow_bytes) — KV8: kv_lora/qk_rope (1 byte/valore); TQ:
          * coli_tq_row_bytes (< kv_lora, solo gli angoli). Lsc/Rsc reggono scala|raggio. */
-        int lb = g_tq ? coli_kvq_row_bytes(c->kv_lora,g_tq_bits,g_tq_codec) : c->kv_lora;
-        int rb = g_tq ? coli_kvq_row_bytes(c->qk_rope,g_tq_bits,g_tq_codec) : c->qk_rope;
+        int lb = kv_lrow_bytes(c->kv_lora), rb = kv_rrow_bytes(c->qk_rope);
         if(g_kv8) coli_fp8_lut_init();
         k->Lc8=calloc(NR,sizeof(uint8_t*)); k->Rc8=calloc(NR,sizeof(uint8_t*));
-        k->Lsc=calloc(NR,sizeof(float*));   k->Rsc=calloc(NR,sizeof(float*));
+        if(!g_kv16){ k->Lsc=calloc(NR,sizeof(float*)); k->Rsc=calloc(NR,sizeof(float*)); }
         for(int i=0;i<NR;i++){
             k->Lc8[i]=malloc((size_t)max_t*lb);
             k->Rc8[i]=malloc((size_t)max_t*rb);
-            k->Lsc[i]=falloc((int64_t)max_t*(g_kv8?coli_kv8_nscale(c->kv_lora,g_kv8_gs):1));
-            k->Rsc[i]=falloc(max_t);
-            if(!k->Lc8[i]||!k->Rc8[i]){fprintf(stderr,"OOM kv8\n");exit(1);}
+            if(!g_kv16){
+                k->Lsc[i]=falloc((int64_t)max_t*(g_kv8?coli_kv8_nscale(c->kv_lora,g_kv8_gs):1));
+                k->Rsc[i]=falloc(max_t);
+            }
+            if(!k->Lc8[i]||!k->Rc8[i]){fprintf(stderr,"OOM %s\n", g_kv16?"kv16":"kv8");exit(1);}
         }
     } else
     for(int i=0;i<NR;i++){ k->Lc[i]=falloc((int64_t)max_t*c->kv_lora);
@@ -8445,9 +8505,9 @@ static float *step_decode_batch(Model *m, const DecodeRow *rows, int S){
             free(x); return NULL;
         }
         for(int l=0;l<c->n_layers;l++){
-            if(((g_kv8||g_tq) ? (!rows[s].kv->Lc8 || !rows[s].kv->Rc8 ||
+            if((kv_coded() ? (!rows[s].kv->Lc8 || !rows[s].kv->Rc8 ||
                          !rows[s].kv->Lc8[l] || !rows[s].kv->Rc8[l] ||
-                         !rows[s].kv->Lsc[l] || !rows[s].kv->Rsc[l])
+                         (!g_kv16 && (!rows[s].kv->Lsc[l] || !rows[s].kv->Rsc[l])))
                       : (!rows[s].kv->Lc[l] || !rows[s].kv->Rc[l])) ||
                rows[s].kv->kv_start[l]<0 || rows[s].kv->kv_start[l]>rows[s].pos ||
                (m->has_dsa && c->idx_type[l] &&
@@ -10617,6 +10677,7 @@ static void repin_pass_limit(Model *m,int limit){
 typedef struct { KVState kv; int *hist, len, first;
                  ColiPinPool pins; } ServeCtx;
 static double kv_pool_bytes(Model *m, int max_ctx);
+static double kvb_transient_bytes(Model *m, int max_ctx);
 
 static void serve_ctx_init(Model *m, ServeCtx *s, const char *snap, int slot, int maxctx){
     s->kv.kv_start=calloc(m->c.n_layers+1,sizeof(int));
@@ -10636,7 +10697,7 @@ static void serve_ctx_free(Model *m, ServeCtx *s){
     free(k->disk_buf); k->disk_buf=NULL;
     if(k->Lc) for(int i=0;i<NR;i++){ free(k->Lc[i]); free(k->Rc[i]); }
     if(k->Lc8) for(int i=0;i<NR;i++){ free(k->Lc8[i]); free(k->Rc8[i]);
-        free(k->Lsc[i]); free(k->Rsc[i]); }
+        if(k->Lsc) free(k->Lsc[i]); if(k->Rsc) free(k->Rsc[i]); }   /* KV16: no scales */
     if(k->Ic) for(int i=0;i<m->c.n_layers;i++) free(k->Ic[i]);
     free(k->Lc); free(k->Rc); free(k->Lc8); free(k->Rc8); free(k->Lsc); free(k->Rsc);
     free(k->Ic); free(k->kv_start); free(s->hist);
@@ -10905,19 +10966,21 @@ static void coli_kv_share_adopt_rows(Cfg *cc, KVState *sc, KVState *dn,
          * the cache lives in the byte rows Lc8/Rc8 plus the per-row
          * scales Lsc/Rsc. Copy both here so the adopted range is not
          * left uninitialized. Same guard style as the f32 paths above. */
-        if((g_kv8||g_tq)&&sc->Lc8[l]&&dn->Lc8[l]){
-            int lb=g_tq?coli_kvq_row_bytes(cc->kv_lora,g_tq_bits,g_tq_codec):cc->kv_lora;
+        if(kv_coded()&&sc->Lc8[l]&&dn->Lc8[l]){   /* KV16: the float16 rows, no scales */
+            int lb=kv_lrow_bytes(cc->kv_lora);
             memcpy(coli_kv_row8(sc->Lc8[l],from,lb),
                    coli_kv_row8(dn->Lc8[l],from,lb),(size_t)n*lb);
-            int nsl=g_kv8?coli_kv8_nscale(cc->kv_lora,g_kv8_gs):1;
-            memcpy(sc->Lsc[l]+(int64_t)from*nsl,
-                   dn->Lsc[l]+(int64_t)from*nsl,(size_t)n*nsl*sizeof(float));
+            if(!g_kv16){
+                int nsl=g_kv8?coli_kv8_nscale(cc->kv_lora,g_kv8_gs):1;
+                memcpy(sc->Lsc[l]+(int64_t)from*nsl,
+                       dn->Lsc[l]+(int64_t)from*nsl,(size_t)n*nsl*sizeof(float));
+            }
         }
-        if((g_kv8||g_tq)&&sc->Rc8[l]&&dn->Rc8[l]){
-            int rb=g_tq?coli_kvq_row_bytes(cc->qk_rope,g_tq_bits,g_tq_codec):cc->qk_rope;
+        if(kv_coded()&&sc->Rc8[l]&&dn->Rc8[l]){
+            int rb=kv_rrow_bytes(cc->qk_rope);
             memcpy(coli_kv_row8(sc->Rc8[l],from,rb),
                    coli_kv_row8(dn->Rc8[l],from,rb),(size_t)n*rb);
-            memcpy(sc->Rsc[l]+from,dn->Rsc[l]+from,(size_t)n*sizeof(float));
+            if(!g_kv16) memcpy(sc->Rsc[l]+from,dn->Rsc[l]+from,(size_t)n*sizeof(float));
         }
     }
     memcpy(sc_hist+from,dn_hist+from,(size_t)n*sizeof(int));
@@ -11735,12 +11798,25 @@ static void vk_tier_start(Model *m){
         return;
     }
     /* What the device still has to hold besides the experts: the absorb core's KV
-     * mirror (COLI_VK_ATTN, allocated at the first decode, CTX rows a layer), and
+     * mirror (COLI_VK_ATTN, growing with the conversation up to CTX rows a layer), and
      * COLI_VK_RESERVE_GB, the old name of this reserve, beyond the tier's own. The dense
-     * set is already on the device (vk_dense_preload ran first) and counted as used. */
+     * set is already on the device (vk_dense_preload ran first) and counted as used.
+     * The mirror's room: CTX rows a layer, at most half of what the device has free, so
+     * the experts keep the other half (#2314: the gateway's 131072 tokens asked GLM-5.3
+     * for 23.6 GB on a 24 GB card and left the tier none); a longer conversation grows it
+     * while there is room, and a layer that finds none computes its attention on the CPU. */
     double dense=0;
     if(g_vk_attn){ int ctx=getenv("CTX")?atoi(getenv("CTX")):4096; if(ctx<1) ctx=4096;
-        dense+=(double)(g_glmc_partial ? g_glmc_fit.n : NL)*ctx*(c->kv_lora+c->qk_rope)*4.0; }
+        double mir=(double)(g_glmc_partial ? g_glmc_fit.n : NL)*ctx*(c->kv_lora+c->qk_rope)*4.0;
+        const char *tr=getenv("COLI_VK_TIER_RESERVE_GB");
+        double half=((double)coli_vk_free_bytes()-(tr&&*tr?atof(tr):1.0)*1073741824.0)/2;
+        if(half>0&&mir>half){
+            fprintf(stderr,"[VK] colibri: the attention KV mirror of %d tokens (%.1f GiB) does not fit beside the experts: "
+                    "%.1f GiB kept for it, half of what the device has free (COLI_VK_TIER_RESERVE_GB keeps more)\n",
+                    ctx,mir/1073741824.0,half/1073741824.0);
+            mir=half;
+        }
+        dense+=mir; }
     /* a partial chain: nothing more of the trunk goes up, but the chain's first forward
      * allocates its scratch and the N layers' KV mirrors */
     if(g_glmc_partial) dense+=(double)g_glmc_lazy;
@@ -11766,12 +11842,19 @@ static void vk_tier_start(Model *m){
               xgu.kind=VKT_SRC_NONE;
           }
       } }
+    /* what the serve fills after this: the KV cache at CTX (each slot's) and the attention's
+     * reconstruction, as cap_for_ram counts them (#2314). Counted even when allocated: its
+     * pages are RAM only once written, so the free RAM here does not show them yet. */
+    double later=0;
+    { int ctx=getenv("CTX")?atoi(getenv("CTX")):4096; if(ctx<1) ctx=4096;
+      later=kv_pool_bytes(m,ctx)+kvb_transient_bytes(m,ctx); }
     VktConfig vc={.engine="colibri", .layers=NL, .experts=E, .hidden=c->hidden, .inter=c->moe_inter, .topk=c->topk,
                   .gate_up=gu, .down=dn, .act=VKT_ACT_SWIGLU, .act_limit=0.f,
                   .extra_layers=xgu.kind!=VKT_SRC_NONE, .extra_gate_up=xgu, .extra_down=xdn,
                   .max_rows=GLM_VK_ROWS*c->topk,
                   .ram_reserve=(size_t)((double)m->ecap*expert_cache_row_bytes(m,m->ebits)),
                   .ram_floor=(size_t)((double)c->topk*expert_cache_row_bytes(m,m->ebits)), .ram_given=vk_ram_given,
+                  .ram_later=(size_t)later,
                   .dense_bytes=(size_t)dense,
                   .in_ram=vk_in_ram, .ram_ctx=m,
                   .max_experts=g_vk_experts>0 ? g_vk_experts : 0,
@@ -12519,11 +12602,27 @@ static double kv_pool_bytes(Model *m, int max_ctx){
     double one=(double)(c->n_layers+1)*max_ctx*
         (g_tq ? (double)(coli_kvq_row_bytes(c->kv_lora,g_tq_bits,g_tq_codec)+coli_kvq_row_bytes(c->qk_rope,g_tq_bits,g_tq_codec))+8.0
          : g_kv8 ? (double)(c->kv_lora+c->qk_rope)+8.0
+         : g_kv16 ? (c->kv_lora+c->qk_rope)*2.0
          : (c->kv_lora+c->qk_rope)*4.0);
     if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(c->idx_type[i])
         one+=(double)max_ctx*c->index_hd*4.0;
     int slots=kv_slot_count(); if(slots<1||slots>16) slots=1;
     return one*slots;
+}
+
+/* #768: above KVB_FLASH_MB attention_rows tiles the reconstruction instead of
+ * materialising kvb_all, so the transient to reserve is the flash ceiling plus
+ * one tile and the per-(row,head) running state — not 30 GB at ctx 262144.
+ * The reserve mirrors the trigger in attention_rows: same env, same default. */
+static double kvb_transient_bytes(Model *m, int max_ctx){
+    Cfg *c=&m->c;
+    double kvb_b = (double)max_ctx*c->n_heads*(c->qk_nope+c->v_head)*4.0;
+    int64_t flash_mb=getenv("KVB_FLASH_MB")?atoll(getenv("KVB_FLASH_MB")):2048;
+    int64_t tile_mb =getenv("KVB_TILE_MB") ?atoll(getenv("KVB_TILE_MB")) :512;
+    double capped = (double)flash_mb*1048576.0 + (double)tile_mb*1048576.0
+                  + (double)max_ctx*c->n_heads*2*4.0;
+    if(flash_mb>0 && kvb_b>capped) kvb_b = capped;
+    return kvb_b;
 }
 
 
@@ -12624,16 +12723,7 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
      * re-reads. Clamp ws_b to the actual budget (min 8 for non-budgeted / prefill). */
     if(g_expert_budget>0 && g_expert_budget<64) ws_b = (double)(g_expert_budget+4) * (double)eb;
     double kv_b  = kv_pool_bytes(m,max_ctx);
-    double kvb_b = (double)max_ctx*c->n_heads*(c->qk_nope+c->v_head)*4.0;
-    /* #768: above KVB_FLASH_MB attention_rows tiles the reconstruction instead of
-     * materialising kvb_all, so the transient to reserve is the flash ceiling plus
-     * one tile and the per-(row,head) running state — not 30 GB at ctx 262144.
-     * The reserve mirrors the trigger in attention_rows: same env, same default. */
-    { int64_t flash_mb=getenv("KVB_FLASH_MB")?atoll(getenv("KVB_FLASH_MB")):2048;
-      int64_t tile_mb =getenv("KVB_TILE_MB") ?atoll(getenv("KVB_TILE_MB")) :512;
-      double capped = (double)flash_mb*1048576.0 + (double)tile_mb*1048576.0
-                    + (double)max_ctx*c->n_heads*2*4.0;
-      if(flash_mb>0 && kvb_b>capped) kvb_b = capped; }
+    double kvb_b = kvb_transient_bytes(m,max_ctx);
     /* RISERVA PAGE-CACHE (misurato 2026-07-06 su Linux): strangolarla fa crollare
      * le pread buffered da ~800 a ~180 MB/s — gli ultimi GB di LRU rendono MENO di
      * quanto costino in banda disco persa. 2.5 GB restano SEMPRE al kernel.
@@ -13657,6 +13747,7 @@ int main(int argc, char **argv){
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
 #endif
 #ifdef COLI_VULKAN
+    if(!(getenv("COLI_VULKAN") && atoi(getenv("COLI_VULKAN")))) coli_vk_say_unused("colibri");   /* #2289 */
     if(getenv("COLI_VULKAN") && atoi(getenv("COLI_VULKAN"))){
         char spvbuf[512]; const char *spv = vk_resolve_spv(spvbuf, sizeof(spvbuf));
         g_vulkan = coli_vk_init(spv);
@@ -13836,6 +13927,28 @@ int main(int argc, char **argv){
         fprintf(stderr,"[KV_TQ] latent KV in %s (randomized-Hadamard rotation; radius = per-row scale)\n",
             g_tq_codec ? "rotated int4 + Lloyd codebook (4-bit)" : "PolarQuant recursive-polar");
       }
+    }
+    /* KV16 (the default): the latent cache, kv_lora + qk_rope values a token and layer (the
+     * MTP layer's too), in float16: half its RAM (GLM-5.3 at 131072 tokens: 11.9 GB instead of
+     * 23.9), each value clamped to +-65504 and rounded to the nearest float16 (kv16.h). Off
+     * where a path reads float32 rows: CUDA's attention (COLI_CUDA) and Metal's fused kernel
+     * keep the float32 cache; KV8 and KV_TQ have their own codecs; an oracle run (below)
+     * compares against a float32 reference unless KV16 is set. KV16=0: float32. The index keys (DSA) stay
+     * float32: they pick the rows the attention reads. */
+    { const char *e=getenv("KV16"); int set=e&&*e;
+      g_kv16 = set ? atoi(e)!=0 : 1;
+      if(g_kv8||g_tq) g_kv16=0;
+#ifdef COLI_CUDA
+      if(g_kv16&&g_cuda_enabled){
+          if(set) fprintf(stderr,"[KV16] COLI_CUDA's attention reads float32 rows: the KV cache stays float32\n");
+          g_kv16=0; }
+#endif
+#ifdef COLI_METAL
+      if(g_kv16&&g_metal_enabled){
+          if(set) fprintf(stderr,"[KV16] Metal's fused attention reads float32 rows: the KV cache stays float32\n");
+          g_kv16=0; }
+#endif
+      if(g_kv16) fprintf(stderr,"[KV16] latent KV cache in float16 (half the RAM of float32; KV16=0 keeps float32)\n");
     }
     /* ebits/dbits are the compute (dequant) width the idot kernels run at, not
      * the stored weight format: a fmt=4 grouped-int4 container still computes at
@@ -14189,6 +14302,13 @@ int main(int argc, char **argv){
     }
 
     /* altrimenti: validazione contro l'oracolo (ref_glm.json) */
+    /* The oracle's references were written by float32 arithmetic: its runs keep a float32
+     * KV cache unless KV16 says otherwise (nothing has allocated the cache yet; the chain
+     * reads g_kv16 at each step) */
+    if(g_kv16 && !(getenv("KV16") && *getenv("KV16"))){
+        g_kv16=0;
+        fprintf(stderr,"[KV16] an oracle run keeps the KV cache in float32 (KV16=1 for float16)\n");
+    }
     /* Diagnostic modes take precedence over TF and do not read predictions. */
     int teacher_forcing=getenv("TF")!=NULL && !getenv("REPLAY") && !getenv("CONSIST");
     const char *refpath=getenv("REF")?getenv("REF"):"ref_glm.json";
@@ -14674,12 +14794,19 @@ static int glm_segment_spans(
     size_t count = 0;
     for (uint32_t layer = session->engine->layer_begin;
          layer < session->engine->layer_end; layer++) {
+        if (g_kv16) {   /* the latent rows in float16 (main's KV16; a library session keeps float32) */
+            spans[count++] = (ColiSegmentStateSpan){
+                session->kv.Lc8[layer], (size_t)position * (size_t)kv_lrow_bytes(config->kv_lora)};
+            spans[count++] = (ColiSegmentStateSpan){
+                session->kv.Rc8[layer], (size_t)position * (size_t)kv_rrow_bytes(config->qk_rope)};
+        } else {
         spans[count++] = (ColiSegmentStateSpan){
             session->kv.Lc[layer],
             (size_t)position * config->kv_lora * sizeof(float)};
         spans[count++] = (ColiSegmentStateSpan){
             session->kv.Rc[layer],
             (size_t)position * config->qk_rope * sizeof(float)};
+        }
         if (session->engine->model.has_dsa && config->idx_type[layer])
             spans[count++] = (ColiSegmentStateSpan){
                 session->kv.Ic[layer],

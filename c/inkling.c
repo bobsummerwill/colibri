@@ -2228,6 +2228,17 @@ static void ink_vk_tmp_free(Slot *s) {
 static int  ink_vk_load(void *ctx, int layer, int e, VktExpertSrc *src, void **h);
 static void ink_vk_unhold(void *ctx, void *h);
 static int  ink_vk_load_batch(void *ctx, int layer, const int *e, int n, VktExpertSrc *srcs, void **h);
+/* The KV a serve allocates once it runs (every slot at the whole context; kv_alloc's
+ * rows), which the tier's host pool must leave in RAM. */
+static int ink_ctx_max(void);
+static size_t ink_kv_later(const Model *m) {
+    const Cfg *c = &m->c;
+    int t = ink_ctx_max() + 8;
+    size_t b = 0;
+    for (int i = 0; i < c->n_layers; i++)
+        b += 2 * (size_t)L_KV(c, i) * (size_t)kv_ring_rows(c, i, t) * (size_t)L_HD(c, i) * sizeof(float);
+    return b * (size_t)(g_ink_mux_slots > 1 ? g_ink_mux_slots : 1);
+}
 static void ink_vk_tier_start(Model *m) {
     Cfg *c = &m->c;
     if (!g_vk_ready) return;
@@ -2284,6 +2295,7 @@ static void ink_vk_tier_start(Model *m) {
                         .max_rows = INK_VK_ROWS * c->topk,
                         .ram_reserve = (size_t)slotb * (size_t)m->cache[0].cap * (size_t)nsp,
                         .ram_floor = (size_t)slotb * (size_t)c->topk * (size_t)nsp, .ram_given = ink_vk_ram_given,
+                        .ram_later = ink_kv_later(m),
                         .dense_bytes = ink_vk_dense_bytes(m),
                         .in_ram = ink_vk_in_ram, .ram_ctx = m,
                         .load = ink_vk_load, .release = ink_vk_unhold, .load_ctx = m, .load_batch = ink_vk_load_batch};

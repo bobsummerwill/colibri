@@ -368,10 +368,12 @@ and lm_head on one card: `COLI_CUDA_CHAIN=1` offers the shared expert to the pla
 (what `Q36_OFFER_SHEXP=1` does) and `COLI_PLACE=auto` takes the whole 35B trunk on an
 8 GB card. The chain uploads itself the router's matrix, the DeltaNet b|a rows and the
 shared expert's gate row, and the parameter arena. It declines, naming the first matrix
-on the CPU, when the placement left anything behind, and under a qpack container, PILOT
-prefetch (which reads the residual on the host) or `KV_SLOTS` > 1 (one state per
-conversation on the host). `Q36_DN_GPU`'s per-layer step is not set up beside it: the
-chain owns the DeltaNet state.
+on the CPU, when the placement left anything behind, and under a qpack container or PILOT
+prefetch (which reads the residual on the host). With `KV_SLOTS` > 1 it runs each
+conversation's prompts, the held conversation's state handed over through the host when
+the conversation changes, and the decode steps run every conversation's row on the tier
+and the host. `Q36_DN_GPU`'s per-layer step is not set up beside it: the chain owns the
+DeltaNet state.
 
 **State, and who owns it.** The residual stream lives on the device for a forward. The
 host's KV cache stays canonical: every step copies its new rows back, the device holds

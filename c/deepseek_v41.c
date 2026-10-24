@@ -5752,9 +5752,9 @@ static void vk_ram_given(void *ctx, size_t bytes) {
         if (cap < c->n_activated) cap = c->n_activated;
         if (cap < lc->n) cap = lc->n;   /* slots filled already stay */
         if (cap > lc->cap) cap = lc->cap;
-        for (int k = cap; k < lc->cap; k++)   /* never read: their windows back */
+        for (int k = cap; k < lc->cap; k++)   /* never read: their windows back (posix_memalign'd: _aligned_malloc on Windows) */
             for (int part = 0; part < V41_EXPERT_TENSORS; part++) {
-                free(lc->slot[k].base[part]); lc->slot[k].base[part] = NULL; *slot_part(&lc->slot[k], part) = NULL;
+                compat_aligned_free(lc->slot[k].base[part]); lc->slot[k].base[part] = NULL; *slot_part(&lc->slot[k], part) = NULL;
             }
         was = lc->cap; now = cap; lc->cap = cap;
     }
@@ -5836,6 +5836,22 @@ static int v41_gx_expert_rows(Model *m, int layer, int eid, uint8_t **buf, VktEx
     *src = (VktExpertSrc){w[0], w[1], w[2], sc[0], sc[1], sc[2]};
     return 0;
 }
+/* The state a serve allocates once it runs: the KV_SLOTS conversations past the
+ * Model's own (v41_seq_alloc's windows, compressed KV and index keys, zeroed pages
+ * the RAM does not count yet), which the tier's host pool must leave in RAM. The
+ * Model's own was written while the weights loaded. */
+static size_t v41_state_later(const Model *m) {
+    const Cfg *c = &m->c;
+    size_t b = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        b += (size_t)c->window * c->head_dim * sizeof(float);
+        if (c->kv_source[i]) {
+            int ratio = c->compress_ratio[i];
+            b += (size_t)(c->max_positions / (ratio > 0 ? ratio : 1)) * (size_t)(c->head_dim + c->index_head_dim) * sizeof(float);
+        }
+    }
+    return b * (size_t)(g_v41_mux_slots > 1 ? g_v41_mux_slots - 1 : 0);
+}
 static void vk_tier_start(Model *m, const char *snap, int cap) {
     Cfg *c = &m->c;
     if (!v41_tier_dev() || c->n_routed < 1 || !XT(wanted)()) return;
@@ -5860,6 +5876,7 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
                     .max_rows = MOE_ROW_CHUNK * c->n_activated,
                     .ram_reserve = expert * (size_t)cap * (size_t)c->n_layers,
                     .ram_floor = expert * (size_t)c->n_activated * (size_t)c->n_layers, .ram_given = vk_ram_given,
+                    .ram_later = v41_state_later(m),
                     .dense_bytes = v41_tier_dense_bytes(m), .in_ram = vk_in_ram, .ram_ctx = m,
                     .load = vk_load, .release = vk_unhold, .load_ctx = m, .load_batch = vk_load_batch};
     rt_init("deepseek_v41", c->n_layers, c->n_routed);

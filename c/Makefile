@@ -552,7 +552,6 @@ TEST_EXCLUDE += test_qwen36_tier_stream_engine
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
-TEST_BINS += tests/test_exact_dot$(EXE)
 endif
 ifneq (,$(IS_WIN))
 TEST_BINS += tests/test_xdna_execution$(EXE) tests/test_xdna_failure$(EXE)
@@ -565,7 +564,6 @@ TEST_BINS += tests/test_gsgemv_sse41$(EXE) tests/test_qgemv_sse41$(EXE) \
 	tests/test_idot_ssse3$(EXE)
 endif
 ifeq ($(COLI_V4_SUPPORTED),1)
-TEST_BINS += tests/test_v4_hybrid_policy$(EXE) tests/test_k3_fill_budget$(EXE) tests/test_v4_bank_pair$(EXE)
 TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE) \
 	tests/test_v4_serve_framing$(EXE) \
 	tests/test_segment_adapters_registration$(EXE) \
@@ -2054,6 +2052,14 @@ tests/test_dsv41_untrusted_load$(EXE): tests/test_dsv41_untrusted_load.c deepsee
 tests/test_qwen38_idot$(EXE): tests/test_qwen38_idot.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+# The token list of qwen38's MTP head (draft_vocab.h), with no model.
+tests/test_draft_vocab$(EXE): tests/test_draft_vocab.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# The draft qwen38's MTP head takes from that list, with no model.
+tests/test_qwen38_draft_head$(EXE): tests/test_qwen38_draft_head.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 # The int4-g64 expert matmul with no model (part of test-c); given a converted
 # snapshot on argv it checks the sidecar's loaders too (qwen38-tiny-int4-check).
 tests/test_qwen38_int4_experts$(EXE): tests/test_qwen38_int4_experts.c qwen38.c $(VK_OBJ)
@@ -3148,6 +3154,14 @@ tests/test_gsgemv_sse41$(EXE): tests/test_gsgemv.c
 # output rests on. Links the SAME qgemv.h the engine links.
 tests/test_qgemv$(EXE): tests/test_qgemv.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# The float16 KV cache's rounding (kv16.h): the integer arithmetic the Vulkan shader and the
+# CUDA kernel use against the compiler's IEEE conversion, and the integer fallback's
+# conversions both ways. A rule each, so both are gates.
+tests/test_kv16$(EXE): tests/test_kv16.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_kv16_integer$(EXE): tests/test_kv16.c
+	$(CC) $(CFLAGS) -DKV16_INTEGER $< -o $@ $(LDFLAGS)
 
 # Same gate, forced onto the SSE4.1 tier: overrides the host's default -march
 # so the SSE4.1 body in qgemv.h is actually exercised even on a devbox that
