@@ -641,27 +641,34 @@ static void up_imp_release(VkUp *u, int s) {
     u->nimp[s] = 0;
 }
 /* The host image a tier tensor is filled in (coli_vk_tier_tensor, staged uploads): aligned
- * and rounded to the device's import alignment, so up_import can copy from it in place. */
+ * and rounded to the device's import alignment, so up_import can copy from it in place.
+ * Off Windows it is aligned by hand inside a calloc'd block, whose address sits just before
+ * the image, as the path without imports allocates: posix_memalign + memset kept ~5 GiB of
+ * freed images in glibc's arenas over a prompt (pure Vulkan, V4 Flash REAP: anon 45.4 GiB
+ * against 40.3 this way), past what the host pool's sizing leaves the engine. */
 static uint8_t *up_img_alloc(int dev, size_t bytes, uint8_t *aligned) {
     size_t al = g_up[dev].imp_align;
     *aligned = al != 0;
     if (!al) return calloc(1, bytes);
-    void *p = NULL;
     size_t sz = (bytes + al - 1) / al * al;
 #ifdef _WIN32
-    p = _aligned_malloc(sz, al);
-#else
-    if (posix_memalign(&p, al, sz)) p = NULL;
-#endif
+    void *p = _aligned_malloc(sz, al);
     if (p) memset(p, 0, sz);
     return p;
+#else
+    uint8_t *raw = calloc(1, sz + al + sizeof(void *));
+    if (!raw) return NULL;
+    uint8_t *p = (uint8_t *)(((uintptr_t)raw + sizeof(void *) + al - 1) / al * al);
+    memcpy(p - sizeof(void *), &raw, sizeof raw);
+    return p;
+#endif
 }
 static void up_img_free(uint8_t *p, int aligned) {
     if (!p) return;
 #ifdef _WIN32
     if (aligned) { _aligned_free(p); return; }
 #else
-    (void)aligned;
+    if (aligned) { void *raw; memcpy(&raw, p - sizeof(void *), sizeof raw); free(raw); return; }
 #endif
     free(p);
 }
