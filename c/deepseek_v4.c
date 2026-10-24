@@ -12008,6 +12008,11 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
          * decode keeps its hottest experts and the next large prefill still
          * fits if the reserve covers the bank. */
         int grow = cache->count < cache->capacity;
+        /* fp4 nibbles plus one UE8M0 scale per 32, as uploaded */
+        long long elements = (long long)view->gate.rows * view->gate.columns +
+                             (long long)view->up.rows * view->up.columns +
+                             (long long)view->down.rows * view->down.columns;
+        long long mirror_bytes = elements / 2 + elements / 32;
         /* VRAM reserve kept free while mirrors grow: meant for the transient
          * prefill expert bank (COLI_CUDA_MOE_BATCH) plus attention buffers.
          * DSV4_CUDA_VRAM_RESERVE_MB overrides; the default only reserves
@@ -12015,16 +12020,30 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
          * 2800 MiB default is smaller than the bank: once the cache has grown
          * to it, the next large prefill cannot allocate the bank and runs on
          * the CPU union (docs: VRAM budget, ~4700 keeps the bank's room). */
-        static long long reserve_mb = -1;
+        static long long reserve_mb = -1, margin_mb;
         if (reserve_mb < 0) {
             const char *env = getenv("DSV4_CUDA_VRAM_RESERVE_MB");
             reserve_mb = env ? atoll(env)
                              : (coli_v4_gpu_moe_batch_wanted() ? 2800 : 600);
             if (reserve_mb < 256) reserve_mb = 256;
+            /* How far the cache may grow past the reserve between two probes
+             * (below): the bank-sized default carries 64 mirrors of margin
+             * (816 MiB of 2800); an explicit reserve and the 600 MiB default
+             * without the bank carry none. */
+            margin_mb = env || !coli_v4_gpu_moe_batch_wanted() ? 0 : 816;
         }
         /* cudaMemGetInfo is a driver round trip; with a large capacity the
          * guard is consulted on every miss (hundreds per token), so re-check
-         * free VRAM only every 64 misses and reuse the last answer between. */
+         * free VRAM only every 64 misses and reuse the last answer between.
+         * The answer must clear the reserve and, from 8 live mirrors on, so
+         * must the answer less the mirrors grown since (this one included),
+         * less the reserve's margin. Without that second test the cache grew
+         * up to 64 mirrors (816 MiB) past an explicit reserve or the 600 MiB
+         * default, past the card's free VRAM: the compressed-KV buffer and
+         * the prefill's attention buffers then failed to allocate and their
+         * layers' attention ran on the CPU, which changes greedy texts. Below
+         * 8 live mirrors only the first test applies, so a reserve just under
+         * the card's free VRAM still leaves the cache a set it can recycle. */
         /* On unified memory (GB10, Jetson) cudaMemGetInfo's free is the
          * system's MemFree, which the page cache holding the model keeps
          * near zero; measured against a VRAM reserve it froze this cache at
@@ -12043,14 +12062,20 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
         /* After a failed upload (upload_failed) last_free_mb is 0 until the
          * next probe: the card counts as full, also for an empty cache. */
         static long long last_free_mb = -1;
+        static long long grown_bytes;   /* mirrors appended since the last probe */
         static unsigned probes;
         static int upload_failed;
         if (grow && !unified && (cache->count > 0 || upload_failed)) {
             if (last_free_mb < 0 || (probes++ & 63) == 0) {
                 last_free_mb = dsv4_cuda_mem_free_mb(cache->device);
                 upload_failed = 0;
+                grown_bytes = 0;
             }
-            if (last_free_mb >= 0 && last_free_mb < reserve_mb) grow = 0;
+            long long grown_mb = (grown_bytes + mirror_bytes + (1LL << 20) - 1) >> 20;
+            if (last_free_mb >= 0 &&
+                (last_free_mb < reserve_mb ||
+                 (cache->count >= 8 && last_free_mb - grown_mb < reserve_mb - margin_mb)))
+                grow = 0;
         }
         if (!grow && cache->count == 0) {
             pthread_mutex_unlock(&cache->mutex);
@@ -12076,6 +12101,7 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
             pthread_mutex_unlock(&cache->mutex);
             return -1;
         }
+        int appended = 0;   /* a new slot, not a recycled one (grown_bytes) */
         if (!grow || cache->count >= cache->capacity) {
             found = 0;
             for (int i = 1; i < cache->count; i++)
@@ -12120,6 +12146,7 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                 dsv4_cuda_tensor_free(cache->entries[found].down);
         } else {
             found = cache->count++;
+            appended = 1;
         }
         cache->entries[found].layer = view->key.layer;
         cache->entries[found].expert = view->key.expert;
@@ -12167,9 +12194,11 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                 cache->entries[found] = cache->entries[--cache->count];
             last_free_mb = 0;
             upload_failed = 1;
+            grown_bytes = 0;
             pthread_mutex_unlock(&cache->mutex);
             return -1;
         }
+        if (appended) grown_bytes += mirror_bytes;
         cache->entries[found].gate = gate;
         cache->entries[found].up = up;
         cache->entries[found].down = down;

@@ -229,12 +229,18 @@ down in fp4 with their scales). `DSV4_CUDA_EXPERT_MIRRORS` is only an upper
 bound (default 4096): the cache grows while at least
 `DSV4_CUDA_VRAM_RESERVE_MB` (default 2800 with the bank enabled, 600
 without) stays free, so free VRAM sizes it at run time — you normally do not
-need to set it. Decode is disk-bound, so more mirrors help in proportion to
+need to set it. Free VRAM is re-read every 64 mirror misses; in between, an
+explicit reserve and the 600 MiB default also count the mirrors grown since
+the last reading, so the cache stops at the reserve instead of up to 64
+mirrors (~800 MiB) past it, where the compressed-KV buffer and the prefill's
+attention buffers no longer fit and their layers' attention falls back to the
+CPU (`[DSV4 CUDA] kv comp allocation: out of memory`). Decode is disk-bound, so more mirrors help in proportion to
 the hit rate they add (~11 000 experts total; 600 mirrors ≈ 5 %); more RAM
 (`--ram`) buys more than more VRAM.
 
-The 2800 MiB default is smaller than the bank, and free VRAM is re-read only
-every 64 mirror misses (up to ~800 MiB of mirrors past the reserve): once
+The 2800 MiB default is smaller than the bank, and with it free VRAM is
+re-read only every 64 mirror misses (up to ~800 MiB of mirrors past the
+reserve, which the default carries as margin): once
 decode has grown the mirror cache to the reserve, a later large prefill
 cannot allocate the bank and runs on the CPU union (`v4_gpu moe-batch=off
 (bank allocation failed; CPU union stays)`). `DSV4_CUDA_VRAM_RESERVE_MB=4700`
