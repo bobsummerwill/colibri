@@ -173,11 +173,13 @@ them by f32 activations.
 **Run to run.** The dense chain alone gives the same tokens on every run. With the
 routed-expert tier on, a run is not bit-reproducible by default: which experts a step
 finds on the device depends on when the uploader finished, and the balancer moves rows
-between the device and the CPU on measured times. The device's experts compute as
+between the device and the CPU on measured times, and so does the streaming rule of big
+prompt steps (R below, from the measured upload rate). The device's experts compute as
 above, so a different split changes the last bits, and over many layers of routing
 near-ties that can change a greedy token. `COLI_VK_TIER_SYNC=1
 COLI_VK_TIER_BALANCE=0` make the residency and the split follow the routing alone
-(each step waits for its uploads, so it is slower): the runs then repeat (#2081).
+(each step waits for its uploads, so it is slower, and the streaming rule keeps R = G):
+the runs then repeat (#2081).
 
 **Memory.** The host copy stays as the CPU fallback. On an integrated GPU or APU,
 which shares RAM with the CPU, the resident set is therefore held twice: size
@@ -577,7 +579,7 @@ the device, since no Vulkan tier runs.
 | `COLI_VK_TIER_BALANCE` | on | `0`: the device takes every resident expert of a step even when it is the slower side (see below). |
 | `COLI_VK_TIER_WARM` | on | `0`: no warm start; the tier fills as experts pass by. |
 | `COLI_VK_TIER_FILL` | on | The warm start fills the device: the history's experts first (hottest first), then the room left with the experts no history named, one of each layer in turn. A first run used to start with an empty device and fill it at the promotion rate (Qwen3.6 on a 3090 Ti: 16.5% of the routed experts on the device and the CPU's speed, then 97% and three times it from the second run, #2081). A model whose experts all fit now goes up whole at start. `0`: the history's experts only. |
-| `COLI_VK_TIER_SYNC` | `0` | `1`: each layer step first waits for the uploads staged so far: residency then follows the routing alone (with `COLI_VK_TIER_BALANCE=0`, the run is reproducible). A promotion that displaces a resident while a batch is in flight waits for the join to free it. For tests and debugging. |
+| `COLI_VK_TIER_SYNC` | `0` | `1`: each layer step first waits for the uploads staged so far: residency then follows the routing alone, and the streaming rule takes no measured time (R = G). With `COLI_VK_TIER_BALANCE=0`, the run is reproducible. A promotion that displaces a resident while a batch is in flight waits for the join to free it. For tests and debugging. |
 | `COLI_VK_TIER_GEMM_ROWS` | `16` | Rows from which an expert of a step takes the tiled GEMM instead of the per-row GEMV; `0` never. |
 | `COLI_VK_XB_GROUPED` | on where supported | `0`: a step's experts keep their own dispatches where the grouped GEMM would take them (cooperative matrices at subgroup size 64, `bufferDeviceAddress`, widths multiples of 128, int8/int4, SwiGLU). |
 | `COLI_VK_XB_GROUPED_ROWS` | `64` | Assignments in a batch from which the grouped GEMM takes it. |
@@ -1054,8 +1056,9 @@ What the numbers say, and what they do not:
   rows (the GEMM against the per-row GEMV: 0.34, KL 0.07). The trunk on the device
   moves them further (0.76, KL 0.49) through its int8 trunk (see Arithmetic above).
   A run with the tier is also not bit-reproducible by default: which experts a step
-  finds resident depends on when the uploader finished, and the balancer on measured
-  times (`COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0` removes both).
+  finds resident depends on when the uploader finished, and the balancer and the
+  streaming rule on measured times (`COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0` removes
+  all three).
 
 The first round (histories that had seen the benchmark's prompts: Qwen3.8's own
 `.coli_usage` from earlier work, and for Qwen3.6 a run on the prefill prompt):
@@ -2785,7 +2788,8 @@ engine has them. For a step of at least `COLI_VK_TIER_GEMM_ROWS` rows (16),
   `cpu_row` is the time the CPU spent per (row, expert) pair it computed in the prefill
   steps so far, its share of a step between issue and join, loads included. Below R the
   CPU keeps the expert: its rows cost the CPU less than the upload. Until both are
-  measured, R = G. `COLI_VK_TIER_STREAM_ROWS=n` fixes R at n. One line per forward says
+  measured, R = G. `COLI_VK_TIER_STREAM_ROWS=n` fixes R at n; `COLI_VK_TIER_SYNC=1` keeps
+  R = G, so a reproducible run does not follow the upload rate. One line per forward says
   what the rule gave:
 
   ```

@@ -1025,13 +1025,16 @@ static int grow_rows(int need) {
  * the CPU spent per (row, expert) pair it computed in the prefill steps so far (its share
  * of a step between issue and join, loads included). Below R the CPU keeps the expert:
  * its rows cost the CPU less than the upload. Until both are measured R = G.
- * COLI_VK_TIER_STREAM_ROWS=n fixes R at n (tests). A [VK] line per forward says what the
- * rule gave, and the run's line how much streamed. */
+ * COLI_VK_TIER_STREAM_ROWS=n fixes R at n (tests). COLI_VK_TIER_SYNC=1 keeps R = G: the
+ * run it makes reproducible (with COLI_VK_TIER_BALANCE=0) takes no measured time here
+ * either, or a different upload rate moves R and the experts between the device and the
+ * CPU. A [VK] line per forward says what the rule gave, and the run's line how much
+ * streamed. */
 static double vkt_now_ms(void);
 static int stream_min_rows(void) {
     if (T.st_rows_env > 0) return T.st_rows_env;
     int r = T.gemm_rows;
-    if (T.bw_up > 0 && T.cpu_row_ms > 0) {
+    if (!T.sync && T.bw_up > 0 && T.cpu_row_ms > 0) {
         double up = (double)T.exp_bytes / T.bw_up, need = up / T.cpu_row_ms;
         if (need > 1e6) need = 1e6;
         int n = (int)need + (need > (int)need);
@@ -1357,6 +1360,7 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
         fprintf(stderr, VKT_TAG " tier %s stream: a step of %d rows; cold experts with %d rows or more go to the device (",
                 T.engine, S, R);
         if (T.st_rows_env > 0) fprintf(stderr, "COLI_VK_TIER_STREAM_ROWS");
+        else if (T.sync) fprintf(stderr, "the GEMM's %d rows: COLI_VK_TIER_SYNC takes no measured time", T.gemm_rows);
         else if (T.bw_up > 0 && T.cpu_row_ms > 0)
             fprintf(stderr, "an upload of %s at %.1f GB/s takes %.3f ms, the CPU %.4f ms a row; the GEMM from %d rows",
                     human((double)T.exp_bytes, hb, sizeof hb), T.bw_up / 1e6, (double)T.exp_bytes / T.bw_up,
