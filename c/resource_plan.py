@@ -2146,36 +2146,46 @@ def _parse_cgroup_counter(text):
     return value if value <= _CGROUP_UINT64_MAX else None
 
 
-def _cgroup_inactive_file(directory, v1=False):
-    """Return the inactive file cache charged to one cgroup, in bytes.
+def _cgroup_file_cache(directory, v1=False):
+    """Return the file cache charged to one cgroup, inactive and active, in bytes.
 
     ``memory.current`` (v1: ``usage_in_bytes``) charges clean page cache -- for
     this engine, the mmap'd shards a previous run left behind -- while the host
     half of the minimum, MemAvailable, counts such cache as available. Subtract
-    ``inactive_file`` (v1: ``total_inactive_file``, the hierarchical figure that
-    pairs with the hierarchical usage counter) the way Docker and cAdvisor
-    derive a working set. Absent statistics, or a kernel without the key,
-    subtract nothing; a present but malformed file is a refusal.
+    ``inactive_file`` and ``active_file`` (v1: ``total_inactive_file`` and
+    ``total_active_file``, the hierarchical figures that pair with the
+    hierarchical usage counter): at the limit the kernel reclaims from both
+    lists before it calls the OOM killer, and the pages of a model an engine
+    has mapped and read sit on the active one (seen on Linux 6.8 with MGLRU:
+    pages touched through a mapping went active, pages read with read() stayed
+    inactive). Docker and cAdvisor subtract only the inactive pages, which
+    counts such a model as spent. Not ``file``:
+    it includes tmpfs and shared memory, which sit on the anon lists. Absent
+    statistics, or a kernel without a key, subtract nothing for it; a present
+    but malformed file is a refusal.
     """
     stat_path = Path(directory) / "memory.stat"
     present, text = _read_bounded_ascii(stat_path, _CGROUP_STAT_MAX_BYTES,
                                         "cgroup memory statistics")
     if not present:
         return 0
-    key = "total_inactive_file" if v1 else "inactive_file"
-    values = []
+    prefix = "total_" if v1 else ""
+    values = {prefix + "inactive_file": [], prefix + "active_file": []}
     for line in _proc_lines(text, "cgroup memory statistics"):
         match = re.fullmatch(r"([A-Za-z0-9_]+) (\d+)", line)
         if match is None:
             raise CgroupFormatError(f"malformed cgroup memory statistics: {stat_path}")
-        if match.group(1) == key:
-            values.append(match.group(2))
-    if len(values) > 1:
-        raise CgroupFormatError(f"duplicate {key} in cgroup memory statistics: {stat_path}")
-    value = _parse_cgroup_counter(values[0]) if values else 0
-    if value is None:
-        raise CgroupFormatError(f"malformed {key} in cgroup memory statistics: {stat_path}")
-    return value
+        if match.group(1) in values:
+            values[match.group(1)].append(match.group(2))
+    cache = 0
+    for key, found in values.items():
+        if len(found) > 1:
+            raise CgroupFormatError(f"duplicate {key} in cgroup memory statistics: {stat_path}")
+        value = _parse_cgroup_counter(found[0]) if found else 0
+        if value is None:
+            raise CgroupFormatError(f"malformed {key} in cgroup memory statistics: {stat_path}")
+        cache += value
+    return cache
 
 
 def _cgroup_pair_remaining(directory, limit_name, current_name, v1=False):
@@ -2185,8 +2195,8 @@ def _cgroup_pair_remaining(directory, limit_name, current_name, v1=False):
     (v2 ``max``; v1's sentinel just below 2**63). Both files must be present
     and well-formed together: an incomplete pair or a malformed counter is a
     refusal, never something a looser ancestor may mask. Headroom is measured
-    against the working set, charged usage less reclaimable inactive file
-    cache, so a previous run's cached model pages do not read as spent budget.
+    against the working set, charged usage less reclaimable file cache
+    (inactive and active), so cached model pages do not read as spent budget.
     """
     directory = Path(directory)
     limit_path = directory / limit_name
@@ -2210,7 +2220,7 @@ def _cgroup_pair_remaining(directory, limit_name, current_name, v1=False):
         raise CgroupFormatError(f"malformed cgroup memory limit: {limit_path}")
     if v1 and limit >= _CGROUP_V1_UNLIMITED_MIN:
         return (True, None)
-    working_set = max(0, current - _cgroup_inactive_file(directory, v1=v1))
+    working_set = max(0, current - _cgroup_file_cache(directory, v1=v1))
     return (True, max(0, limit - working_set))
 
 

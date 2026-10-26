@@ -53,7 +53,7 @@ QWEN38_SPEED_RE = re.compile(
     re.IGNORECASE,
 )
 RAM_RE = re.compile(r"(?:projected=|dense=resident\(|available=)([\d.]+)G[iI]?B", re.IGNORECASE)
-IOBENCH_RE = re.compile(r"-> ([\d.]+) GB/s")
+IOBENCH_RE = re.compile(r"^(O_DIRECT|buffered)\b[^\n]*-> ([\d.]+) GB/s", re.MULTILINE)
 
 HERE = Path(__file__).resolve().parent
 C_ROOT = HERE.parent
@@ -513,8 +513,18 @@ def run_fresh_engine(engine, snap, prompt, max_new, runs, cap, bits, memory_gb=N
 def run_iobench(iobench, shard, mode):
     proc = subprocess.run([iobench, shard, "19", "64", "8", str(mode)],
                           capture_output=True, text=True)
+    if proc.returncode:
+        print(f"[datapoint] iobench exited {proc.returncode}; disk result omitted",
+              file=sys.stderr)
+        return None
     m = IOBENCH_RE.search(proc.stdout)
-    return float(m.group(1)) if m else None
+    expected = "O_DIRECT" if mode else "buffered"
+    if not m or m.group(1) != expected:
+        actual = m.group(1) if m else "no parseable result"
+        print(f"[datapoint] iobench requested {expected} but got {actual}; "
+              "disk result omitted", file=sys.stderr)
+        return None
+    return float(m.group(2))
 
 
 def build_parser():

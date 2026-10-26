@@ -1388,17 +1388,24 @@ static void q36cc_dm_end(Q36CChain *ch) { if (ch->dm_held) { qt_chain_hold(0); c
  * a hybrid layer waits for (0: none) */
 static int q36cc_dm_layer(Q36CChain *ch, Model *m, Layer *l, int i, int n, unsigned *v) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
-    int ng = c->n_group > 1 && c->n_group <= E ? c->n_group : 1, io = i * ch->rows * K;
+    int ng = c->n_group > 1 && c->n_group <= E ? c->n_group : 1, io = i * n * K;
     CcRoute rp = {n, E, K, c->router_sigmoid ? 1 : 0, 0, E, 0, 0, io, K, io, K, ng, ng > 1 ? c->topk_group : 1, 1, 1.f, 1.f, 0.f};
     int part;
     CcBuf *tab = q36cc_dm_tab(ch, i, n, &part);
     CcMoe mp = {n, K, D, I, ch->dm_fmt, ch->dm_gs, 0, 1, i * E, 0, D, io, K, io, K, 0, D, -1, E, tab == ch->dm_tabb, 0};
     if (ch->dm_fmt >= 100) qt_chain_layer_format(i, &mp.fmt, &mp.fmt_d);   /* a GGUF's types change from layer to layer */
     int stg = q36cc_stages(ch, tab, i);
-    int ok = cc_matmul(ch->t_gate[i], ch->h2, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->dm_ids, ch->dm_w, &rp) &&
-             cc_copy(ch->dm_idsd, io, ch->dm_ids, io, (size_t)n * K) && cc_copy(ch->dm_wd, io, ch->dm_w, io, (size_t)n * K);
+    int ok = cc_matmul(ch->t_gate[i], ch->h2, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->dm_ids, ch->dm_w, &rp);
     *v = 0;
-    if (ok && part) { *v = ++ch->dm_seq; ok = cc_copy(ch->h2d, 0, ch->h2, 0, (size_t)n * D) && cc_signal(ch->dm_dfl, 0, *v); }
+    /* a layer whose experts are all on the device needs no weights on the host, and its route ids
+     * only after the frame (one copy for the chunk before cc_submit); a hybrid layer copies both
+     * and the input rows before signalling the host */
+    if (ok && part) {
+        *v = ++ch->dm_seq;
+        ok = cc_copy(ch->dm_idsd, io, ch->dm_ids, io, (size_t)n * K) &&
+             cc_copy(ch->dm_wd, io, ch->dm_w, io, (size_t)n * K) &&
+             cc_copy(ch->h2d, 0, ch->h2, 0, (size_t)n * D) && cc_signal(ch->dm_dfl, 0, *v);
+    }
     ok = ok && q36cc_shared(ch, m, l, i, n) && (!stg || cc_fetch_wait()) &&
          cc_moe(tab, ch->h2, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, NULL, &mp);
     if (ok && stg) ok = cc_fetch_done() && q36cc_stage_from(ch, m, i + 1);   /* the sum below reads no weights */
@@ -1420,8 +1427,8 @@ static int q36cc_dm_serve(Q36CChain *ch, Model *m, int i, int n, unsigned v) {
             return 0;
         }
     double t1 = tm_now();
-    const int *ids = (const int *)cc_ptr(ch->dm_idsd) + (size_t)i * ch->rows * K;
-    const float *w = (const float *)cc_ptr(ch->dm_wd) + (size_t)i * ch->rows * K, *x = (const float *)cc_ptr(ch->h2d);
+    const int *ids = (const int *)cc_ptr(ch->dm_idsd) + (size_t)i * n * K;
+    const float *w = (const float *)cc_ptr(ch->dm_wd) + (size_t)i * n * K, *x = (const float *)cc_ptr(ch->h2d);
     for (int s = 0; s < n; s++) {
         uint32_t mask = 0; int any = 0;
         for (int k = 0; k < K; k++) { int e = ids[s * K + k]; if (e < 0 || ch->dm_res[(size_t)i * E + e]) mask |= 1u << k; else { any = 1; ch->dm_pairs++; } }
@@ -1443,7 +1450,7 @@ static void q36cc_dm_books(Q36CChain *ch, Model *m, int n, int pb) {
     for (int i = 0; i < L; i++) {
         if (!ch->dm_ran[i]) continue;   /* a layer that took the host's step kept its own books */
         q36cc_kv_down(ch, m, i, n, pb);
-        const int *ids = (const int *)cc_ptr(ch->dm_idsd) + (size_t)i * ch->rows * K;
+        const int *ids = (const int *)cc_ptr(ch->dm_idsd) + (size_t)i * n * K;
         for (int s = 0; s < n; s++) {
             const int *idx = ids + s * K;
             if (m->resident_collecting) for (int k = 0; k < K; k++) if (idx[k] >= 0) m->seen[(int64_t)i * E + idx[k]] = 1;
@@ -1558,7 +1565,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
          * paid the bus on every element, 11-16 us a call (Flint: 70 calls a token) */
         if (half && !cc_copy(ch->csd, 0, ch->cs, 0, (size_t)n * 2 * half)) goto lost;
         if (dm && q36cc_dm_tab(ch, 0, n, &(int){0}) == ch->dm_tabb && !q36cc_stage_from(ch, m, 0)) goto lost;   /* the first staged layer's copy */
-        int ok = 1, pending = 0, pend_i = -1;   /* pend_i: the hybrid layer the host serves after recording the next */
+        int ok = 1, pending = 0, pend_i = -1, dm_ids_defer = 0;   /* pend_i: the hybrid layer the host serves after recording the next */
         unsigned pend_v = 0;
         CcBuf *routed = ch->routed;              /* where the layer before left its routed sum */
         for (int i = 0; i < L && ok; i++) {
@@ -1588,6 +1595,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
                 unsigned v = 0;
                 ch->dm_ran[i] = 1;
                 ok = q36cc_dm_layer(ch, m, l, i, n, &v);
+                if (!v) dm_ids_defer = 1;
                 if (ok && pend_v) ok = q36cc_dm_serve(ch, m, pend_i, n, pend_v);
                 pend_i = i; pend_v = v; routed = ch->dm_y; pending = 1;
                 continue;
@@ -1622,6 +1630,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
             pending = 1;
         }
         if (ok) ok = q36cc_combine(ch, m, L - 1, n, routed);
+        if (ok && dm_ids_defer) ok = cc_copy(ch->dm_idsd, 0, ch->dm_ids, 0, (size_t)L * n * c->topk);
         if (ok && lf) ok = cc_copy(ch->lfd, ((size_t)(L - 1) * 3 + 2) * D, ch->x, (size_t)(n - 1) * D, D);
         if (ok && want_x) ok = cc_copy(ch->xd, 0, ch->x, 0, (size_t)n * D);
         int last = c0 + n == S;

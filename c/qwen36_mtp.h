@@ -16,8 +16,10 @@ typedef struct {
     QW sh_g, sh_u, sh_d;
     QW *eg, *eu, *ed;                /* [E] */
     QW dvoc; int nvoc;               /* the shared lm_head rows selected by vid */
+    DraftVocab *voc;                 /* Q36_MTP_VOCAB: adaptive draft vocabulary (draft_vocab.h); NULL = full or vid */
+    uint64_t voc_gen; int voc_reuse; /* one more at every rebuild of voc's list; the prompt tokens serve kept */
     float last_p;                    /* the newest draft's probability under the head */
-    int pick_id, pick_ok;            /* q36_mg_row's compact pick (a listed vocabulary) */
+    int pick_id, pick_ok;            /* q36_mg_row / q36_mc_row compact pick */
     int *vid;                        /* Q36_MTP_VOCAB_IDS: row j of dvoc scores id vid[j] (NULL: id j) */
     void *Kc, *Vc; int stride;       /* the head's KV rows [KV][stride][hd], q36_kv_es() bytes an element */
     void **Kp, **Vp;                 /* the model's per-layer pointers and the head's after them */
@@ -136,6 +138,67 @@ static int q36_mtp_load(Model *m) {
         p->dvoc.I = D; p->dvoc.O = n; p->dvoc.w = rows;
         if (dense_i8_on()) { qw_quantize(rows, D, n, "lm_head", &p->dvoc); free(rows); p->dvoc.w = NULL; }
         p->nvoc = n; p->vid = ids;
+    } else {
+        /* Q36_MTP_VOCAB: the head scores the most used tokens only (draft_vocab.h, as Qwen3.8's).
+         * Unset, a list of DRAFT_VOCAB_DEFAULT_TOP where the head drafts on the CUDA chain (measured
+         * there), the whole vocabulary elsewhere; 0 is always the whole vocabulary. */
+        const char *ve = getenv("Q36_MTP_VOCAB"), *dmp = getenv("Q36_MTP_DUMP");
+        int top = q36_cuda_tier_drafts(m) ? DRAFT_VOCAB_DEFAULT_TOP : 0;
+        if (ve && *ve) {
+            char *end = NULL; long parsed = strtol(ve, &end, 10);
+            if (end == ve || *end || parsed < 0 || parsed > (long)c->vocab) {
+                fprintf(stderr, "Q36_MTP_VOCAB must be an integer in 0..%d\n", c->vocab); exit(1);
+            }
+            top = (int)parsed;
+        }
+        int can = !(dmp && *dmp) && 0 < top && top < c->vocab && (m->lm_head.q || m->lm_head.w || q36_cuda_tier_drafts(m));
+#ifdef COLI_VULKAN
+        if (g_vk_chain || m->lm_head.vk_gone) can = 0;
+#endif
+        if (can) {
+            const char *snap = getenv("SNAP"), *vp = getenv("COLI_VOCAB_USAGE"), *up = getenv("COLI_USAGE");
+            if (!snap || !*snap) snap = ".";
+            size_t cl = (vp && *vp ? strlen(vp) : strlen(snap) + 13) + 1;
+            size_t ul = (up && *up ? strlen(up) : strlen(snap) + 13) + 1;
+            char *counts = malloc(cl), *usage = malloc(ul);
+            if (!counts || !usage) { fprintf(stderr, "OOM MTP vocabulary\n"); exit(1); }
+            if (vp && *vp) memcpy(counts, vp, cl); else snprintf(counts, cl, "%s/.coli_vocab", snap);
+            if (up && *up) memcpy(usage, up, ul); else snprintf(usage, ul, "%s/.coli_usage", snap);
+            int same = coli_own_same_path(counts, usage);
+            free(usage);
+            if (same) {
+                fprintf(stderr, "[mtp] draft vocabulary off, the head scores the whole vocabulary: "
+                                "COLI_VOCAB_USAGE and COLI_USAGE are the same file, %s. Set COLI_VOCAB_USAGE "
+                                "to another file.\n", counts);
+                free(counts);
+            } else {
+                p->voc = draft_vocab_new(c->vocab, top);
+                if (!p->voc) { fprintf(stderr, "OOM MTP vocabulary\n"); exit(1); }
+                fprintf(stderr, "[mtp] draft vocabulary: top %d + %d/%d rule + conversation, ",
+                        p->voc->top, DRAFT_VOCAB_NEAR_NUM, DRAFT_VOCAB_NEAR_DEN);
+                double tokens; int distinct;
+                switch (draft_vocab_load(p->voc, counts)) {
+                case DRAFT_VOCAB_LOADED:
+                    draft_vocab_totals(p->voc, &tokens, &distinct);
+                    fprintf(stderr, "counts from %s (%.0f tokens, %d distinct)\n", p->voc->path, tokens, distinct);
+                    break;
+                case DRAFT_VOCAB_NO_FILE:
+                    fprintf(stderr, "no counts file at %s yet\n", p->voc->path);
+                    break;
+                case DRAFT_VOCAB_NOT_COUNTS:
+                    fprintf(stderr, "%s cannot be read as a counts file\n", p->voc->path);
+                    break;
+                case DRAFT_VOCAB_OTHER_SIZE:
+                    fprintf(stderr, "%s has counts for another vocabulary size\n", p->voc->path);
+                    break;
+                case DRAFT_VOCAB_DAMAGED:
+                    draft_vocab_totals(p->voc, &tokens, &distinct);
+                    fprintf(stderr, "counts from %s up to a damaged record, after %d records (%.0f tokens, %d distinct)\n",
+                            p->voc->path, p->voc->records, tokens, distinct);
+                    break;
+                }
+            }
+        }
     }
     p->pend = falloc(D); p->on = 1;
     fprintf(stderr, "[mtp] Qwen3.6 checkpoint head: %d experts\n", E);
@@ -252,6 +315,7 @@ static void q36_mtp_moe(const float *x, int R, int D, float *out) {
 
 /* The model's lm_head on one normed row: on the device when the chain holds it */
 static void q36_mtp_lm_head(Model *m, const float *row, float *logits);
+static void q36_mtp_lm_rows(Model *m, const float *row, const int *ids, int n, float *scores);
 
 /* A fed row's only lasting effect is its K/V row (the head reads nothing else of it
  * later): fc, the input norm, k and v, the k norm and RoPE, into the head's cache,
@@ -562,6 +626,16 @@ static void q36_mtp_rows(Model *m, const int *tok, const float *hid, int R, int 
             for (int i = 0; i < c->vocab; i++) logits[i] = -INFINITY;
             for (int j = 0; j < p->nvoc; j++) logits[p->vid[j]] = scores[j];
             free(scores);
+        } else if (p->voc) {
+            const int *ids = p->voc->list; int n = p->voc->list_n;
+            float *scores = falloc(n);
+            q36_mtp_lm_rows(m, last, ids, n, scores);
+            int b = 0;
+            for (int j = 1; j < n; j++) if (scores[j] > scores[b]) b = j;
+            float z = 0.f, sb = scores[b];
+            for (int j = 0; j < n; j++) if (scores[j] - sb > -20.f) z += expf(scores[j] - sb);
+            p->pick_id = ids[b]; p->last_p = z > 0.f ? (float)(1.0 / z) : 0.f; p->pick_ok = 1;
+            free(scores);
         } else q36_mtp_lm_head(m, last, logits);
         if (hid_out) memcpy(hid_out, last, sizeof(float) * D);   /* a deeper draft's: after mtp.norm */
         free(last);
@@ -706,9 +780,51 @@ static void q36_mtp_attach(Model *m) {
     }
     if (!q36_mtp_load(m)) { fprintf(stderr, "[mtp] Q36_MTP=%s: the head stays off\n", path); return; }
 }
+/* A request starts: its prompt joins the list and counts, but the tokens serve kept from the
+ * last request (counted then) do not count again. draft_vocab_begin rebuilds the list. */
+static void q36_mtp_vocab_begin(const int *prompt, int n) {
+    Q36Mtp *p = &g_q36_mtp;
+    int reuse = p->voc_reuse; p->voc_reuse = 0;
+    if (!p->on || !p->voc || !prompt || n <= 0) return;
+    if (reuse < 0 || reuse > n) reuse = 0;
+    draft_vocab_begin(p->voc, prompt, n, reuse);
+    p->voc_gen++;
+}
+/* A token the request feeds: counted, and appended to the list when it is not in it. */
+static void q36_mtp_vocab_step(int tok) {
+    Q36Mtp *p = &g_q36_mtp;
+    if (!p->on || !p->voc) return;
+    uint64_t r = p->voc->run.rebuilds;
+    draft_vocab_count_token(p->voc, tok);
+    if (p->voc->run.rebuilds != r) p->voc_gen++;   /* a new list, not ids at its tail: the device's copy is stale */
+}
+/* The counts beside the model (.coli_vocab, or COLI_VOCAB_USAGE) at exit; USAGE_SAVE=0 keeps them. */
+static void q36_mtp_vocab_save(void) {
+    Q36Mtp *p = &g_q36_mtp;
+    if (!p->on || !p->voc || !rt_save_enabled()) return;
+    double tokens; int distinct;
+    draft_vocab_totals(p->voc, &tokens, &distinct);
+    switch (draft_vocab_save(p->voc)) {
+    case DRAFT_VOCAB_SAVED:
+        fprintf(stderr, "[STATS] %.0f tokens across %d distinct -> %s\n", tokens, distinct, p->voc->path);
+        break;
+    case DRAFT_VOCAB_LEFT_ALONE:
+        fprintf(stderr, "[STATS] no counts are written to %s. Set COLI_VOCAB_USAGE to use another file.\n", p->voc->path);
+        break;
+    case DRAFT_VOCAB_NOT_SAVED:
+        fprintf(stderr, "[STATS] the draft vocabulary counts were not written to %s. Make the directory "
+                        "writable, or point COLI_VOCAB_USAGE at a file that is.\n", p->voc->path);
+        break;
+    }
+}
 static void q36_mtp_report(void) {
     const Q36Mtp *p = &g_q36_mtp;
     if (!p->on) return;
     fprintf(stderr, "[mtp] head rows %llu (%.2f ms each), fed rows %llu (K/V only, %.2f ms each), drafts %llu\n", p->rows,
             p->rows ? p->ms / (double)p->rows : 0.0, p->kv_rows, p->kv_rows ? p->kv_ms / (double)p->kv_rows : 0.0, p->drafts);
+    if (p->voc) {
+        DraftVocabSummary s = draft_vocab_summary(p->voc);
+        fprintf(stderr, "[mtp] draft list %.0f tokens on average, %.1f%% of picks inside, %llu ids appended, %llu rebuilds\n",
+                s.average_list_tokens, s.inside_percent, (unsigned long long)s.appended, (unsigned long long)s.rebuilds);
+    }
 }

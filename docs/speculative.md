@@ -142,6 +142,10 @@ head scores the whole vocabulary with `Q38_MTP_VOCAB=0`, with `Q38_MTP_DUMP`, wi
 while the dense chain is on, where the device scores it. Each run and served turn prints the
 average size of the list, the share of picks inside it, and the ids appended and rebuilds.
 
+Qwen3.6's head uses the same list with `Q36_MTP_VOCAB`, on by default where it drafts on the CUDA
+chain ([qwen36.md](qwen36.md#the-mtp-head-q36_mtp)); its engine writes the counts at exit, not on
+SIGTERM.
+
 ## The MTP head's drafts (qwen36)
 
 `Q36_MTP=1` reads the release's `mtp.*` block from the converted container
@@ -151,7 +155,8 @@ The head has its own causal KV cache; every completed pair contributes its K/V,
 and only a draft row runs the full attention/MoE/output computation.
 
 `Q36_MTP_DRAFTS=1..7` bounds the depth, `auto` lets the measured gate choose,
-`Q36_MTP_PMIN` stops uncertain deeper drafts, and `Q36_MTP_VOCAB_IDS` limits
+`Q36_MTP_PMIN` stops uncertain deeper drafts, and `Q36_MTP_VOCAB` (the most
+used tokens, on by default on the CUDA chain) or `Q36_MTP_VOCAB_IDS` limits
 only the draft's output scoring. When lookup also proposes tokens the gate
 chooses a source by its measured value. Both sources share verification and
 rollback; `[qwen36 mtp]` reports the head's acceptance separately. A rejected
@@ -191,9 +196,11 @@ cost(k)  = (T(k+1) + (k-1) d) / T(1)                    in plain decode steps
 
 and it drafts only when that beats a plain step (`value(k) > 1`). A row count not
 measured yet costs `T(1) (1 + (n-1) rho)`, with `rho` fitted from the multi-row forwards
-that ran (0.5 until one has). Every 16 picks it tries one draft deeper than its best,
-so an estimate it stopped feeding can recover. After 64 forwards without a plain step it
-takes one, so `T(1)` stays measured. Prompt lookup is always gated. The MTP head is
+that ran once `T(1)` is measured (0.5 until then). Every 16 picks it tries one draft
+deeper than its best, so an estimate it stopped feeding can recover. After 64 forwards
+without a plain step it takes one, so `T(1)` stays measured. A fixed depth of 2 or more
+whose drafts are trimmed (below) takes one too, because the trim prices rows with `T(1)`
+and `rho`. Prompt lookup is always gated. The MTP head is
 gated under `Q38_MTP_DRAFTS=0`. colibri's MTP head (GLM-5.2) is always gated: its head
 runs a layer of its own for each draft and absorbs the drafts that stood, so a verify's
 `T(n)` counts the forward, the head's drafts and that absorb. `COLI_SPEC_GATE=0` drafts
@@ -205,8 +212,14 @@ guard that pauses the head for 256 tokens under 70% (`COLI_MTP_GUARD_PCT`,
 its drafts look like. A source that can say how likely each of this step's drafts is
 passes that estimate `p_j` to `spec_gate_pick_p`, and `a_j` in `E(k)` becomes the
 acceptance the gate measured for drafts given that estimate (ten bins of `p`, each
-starting at the bin's own `p` and worth two verifies, then fed by every verify). A step
-whose drafts are sure verifies deeper, a doubtful one stops early. This is DeepSeek's
+starting at the bin's own `p` and worth two verifies, then fed by every verify). Those
+`k` drafts are already written, so `spec_gate_pick_p` prices only their verify
+(`T(k+1) / T(1)`), not the time spent writing them. Before the head writes draft `n + 1`,
+`spec_gate_deeper_p` lets it write that draft only when no shorter verify is already
+worth more than `n` drafts and `n + 1` drafts, the new one as likely as the gate's best
+bin, would beat both a plain step and `n`. The time of that draft is not counted there:
+it stops only drafts that could not pay for their verify row. A step whose drafts are
+sure verifies deeper, a doubtful one stops early. This is DeepSeek's
 confidence-scheduled verification, and the estimate is:
 
 - for the MTP heads, the head's probability of its own token (the softmax over the scores
@@ -216,8 +229,8 @@ confidence-scheduled verification, and the estimate is:
 
 Qwen3.6 and Qwen3.8 keep the first draft (the head pass that wrote it is one a plain step
 makes too), trim the deeper ones within a fixed depth (`Q36_MTP_DRAFTS`, `Q38_MTP_DRAFTS`
-from 2), and stop writing drafts at the first one that is not worth its verify row
-(`spec_gate_deeper_p`: a deeper draft is no likelier). Under `auto` the averages pick the
+from 2), and stop writing drafts when no next one could be worth its verify row
+(`spec_gate_deeper_p`). Under `auto` the averages pick the
 depth alone: fed by the verifies the estimates trimmed, which kept the sure drafts, they
 learned a higher acceptance than the head has and picked deeper. GLM-5.2's head runs a
 layer of its own per draft, so there the probability can also turn the verify into a
@@ -241,10 +254,14 @@ tok/s; every Qwen3.6 run printed the text of the run without the head, prompt by
 | `auto` with the per-step depth (not what ships) | 106.0-120.6 | |
 
 So one draft stays the fastest depth on that card, and the per-step depth takes most of
-the loss out of a deeper one. On Qwen3.8 Flash Next IQ2_XS with its Q8_0 head, Vulkan
-chain, two drafts, it measured 1 to 5% slower (33.9-38.0 against 34.1-39.0 tok/s; the
-head itself is off by default beside that chain, 35.8-49.6 without it), hence opt-in
-there. GLM-5.2 has not been measured on a real checkpoint with it.
+the loss out of a deeper one. Those runs predate the plain step every 64 forwards at a
+fixed depth and the check before each draft: on an L4 with every expert in VRAM, that
+change made two drafts 9-15% faster
+([qwen36-mtp-fixed-depth-2026-10-25](experiments/qwen36-mtp-fixed-depth-2026-10-25/)).
+On Qwen3.8 Flash Next IQ2_XS with its Q8_0 head, Vulkan chain, two drafts, it measured
+1 to 5% slower (33.9-38.0 against 34.1-39.0 tok/s; the head itself is off by default
+beside that chain, 35.8-49.6 without it), hence opt-in there (measured before that
+change, not since). GLM-5.2 has not been measured on a real checkpoint with it.
 
 A step that does not run colibri's head (a plain step, or another source's verify)
 leaves the head's KV row for that position unwritten. The head's window then restarts

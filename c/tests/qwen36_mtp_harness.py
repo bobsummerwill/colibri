@@ -30,7 +30,7 @@ ENV = {"COLI_VULKAN": "0", "COLI_CUDA": "0", "COLI_LOOKUP": "0", "Q36_MTP": "0",
        "OMP_NUM_THREADS": "2", "COLI_NO_OMP_TUNE": "1", "USAGE_SAVE": "0", "NOSTREAM": "1",
        "COLI_DENSE_I8": "0", "COLI_DENSE_IDOT": "0", "QWEN_EXPERT_ACT": "f32", "Q36_MAXT": "256"}
 KEYS = tuple(k for k in os.environ if k.startswith(("Q36_MTP", "COLI_", "QWEN_"))) + (
-    "Q36_MTP", "Q36_MTP_FORCE", "Q36_MTP_DRAFTS", "Q36_MTP_DUMP", "Q36_MTP_PMIN", "Q36_MTP_VOCAB_IDS")
+    "Q36_MTP", "Q36_MTP_FORCE", "Q36_MTP_DRAFTS", "Q36_MTP_DUMP", "Q36_MTP_PMIN", "Q36_MTP_VOCAB", "Q36_MTP_VOCAB_IDS")
 spec.SPEC_KEYS += KEYS
 spec.BASE_ENV.update(ENV)
 wire.BASE_ENV = ENV
@@ -90,6 +90,9 @@ def check_lossless(eng, ref, stdout, logits, n_new, tmp):
     vocab.write_text("\n".join(map(str, [7, 11, 13, 7, 17])))  # duplicate is counted once
     spec.gate(eng, ref, stdout, logits, tmp, "listed vocabulary + probability stop", {
         "Q36_MTP": "1", "Q36_MTP_DRAFTS": "7", "Q36_MTP_PMIN": "1", "Q36_MTP_VOCAB_IDS": str(vocab)}, "mtp", None, EXTRA)
+    if EXTRA is None:
+        spec.gate(eng, ref, stdout, logits, tmp, "adaptive vocabulary Q36_MTP_VOCAB", {
+            "Q36_MTP": "1", "Q36_MTP_DRAFTS": "7", "Q36_MTP_VOCAB": "32"}, "mtp", None, EXTRA)
 
 
 def check_serve(engine, model):

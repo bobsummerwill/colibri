@@ -5779,7 +5779,11 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
         int km=0;double vm=0.0;
         if(head_ready){
             int maxm=room<3?room:3;
-            if(sp->depth){km=sp->depth<maxm?sp->depth:maxm;vm=spec_gate_value(&sp->gate,SPEC_SRC_MTP,km,NULL);}
+            if(sp->depth){
+                /* the plain step that keeps T(1) measured for the trim below (see q36_mtp_depth) */
+                if(sp->depth>1&&sp->pstep&&!sp->gate.off&&!sp->force&&sp->gate.since_plain>=SPEC_REFRESH){sp->gate.declined[SPEC_SRC_MTP]++;vm=1.0;}
+                else{km=sp->depth<maxm?sp->depth:maxm;vm=spec_gate_value(&sp->gate,SPEC_SRC_MTP,km,NULL);}
+            }
             else km=spec_gate_pick(&sp->gate,SPEC_SRC_MTP,maxm,&vm);
         }
         if(kl>0&&(km==0||sp->lk_force||vl>vm||(vl==vm&&kl>km))){k=kl;src=SPEC_SRC_LOOKUP;memcpy(d,dl,(size_t)k*sizeof(int));}
@@ -5793,13 +5797,13 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
             sp->ahead_p[0]=m->mtp_p;
             double t_first=now_s();
             for(int j=1;j<k;j++){
+                /* the drafts so far leave no next draft that could pass */
+                if(sp->pstep&&sp->depth&&!sp->force&&!spec_gate_deeper_p(&sp->gate,SPEC_SRC_MTP,j,sp->ahead_p)){k=j;break;}
                 double t0=now_s();
                 m->mtp_p=-1.0f;
                 d[j]=q38_mtp_draft_more(m,hidden,d[j-1],pos+j-1);
                 sp->ahead_p[j]=m->mtp_p;
                 spec_gate_draft_cost(&sp->gate,SPEC_SRC_MTP,now_s()-t0);
-                /* this draft is not worth its row: a deeper one, no likelier, is not written */
-                if(sp->pstep&&sp->depth&&!sp->force&&j+1<k&&!spec_gate_deeper_p(&sp->gate,SPEC_SRC_MTP,j+1,sp->ahead_p)){k=j+1;break;}
             }
             free(hidden);
             /* the depth this step's drafts are worth, from their probabilities (DeepSeek's

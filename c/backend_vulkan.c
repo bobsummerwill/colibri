@@ -502,7 +502,11 @@ struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; i
  * shaders size their work by gl_SubgroupSize and gl_SubgroupID; an Intel Iris Xe
  * (8 to 32) ran chain_gemv and chain_gemv2 at another width than the one they read,
  * and every decode GEMV of the chain came out wrong. 0: a device with one size (NVIDIA,
- * Lavapipe), no control, or COLI_VK_SUBGROUP=0 (the driver's choice, as before). */
+ * Lavapipe), no control, or COLI_VK_SUBGROUP=0 (the driver's choice, as before).
+ * COLI_VK_SUBGROUP=n pins n instead (every pipeline that takes this size: the chain's,
+ * build_pipeline's and the expert batch's), a power of two the device allows: Mesa's ANV
+ * (Intel Meteor Lake, Mesa 26.2) took over 38 minutes to compile chain_moe.spv at the
+ * reported 32 and 72-195 s at 16, where test_vk_chain passes. */
 static int vk_pin_sg(VkPhysicalDevice phys, int has_ext) {
 #ifdef VK_EXT_subgroup_size_control
     const char *e = getenv("COLI_VK_SUBGROUP");
@@ -519,6 +523,14 @@ static int vk_pin_sg(VkPhysicalDevice phys, int has_ext) {
     VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sg};
     vkGetPhysicalDeviceProperties2(phys, &p2);
     uint32_t n = sg.subgroupSize;
+    if (e && *e) {
+        long want = strtol(e, NULL, 10);
+        if (want >= (long)sp.minSubgroupSize && want <= (long)sp.maxSubgroupSize && !(want & (want - 1)))
+            n = (uint32_t)want;
+        else
+            fprintf(stderr, "[VK] COLI_VK_SUBGROUP=%s: not a size this device allows (%u to %u); pinning %u\n",
+                    e, sp.minSubgroupSize, sp.maxSubgroupSize, n);
+    }
     if (!f.subgroupSizeControl || !(sp.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) ||
         sp.minSubgroupSize >= sp.maxSubgroupSize || n < sp.minSubgroupSize || n > sp.maxSubgroupSize || (n & (n - 1)))
         return 0;
@@ -641,27 +653,34 @@ static void up_imp_release(VkUp *u, int s) {
     u->nimp[s] = 0;
 }
 /* The host image a tier tensor is filled in (coli_vk_tier_tensor, staged uploads): aligned
- * and rounded to the device's import alignment, so up_import can copy from it in place. */
+ * and rounded to the device's import alignment, so up_import can copy from it in place.
+ * Off Windows it is aligned by hand inside a calloc'd block, whose address sits just before
+ * the image, as the path without imports allocates: posix_memalign + memset kept ~5 GiB of
+ * freed images in glibc's arenas over a prompt (pure Vulkan, V4 Flash REAP: anon 45.4 GiB
+ * against 40.3 this way), past what the host pool's sizing leaves the engine. */
 static uint8_t *up_img_alloc(int dev, size_t bytes, uint8_t *aligned) {
     size_t al = g_up[dev].imp_align;
     *aligned = al != 0;
     if (!al) return calloc(1, bytes);
-    void *p = NULL;
     size_t sz = (bytes + al - 1) / al * al;
 #ifdef _WIN32
-    p = _aligned_malloc(sz, al);
-#else
-    if (posix_memalign(&p, al, sz)) p = NULL;
-#endif
+    void *p = _aligned_malloc(sz, al);
     if (p) memset(p, 0, sz);
     return p;
+#else
+    uint8_t *raw = calloc(1, sz + al + sizeof(void *));
+    if (!raw) return NULL;
+    uint8_t *p = (uint8_t *)(((uintptr_t)raw + sizeof(void *) + al - 1) / al * al);
+    memcpy(p - sizeof(void *), &raw, sizeof raw);
+    return p;
+#endif
 }
 static void up_img_free(uint8_t *p, int aligned) {
     if (!p) return;
 #ifdef _WIN32
     if (aligned) { _aligned_free(p); return; }
 #else
-    (void)aligned;
+    if (aligned) { void *raw; memcpy(&raw, p - sizeof(void *), sizeof raw); free(raw); return; }
 #endif
     free(p);
 }

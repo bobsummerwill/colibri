@@ -4,7 +4,8 @@
  * embedding and the model's row in, the input norms, fc, the input norm, k and v, the k norm
  * and RoPE, the K/V row into the head's own device cache); a draft row is one frame waited
  * for (q, attention over that cache, o, the residual, the shared expert, the routing and the
- * routed experts through cc_route and cc_moe, their rank-order sum, mtp.norm and lm_head).
+ * routed experts through cc_route and cc_moe, their rank-order sum, mtp.norm, lm_head and,
+ * with no listed vocabulary and no Q36_MTP_DUMP, cc_pick: the draft's id and probability).
  * The output after mtp.norm stays on the device for a deeper draft.
  *
  * The head's routed experts are uploaded once as the CUDA tier's formats (int8 rows, or int4
@@ -14,9 +15,10 @@
  * form, device memory) stays off under the CUDA chain: beside the card the CPU's head costs
  * about half a decode step a draft. */
 typedef struct {
-    int on, failed, cap, fmt, gs;
+    int on, failed, cap, fmt, gs, pick_dev, vids_n;
+    uint64_t vids_gen;
     CcBuf *prm, *emb, *hin, *cat, *x, *nrm, *q, *k, *v, *ctx, *tmp, *cs, *kc, *vc;
-    CcBuf *lg, *gsb, *us, *hs, *sd, *sg, *ids, *wt, *rt, *fin, *hid, *outd, *tab, *mh;
+    CcBuf *lg, *gsb, *us, *hs, *sd, *sg, *ids, *wt, *rt, *fin, *hid, *outd, *pick, *vids, *tab, *mh;
     ColiCudaTensor *eh, *lq, *lk, *lv, *lo, *shg, *shu, *shd, *rq, *sq, *lm, **ex;
     size_t o_en, o_hn, o_in, o_post, o_qn, o_kn, o_head;
 } Q36MtpCuda;
@@ -98,19 +100,30 @@ static int q36_mc_init(Model *m) {
     ok = ok && cc_reserve(&g->tab, (size_t)E * sizeof(CcExpert), CC_DEV) && cc_begin() &&
          cc_write(g->tab, 0, tab, (size_t)E * sizeof(CcExpert)) && cc_submit(1);
     free(tab);
-    ok = ok && q36_mc_res(&g->lg, E, CC_DEV) && q36_mc_res(&g->gsb, Ish, CC_DEV) && q36_mc_res(&g->us, Ish, CC_DEV) &&
+    const char *dmp = getenv("Q36_MTP_DUMP");
+    if (p->voc && !(cc_matmul_rows_ready() && cc_pick_ready())) {   /* an older backend: the whole vocabulary */
+        fprintf(stderr, "[mtp] the CUDA backend cannot score a row list (no matmul_rows): the head scores the whole "
+                        "vocabulary\n");
+        draft_vocab_free(p->voc); p->voc = NULL;
+    }
+    g->pick_dev = !p->vid && !(dmp && *dmp) && cc_pick_ready();   /* the adaptive list too (never with a dump) */
+    ok = ok && (!p->voc || q36_mc_res(&g->vids, c->vocab, CC_DEV)) &&
+         q36_mc_res(&g->lg, E, CC_DEV) && q36_mc_res(&g->gsb, Ish, CC_DEV) && q36_mc_res(&g->us, Ish, CC_DEV) &&
          q36_mc_res(&g->hs, Ish, CC_DEV) && q36_mc_res(&g->sd, D, CC_DEV) && q36_mc_res(&g->sg, 1, CC_DEV) &&
          q36_mc_res(&g->ids, K, CC_DEV) && q36_mc_res(&g->wt, K, CC_DEV) && q36_mc_res(&g->rt, D, CC_DEV) &&
          q36_mc_res(&g->mh, cc_moe_hid_floats(1, K, D, I, E), CC_DEV) && q36_mc_res(&g->fin, D, CC_DEV) &&
-         q36_mc_res(&g->hid, D, CC_DEV) && q36_mc_res(&g->outd, p->nvoc ? p->nvoc : c->vocab, CC_DOWN);
+         q36_mc_res(&g->hid, D, CC_DEV) &&
+         q36_mc_res(&g->outd, p->nvoc ? p->nvoc : c->vocab, g->pick_dev ? CC_DEV : CC_DOWN) &&
+         (!g->pick_dev || q36_mc_res(&g->pick, 2, CC_DOWN));
     if (!ok) {
         fprintf(stderr, "[mtp] the head does not fit the CUDA chain's device (an expert format, the f16 dense form or "
                         "device memory): it stays off\n");
         return 0;
     }
+    g->vids_n = 0; g->vids_gen = 0;
     g->failed = 0; g->on = 1;
     fprintf(stderr, "[mtp] the head runs on the CUDA chain's device, its experts in the frame (format %d)%s\n", g->fmt,
-            p->vid ? ", drafts score a listed vocabulary" : "");
+            p->voc ? ", drafts score an adaptive vocabulary" : p->vid ? ", drafts score a listed vocabulary" : "");
     return 1;
 }
 /* scratch for R rows, the head's device KV cache at the model's row stride */
@@ -186,15 +199,25 @@ static int q36_mc_kv_rows(Model *m, const int *tok, const float *hid, int R, int
     g_q36_mtp.kv_rows += (unsigned long long)R; g_q36_mtp.kv_ms += (now_s() - t0) * 1e3;
     return ok;
 }
-/* a draft row at pos: its logits into `logits` (the vocabulary, or the listed ids' with the
- * rest -inf); its output after mtp.norm stays on the device for a deeper draft */
+/* a draft row at pos. Its draft id and probability picked on the device (pick_dev: the whole
+ * vocabulary or the adaptive list, no Q36_MTP_VOCAB_IDS, no Q36_MTP_DUMP), or its logits brought
+ * down: the listed ids' (picked here) or the vocabulary's into `logits`. Its output after mtp.norm
+ * stays on the device for a deeper draft */
 static int q36_mc_row(Model *m, int tok, const float *hid, int pos, float *logits) {
     Q36MtpCuda *g = &g_q36_mc; Q36Mtp *p = &g_q36_mtp; Cfg *c = &m->c;
     int D = c->hidden, H = c->q_heads, KV = c->kv_heads, hd = c->head_dim, qdim = c->q_head_dim;
     int qo = H * qdim, half = c->rotary_dim / 2, gate_dim = qdim > hd ? qdim - hd : 0;
-    int E = p->E, K = p->K, I = p->I, Ish = p->ish, V = p->nvoc ? p->nvoc : c->vocab;
+    int E = p->E, K = p->K, I = p->I, Ish = p->ish, V = p->voc ? p->voc->list_n : p->nvoc ? p->nvoc : c->vocab;
     double t0 = now_s();
     if (!q36_mc_bufs(m, 1) || !cc_begin()) return 0;
+    int vok = 1;
+    if (p->voc) {   /* the device's copy of the list: all of it after a rebuild, else the ids appended since */
+        const int *l = p->voc->list;
+        if (g->vids_gen != p->voc_gen) vok = cc_write(g->vids, 0, l, (size_t)V * sizeof(int));
+        else if (V > g->vids_n)
+            vok = cc_write(g->vids, (size_t)g->vids_n, l + g->vids_n, (size_t)(V - g->vids_n) * sizeof(int));
+        g->vids_gen = p->voc_gen; g->vids_n = V;
+    }
     CcNorm qn = {H, hd, H, 0, qo, qdim, 0, qo, qdim, (int)g->o_qn, 0, CC_NORM_ADD1, c->eps, 1.f};
     CcRope qr = {H, H, 0, qo, qdim, half, 0, 2 * half};
     CcAttn a = {1, H, KV, hd, pos, g->cap, 0, qo, qdim, hd, qo, qdim, gate_dim > 0, 0, H * hd, 0, 0, 1.f / sqrtf((float)hd), 0, 0};
@@ -205,7 +228,7 @@ static int q36_mc_row(Model *m, int tok, const float *hid, int pos, float *logit
     CcMoe mp = {.S = 1, .K = K, .D = D, .I = I, .fmt = g->fmt, .gs = g->gs, .act = 0, .parts = 3,
                 .x_row = D, .i_row = K, .w_row = K, .y_row = D, .h_off = -1, .E = E};
     CcEw cb1 = {CC_EW_COMBINE, D, D, 1, 1 | 2 | 4, 1, 0, 0, 0, 0, 0, 1.f};
-    int ok = q36_mc_input(m, &tok, hid, 1, pos) &&
+    int ok = vok && q36_mc_input(m, &tok, hid, 1, pos) &&
              cc_matmul(g->lq, g->nrm, 0, g->q, 0, 1) &&
              cc_norm(g->q, g->prm, g->q, &qn) && (!half || cc_rope(g->q, g->cs, &qr)) &&
              cc_attn(g->q, g->kc, g->vc, g->ctx, g->q, NULL, &a) &&
@@ -220,10 +243,15 @@ static int q36_mc_row(Model *m, int tok, const float *hid, int pos, float *logit
              cc_moe(g->tab, g->nrm, g->ids, g->wt, g->mh, g->rt, NULL, &mp) &&
              cc_ew(g->x, g->x, g->rt, g->sd, g->sg, &cb1) &&
              q36_mc_norm(g->x, 0, D, g->o_head, g->fin, 0, D, 1, D, c->eps) && cc_copy(g->hid, 0, g->fin, 0, D) &&
-             cc_matmul(g->lm, g->fin, 0, g->outd, 0, 1) && cc_submit(1);
+             (p->voc ? cc_matmul_rows(g->lm, g->vids, g->fin, g->outd, V) : cc_matmul(g->lm, g->fin, 0, g->outd, 0, 1)) &&
+             (!g->pick_dev || cc_pick(g->outd, g->pick, V)) && cc_submit(1);
     if (!ok) return 0;
-    const float *o = cc_ptr(g->outd);
-    if (p->vid) {   /* the listed ids' scores, every other id out (as the Vulkan head) */
+    if (g->pick_dev) {   /* the vocabulary stays in VRAM; only the draft id and its probability cross */
+        const void *pk = cc_ptr(g->pick);
+        int b = ((const int *)pk)[0];
+        p->pick_id = p->voc ? p->voc->list[b] : b; p->last_p = ((const float *)pk)[1]; p->pick_ok = 1;
+    } else if (p->vid) {   /* the listed ids' scores, every other id out (as the Vulkan head) */
+        const float *o = cc_ptr(g->outd);
         if (getenv("Q36_MTP_DUMP")) {
             for (int i = 0; i < c->vocab; i++) logits[i] = -INFINITY;
             for (int j = 0; j < V; j++) logits[p->vid[j]] = o[j];
@@ -237,6 +265,7 @@ static int q36_mc_row(Model *m, int tok, const float *hid, int pos, float *logit
         }
         p->pick_id = p->vid[b]; p->last_p = z > 0 ? (float)(1.0 / z) : 0.f; p->pick_ok = 1;
     } else {
+        const float *o = cc_ptr(g->outd);
         memcpy(logits, o, (size_t)V * 4);
         for (int i = V; i < c->vocab; i++) logits[i] = -INFINITY;
     }
