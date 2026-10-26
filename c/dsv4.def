@@ -98,3 +98,4 @@ EXPORTS
     dsv4_cuda_upload_compressor
     dsv4_cuda_compressor_project
     dsv4_cuda_indexer_prepare
+    dsv4_cuda_wo_decode
