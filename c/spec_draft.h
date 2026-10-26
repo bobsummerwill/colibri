@@ -32,12 +32,13 @@
  *                 of its own token) passes them to spec_gate_pick_p, which picks the depth
  *                 from them instead of the running averages: a_j above is then the
  *                 acceptance the gate measured for drafts given that estimate (SPEC_PBINS
- *                 bins of p, each starting at the bin's own p, worth two verifies). A step
+ *                 bins of p, each starting at the bin's own p, worth two verifies), and
+ *                 cost(k) leaves out d: those drafts are already written. A step
  *                 whose drafts are sure verifies deeper, a doubtful one stops early or takes
  *                 a plain step (DeepSeek's "confidence-scheduled verification").
  *                 spec_gate_deeper_p says, while a source drafts one at a time, whether
- *                 the newest draft is worth its verify row: when it is not, a deeper draft
- *                 (no likelier) is not worth writing.
+ *                 the drafts written so far leave room for another: not when a shorter
+ *                 verify is already worth more, or when no next draft could pass.
  *
  * Neither ever changes a token: every proposal goes through the engine's verify, which
  * keeps exactly what plain decoding produces. They change how many forwards that takes.
@@ -175,14 +176,13 @@ static inline double spec_gate_value(const SpecGate *g, int src, int k, double *
     return k > 0 ? e / cost : 1.0;
 }
 
-/* The value of a verify of k drafts whose acceptances are a[0..k) (each given the ones
- * before it stood). */
+/* The value of a verify of k drafts already made, whose acceptances are a[0..k) (each
+ * given the ones before it stood): their draft cost is already spent. */
 static inline double spec_gate_value_a(const SpecGate *g, int src, int k, const double *a) {
+    (void)src;
     double e = 1.0, q = 1.0;
     for (int j = 0; j < k && j < SPEC_MAX_DRAFTS; j++) { q *= a[j]; e += q; }
-    double cost = spec_gate_rows_cost(g, k + 1);
-    if (k > 1 && g->d_w[src] > 0.0 && g->t_w[1] > 0.0 && g->t[1] > 0.0) cost += (k - 1) * g->d[src] / g->t[1];
-    return k > 0 ? e / cost : 1.0;
+    return k > 0 ? e / spec_gate_rows_cost(g, k + 1) : 1.0;
 }
 
 /* spec_gate_pick for drafts already made, with the source's estimate p[j] for each of the
@@ -210,17 +210,20 @@ static inline int spec_gate_pick_p(SpecGate *g, int src, int maxk, const float *
     return best;
 }
 
-/* Whether the newest of n drafts already written is worth its verify row, from their
- * estimates p[0..n): when a shorter verify is worth more, a deeper draft (its acceptance
- * no higher than this one's) is not worth writing. 1 with the gate off or no estimates. */
+/* Whether another draft past the n already written is worth writing, from their
+ * estimates p[0..n): not when a shorter verify is already worth more than n, or when
+ * even a top-bin next draft would not beat n (or a plain step). 1 with the gate off
+ * or no estimates. */
 static inline int spec_gate_deeper_p(const SpecGate *g, int src, int n, const float *p) {
-    if (g->off || !p || n <= 1 || src < 0 || src >= SPEC_NSRC) return 1;
-    if (n > SPEC_MAX_DRAFTS) return 0;
+    if (g->off || !p || n < 1 || src < 0 || src >= SPEC_NSRC) return 1;
+    if (n >= SPEC_MAX_DRAFTS) return 0;
     double a[SPEC_MAX_DRAFTS] = {0};
     for (int j = 0; j < n; j++) { if (p[j] < 0.0f) return 1; a[j] = spec_gate_p_rate(g, src, p[j]); }
     double vn = spec_gate_value_a(g, src, n, a);
     for (int k = 1; k < n; k++) if (spec_gate_value_a(g, src, k, a) > vn) return 0;
-    return 1;
+    for (int b = 0; b < SPEC_PBINS; b++) if (g->pb[src][b] > a[n]) a[n] = g->pb[src][b];
+    double v = spec_gate_value_a(g, src, n + 1, a);
+    return v > 1.0 && v > vn;
 }
 
 /* How many of the up to maxk drafts src can offer the next verify should carry: 0 for a

@@ -170,6 +170,23 @@ The probability is then conditional on this vocabulary. Verification still
 uses the model's full vocabulary. Scores over 20 below the best are omitted
 from the float probability sum.
 
+`Q36_MTP_VOCAB=N` has the head score a list of the most used tokens instead
+(`draft_vocab.h`, the list of Qwen3.8's head): the `N` tokens with the highest
+counts, every token with at least 3/4 of the count of the `N`-th, and every
+token of the conversation; a token the conversation uses outside the list joins
+it at once. The counts come from `<model>/.coli_vocab` (`COLI_VOCAB_USAGE` names
+another file), halve every 1,024 counted tokens and are written back at exit
+unless `USAGE_SAVE=0`; while fewer than `N` tokens have a count, the lowest ids
+fill the list. Where the head drafts on the CUDA chain the list is on by default
+with `N` = 16000; elsewhere it is asked for, and `Q36_MTP_VOCAB=0` always scores
+the whole vocabulary (`N` must be an integer from 0 to the vocabulary's
+size). It stays off with the Vulkan chain and with `Q36_MTP_DUMP`, and
+`Q36_MTP_VOCAB_IDS` takes precedence. A draft can only be a listed token, and
+its probability is conditional on the list: with two or more drafts that is
+what `Q36_MTP_PMIN` and `Q36_MTP_PSTEP` read. A qwen36 engine stopped by a
+signal does not write the counts, nor one whose head turned off during the run
+(`[mtp] ... it stays off`); `coli serve` closes its input first, so it does.
+
 With the Vulkan chain the head runs on the device: its layer, its routing and its
 routed experts through the chain's device MoE, one frame a draft. `Q36_MTP_GPU=0`
 keeps the head on the CPU, and so does `Q36_MTP_DMOE=0` or a device without the
@@ -179,10 +196,17 @@ uploaded once as the tier's int8 or int4-g64 and read from an expert table of th
 addresses). There a head that cannot go on the device stays off: beside the card the
 CPU's head cost 5.1 ms a draft row and decode fell from 98 to 85-88 tok/s. Under a
 CUDA tier holding part of the experts there are no speculative steps, and `Q36_MTP=1`
-leaves the head off and says so.
+leaves the head off and says so. On the CUDA chain the head also picks its draft and the
+draft's probability on the device (`cc_pick`): 8 bytes come down a draft, not the
+vocabulary's logits. `Q36_MTP_VOCAB_IDS` and `Q36_MTP_DUMP` keep the scores coming down.
+With the `Q36_MTP_VOCAB` list the head reads only the listed rows of the `lm_head`
+already on the card (`cc_matmul_rows`), not the whole matrix; the card keeps a copy
+of the list, sent whole after a rebuild and by its new ids after an append. A
+backend without `matmul_rows` scores the whole vocabulary.
 
-Measured on an RTX PRO 4000 (Qwen3.6-35B-A3B int4-g64, `coli serve`, answers of 128
-tokens, two alternated rounds of three):
+Measured on an RTX PRO 4000 before the `Q36_MTP_VOCAB` list, the head scoring the
+whole vocabulary (Qwen3.6-35B-A3B int4-g64, `coli serve`, answers of 128 tokens, two
+alternated rounds of three):
 
 | `Q36_MTP_DRAFTS` | Vulkan chain | CUDA chain | drafts accepted |
 |---|---|---|---|

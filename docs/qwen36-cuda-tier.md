@@ -143,7 +143,11 @@ a byte of trunk: one DeltaNet input projection is timed both ways on the
 device that would host it (ten GEMVs, best of three rounds, after a warm-up),
 one `[place] probe:` line reports both times, and if the GPU loses the whole
 automatic placement is withdrawn (`[place] trunk stays on the CPU`) and its
-bytes go back to the expert budget before the warmstart. The experts follow
+bytes go back to the expert budget before the warmstart. On the CPU the ten
+GEMVs read the projections of ten layers, as decode reads each once a step:
+one 16 MiB projection read ten times stays in a big L3, and beside an RTX PRO
+6000 an EPYC 9B45 (three 32 MiB L3s) came within about 10% of the card that way
+and tied it under nsys. The experts follow
 (`[qtier] the experts stay on the CPU too`) when their allowance is automatic:
 the tier computes a resident expert with the same int8 GEMV and a round trip
 over PCIe, and a layer waits for its share. On a GTX 1650 Max-Q (#2211; 0.900
@@ -445,7 +449,9 @@ the Vulkan chain does (docs/vulkan.md, "The routed experts in the frame"):
   again when the tier's residency changed (`qt_chain_epoch`). The tier is held for the
   forward (`qt_chain_hold`): an eviction clears the flag at once and moves the epoch, but
   no swap writes into a resident's buffers until the forward is done.
-- A layer whose experts are all in the table has no host step. A layer with some
+- A layer whose experts are all in the table has no host step, and its route ids and
+  weights stay on the device during the frame: the ids of every layer come down in one
+  copy at its end, for the books below. A layer with some
   elsewhere (VRAM was short) signals the host once its routes and rows are down
   (`cc_signal`: a one-thread kernel writes a word of host memory after a system fence).
   The host computes the slots the table lacks as the tier's misses always were

@@ -140,10 +140,22 @@ static void test_gate_p(void) {
     CHECK(spec_gate_pick_p(&g, SPEC_SRC_MTP, 5, doubt, NULL) == 0, "doubtful drafts: a plain step");
     int k = spec_gate_pick_p(&g, SPEC_SRC_MTP, 5, mixed, NULL);
     CHECK(k == 2, "the third draft is doubtful: the first two only, got %d", k);
-    /* while drafting: the newest draft worth its row or not */
+    /* while drafting: the newest draft worth its row or not, and whether a next draft can pass */
+    CHECK(spec_gate_deeper_p(&g, SPEC_SRC_MTP, 1, mixed), "a likely first: write a second");
+    CHECK(!spec_gate_deeper_p(&g, SPEC_SRC_MTP, 1, doubt), "a doubtful first: no second can pass");
     CHECK(spec_gate_deeper_p(&g, SPEC_SRC_MTP, 2, mixed), "two likely drafts: write a third");
     CHECK(!spec_gate_deeper_p(&g, SPEC_SRC_MTP, 3, mixed), "a doubtful third: no fourth");
-    CHECK(spec_gate_deeper_p(&g, SPEC_SRC_MTP, 1, doubt), "one draft: the depth's call is not this one's");
+    /* draft cost is already spent when spec_gate_pick_p judges the drafts in hand */
+    spec_gate_draft_cost(&g, SPEC_SRC_MTP, 0.5);
+    CHECK(spec_gate_pick_p(&g, SPEC_SRC_MTP, 5, mixed, NULL) == 2, "spent draft cost does not shrink pick_p");
+    /* the next draft, as likely as the best bin, must beat both n drafts and a plain step */
+    const float edge[1] = {0.35f}, mid[1] = {0.55f}, low[1] = {0.45f};
+    CHECK(!spec_gate_deeper_p(&g, SPEC_SRC_MTP, 1, edge), "a second draft beats a plain step, not one draft: none");
+    CHECK(spec_gate_deeper_p(&g, SPEC_SRC_MTP, 1, mid), "a middling first: a second from the best bin can pass");
+    SpecGate h; spec_gate_init(&h, 0);   /* two rows cost almost what three do */
+    spec_gate_forward(&h, 1, 1.0);
+    for (int i = 0; i < 4; i++) { spec_gate_forward(&h, 2, 1.9); spec_gate_forward(&h, 3, 2.0); }
+    CHECK(!spec_gate_deeper_p(&h, SPEC_SRC_MTP, 1, low), "a second draft beats one draft, not a plain step: none");
     const float unknown[3] = {0.9f, -1.0f, 0.9f};
     CHECK(spec_gate_deeper_p(&g, SPEC_SRC_MTP, 3, unknown), "an estimate missing: keep drafting");
     /* the bins learn: drafts the source calls sure that fail drag their bin down */

@@ -261,6 +261,13 @@ typedef struct ColiCudaChainOps {
      * rounded to float16 as ew's CC_EW_F16 rounds them: a float16 KV cache's new K and V rows
      * in one launch, the bits of rope and two ew (qwen36_cuda_chain.h); absent: those three */
     int  (*rope_f16)(CcBuf *x, CcBuf *v, CcBuf *cs, const CcRope *p, int seg);
+    /* pick: the argmax (lowest index on a tie) of n logits in `logits` into word 0 of `out`
+     * (an int) and its softmax probability (terms within 20 of the maximum) into word 1 (a
+     * float): an MTP head's draft token and confidence without copying the vocabulary down */
+    int  (*pick)(CcBuf *logits, CcBuf *out, int n);
+    /* matmul_rows: y[0..n) = the rows ids[0..n) of a resident tensor (fmt 0 or 1, one input
+     * row x[I]); an MTP head's adaptive draft vocabulary scored from the model's lm_head */
+    int  (*matmul_rows)(ColiCudaTensor *t, CcBuf *ids, CcBuf *x, CcBuf *y, int n);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -345,6 +352,20 @@ static inline int cc_rope_f16(CcBuf *x, CcBuf *v, CcBuf *cs, const CcRope *p, in
 static inline int cc_muse_ready(void) {
     const ColiCudaChainOps *t = cc_ops();
     return t && t->size >= offsetof(ColiCudaChainOps, muse) + sizeof t->muse && t->muse && t->muse();
+}
+static inline int cc_pick_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, pick) + sizeof t->pick && t->pick;
+}
+static inline int cc_pick(CcBuf *logits, CcBuf *out, int n) {
+    return cc_pick_ready() ? cc_ops()->pick(logits, out, n) : 0;
+}
+static inline int cc_matmul_rows_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, matmul_rows) + sizeof t->matmul_rows && t->matmul_rows;
+}
+static inline int cc_matmul_rows(ColiCudaTensor *w, CcBuf *ids, CcBuf *x, CcBuf *y, int n) {
+    return cc_matmul_rows_ready() ? cc_ops()->matmul_rows(w, ids, x, y, n) : 0;
 }
 #endif
 

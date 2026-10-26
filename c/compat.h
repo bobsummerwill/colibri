@@ -661,6 +661,138 @@ static inline void coli_print_launcher_help(const char *engine, const char *by_h
 #include <sys/sysctl.h>
 #endif
 #include <unistd.h>
+#include <stdio.h>
+
+/* --- the cgroup's room: in a container its limit is the RAM there is -------
+ * /proc/meminfo shows the whole machine, and a container started with a
+ * memory limit is killed at that limit however much the machine has free (a
+ * Vast.ai container with an RTX PRO 4000: MemAvailable 195.7 GiB, memory.max
+ * 120.7 GiB). This is resource_plan.py memory_available's walk without
+ * mountinfo, smaller: every cgroup from the process's own (/proc/self/cgroup)
+ * up to the mount's root, in v2 (memory.max, memory.current) or, where v2
+ * shows none, in v1 (memory.limit_in_bytes, memory.usage_in_bytes, under
+ * <root>/memory). A cgroup's room is its limit minus its usage, plus its file
+ * cache (memory.stat's inactive and active file pages): the kernel takes the
+ * cache back before it kills, and MemAvailable counts it as free too. The
+ * planner adds only the inactive pages; here an engine that has read its model
+ * would see its own cache as spent. A file that does not parse adds nothing.
+ * Returns 1, with the tightest finite limit and room in bytes, when the walk
+ * finds a limit, else 0. The paths are parameters for
+ * tests/test_compat_cgroup.c. compat_meminfo_gb takes the smaller of the
+ * machine's and the cgroup's, for the total and the available. */
+static inline int compat_cg_read(const char *path, char *buf, size_t n){
+    FILE *f = fopen(path, "r");
+    if(!f) return -1;
+    size_t k = fread(buf, 1, n - 1, f);
+    fclose(f);
+    buf[k] = 0;
+    return (int)k;
+}
+/* a counter as the kernel writes it: digits, then a newline or the end */
+static inline int compat_cg_u64(const char *s, uint64_t *v){
+    uint64_t x = 0; int d = 0;
+    for(; *s >= '0' && *s <= '9'; s++, d++){
+        if(x > (UINT64_MAX - (uint64_t)(*s - '0')) / 10) return 0;
+        x = x * 10 + (uint64_t)(*s - '0');
+    }
+    if(!d || (*s && *s != '\n')) return 0;
+    *v = x;
+    return 1;
+}
+/* 1 when dir has both controls; *lim and *room (UINT64_MAX: none yet) keep the
+ * tighter of theirs and this cgroup's, and an unlimited one changes neither */
+static inline int compat_cg_pair(const char *dir, int v1, uint64_t *lim, uint64_t *room){
+    char p[1400], a[64], b[64];
+    snprintf(p, sizeof p, "%s/%s", dir, v1 ? "memory.limit_in_bytes" : "memory.max");
+    int la = compat_cg_read(p, a, sizeof a);
+    snprintf(p, sizeof p, "%s/%s", dir, v1 ? "memory.usage_in_bytes" : "memory.current");
+    int lb = compat_cg_read(p, b, sizeof b);
+    uint64_t l, cur;
+    if(la < 0 || lb < 0 || !compat_cg_u64(b, &cur)) return la >= 0 && lb >= 0;
+    if(!compat_cg_u64(a, &l) || (v1 && l >= (1ull << 60))) return 1;   /* v2 "max"; v1's unlimited sits near 2^63 */
+    uint64_t ina = 0, act = 0;   /* the file cache, inactive and active */
+    snprintf(p, sizeof p, "%s/memory.stat", dir);
+    FILE *f = fopen(p, "r");
+    if(f){
+        const char *ki = v1 ? "total_inactive_file " : "inactive_file ";
+        const char *ka = v1 ? "total_active_file " : "active_file ";
+        size_t ni = strlen(ki), na = strlen(ka);
+        char ln[256]; int gi = 0, ga = 0;
+        while((!gi || !ga) && fgets(ln, sizeof ln, f)){
+            if(!gi && !strncmp(ln, ki, ni)) gi = compat_cg_u64(ln + ni, &ina);
+            if(!ga && !strncmp(ln, ka, na)) ga = compat_cg_u64(ln + na, &act);
+        }
+        fclose(f);
+    }
+    uint64_t ws = cur > ina ? cur - ina : 0;   /* what the kernel cannot take back */
+    ws = ws > act ? ws - act : 0;
+    uint64_t r = l > ws ? l - ws : 0;
+    if(l < *lim) *lim = l;
+    if(r < *room) *room = r;
+    return 1;
+}
+/* a ".." in the path: a cgroup outside this one's namespace (a Colab VM:
+ * 0::/../../jupyter-children), whose ancestors the mount does not show; the
+ * planner refuses it, and here nothing is read */
+static inline int compat_cg_outside(const char *p){
+    for(const char *s = p; (s = strstr(s, "/..")) != NULL; s += 3)
+        if(s[3] == '/' || s[3] == 0) return 1;
+    return 0;
+}
+/* the walk from the leaf up to root: a leaf the mount does not show (a runtime
+ * that mounts the process's own cgroup at the root) adds nothing */
+static inline int compat_cg_walk(const char *root, const char *member, int v1, uint64_t *lim, uint64_t *room){
+    char dir[1300]; int seen = 0;
+    if(snprintf(dir, sizeof dir, "%s%s", root, member) >= (int)sizeof dir) return 0;
+    size_t base = strlen(root);
+    for(int i = 0; i < 64; i++){
+        seen |= compat_cg_pair(dir, v1, lim, room);
+        char *s = strrchr(dir + base, '/');
+        if(!s) break;
+        *s = 0;
+    }
+    return seen;
+}
+static inline int compat_cgroup_room(const char *root, const char *proc_cgroup, uint64_t *limit, uint64_t *room){
+    char buf[8192], v2[1024] = "", v1[1024] = "";
+    int has2 = 0, has1 = 0;
+    uint64_t lim = UINT64_MAX, rm = UINT64_MAX;
+    *limit = *room = 0;
+    if(compat_cg_read(proc_cgroup, buf, sizeof buf) <= 0) return 0;
+    /* hierarchy:controllers:path, a line each; v2's is 0 with no controllers */
+    for(char *ln = buf; ln && *ln; ){
+        char *nl = strchr(ln, '\n'); if(nl) *nl = 0;
+        char *c1 = strchr(ln, ':'), *c2 = c1 ? strchr(c1 + 1, ':') : NULL;
+        if(c2 && c2[1] == '/' && strlen(c2 + 1) < sizeof v2){
+            *c1 = *c2 = 0;
+            if(!strcmp(ln, "0") && !c1[1]){ strcpy(v2, c2 + 1); has2 = 1; }
+            for(const char *t = c1 + 1; *t; ){
+                size_t k = strcspn(t, ",");
+                if(k == 6 && !strncmp(t, "memory", 6)){ strcpy(v1, c2 + 1); has1 = 1; }
+                t += k + (t[k] == ',');
+            }
+        }
+        ln = nl ? nl + 1 : NULL;
+    }
+    if((has2 && compat_cg_outside(v2)) || (has1 && compat_cg_outside(v1))) return 0;
+    if(!strcmp(v2, "/")) v2[0] = 0;   /* the root: the walk is the mount's root alone */
+    if(!strcmp(v1, "/")) v1[0] = 0;
+    char r1[256];
+    if(!(has2 && compat_cg_walk(root, v2, 0, &lim, &rm)) && has1 &&
+       snprintf(r1, sizeof r1, "%s/memory", root) < (int)sizeof r1)
+        compat_cg_walk(r1, v1, 1, &lim, &rm);
+    if(lim == UINT64_MAX) return 0;
+    *limit = lim; *room = rm;
+    return 1;
+}
+
+/* the machine's numbers (GB, 0 = not measured) bounded by a cgroup's limit and room (bytes) */
+static inline void compat_cg_bound(double *total, double *avail, uint64_t lim, uint64_t room){
+    double l = lim / 1e9, r = room / 1e9;
+    if(r < 1e-9) r = 1e-9;   /* nothing left is still a measure: 0 would read as "not measurable" */
+    if(*total == 0 || l < *total) *total = l;
+    if(*avail == 0 || r < *avail) *avail = r;
+}
 
 /* Total AND available in one call, one pass.
  *
@@ -675,6 +807,9 @@ static inline void coli_print_launcher_help(const char *engine, const char *by_h
  * One pass also matters on Linux specifically: MemTotal and MemAvailable are
  * two lines of the same file, and reading it twice to get them is both a
  * second open and a second chance to read a file that changed underneath.
+ *
+ * On Linux a cgroup's limit and room bound both numbers (compat_cgroup_room),
+ * which takes a few more small reads.
  *
  * 0 means "not measurable" for either field; the caller decides the fallback. */
 static inline void compat_meminfo_gb(double *total_gb, double *avail_gb){
@@ -714,6 +849,9 @@ static inline void compat_meminfo_gb(double *total_gb, double *avail_gb){
         }
         fclose(f);
     }
+    uint64_t lim, room;   /* a container's limit (compat_cgroup_room) */
+    if(compat_cgroup_room("/sys/fs/cgroup", "/proc/self/cgroup", &lim, &room))
+        compat_cg_bound(&total, &avail, lim, room);
 #endif
     if(total_gb) *total_gb = total;
     if(avail_gb) *avail_gb = avail;

@@ -3212,7 +3212,8 @@ def _serve_cmdline_matches_port(raw, port):
     argv=[part.decode("utf-8","replace") for part in raw.split(b"\0") if part]
     try: coli_i=next(i for i,arg in enumerate(argv) if os.path.basename(arg)=="coli")
     except StopIteration: return False
-    if coli_i+1>=len(argv) or argv[coli_i+1]!="serve":
+    # `coli web` is a serve too, and the one `coli start` runs
+    if coli_i+1>=len(argv) or argv[coli_i+1] not in ("serve","web"):
         return False
     configured=8000
     for i,arg in enumerate(argv[coli_i+2:], start=coli_i+2):
@@ -3257,8 +3258,15 @@ def cmd_serve(a):
         sys.exit(f"{arch} currently supports at most {family.limits.max_kv_slots} KV slot(s)")
     # pidfile: cosi' `coli stop` spegne tutto con un comando, senza pkill a mano.
     # EN: pidfile so `coli stop` can shut everything down without manual pkill.
+    pidfile=serve_pidfile(a.port)
+    # A serve already on this port gets its pidfile back when this one ends (at once,
+    # the port being taken), or coli stop and coli status lose track of it.
     try:
-        with open(serve_pidfile(a.port),"w") as f: f.write(f"{os.getpid()} {a.model}\n")
+        with open(pidfile) as f: owner=f.read()
+        if not _pid_alive(int(owner.split()[0])): owner=None
+    except (OSError,ValueError,IndexError): owner=None
+    try:
+        with open(pidfile,"w") as f: f.write(f"{os.getpid()} {a.model}\n")
     except OSError: pass
     # and the stop request `coli stop` leaves when it cannot end this process itself.
     # The watcher ends with the serve: left running in a process that goes on (a test
@@ -3293,7 +3301,11 @@ def cmd_serve(a):
               family=family)
     finally:
         served.set()
-        try: os.unlink(serve_pidfile(a.port))
+        try:
+            with open(pidfile) as f: ours=f.read().split()[:1]==[str(os.getpid())]
+            if ours and owner:
+                with open(pidfile,"w") as f: f.write(owner)
+            elif ours: os.unlink(pidfile)
         except OSError: pass
 
 def _proc_state(pid):
@@ -3358,12 +3370,16 @@ def cmd_cluster_worker(a):
     stop_heartbeat=threading.Event()
     if coordinator:
         from cluster import heartbeat, register
-        register(coordinator, {"node_id":node_id, "host":host, "port":a.port,
-                               "role":"expert", "layers":a.layers})
+        node={"node_id":node_id, "host":host, "port":a.port, "role":"expert", "layers":a.layers}
+        register(coordinator, node)
         def keep_registered():
             while not stop_heartbeat.wait(10):
                 try: heartbeat(coordinator, node_id)
-                except OSError: pass
+                except OSError:
+                    # a restarted coordinator has an empty registry and refuses the
+                    # heartbeat of a node it does not know: register again
+                    try: register(coordinator, node)
+                    except OSError: pass
         threading.Thread(target=keep_registered, name="colibri-cluster-heartbeat", daemon=True).start()
     glm53 = resolve_model(a.model).descriptor.id == "glm53"
     e=env_for_engine(a,"glm53") if glm53 else env_for(a)
@@ -3532,7 +3548,9 @@ def cmd_web(a):
     if not os.path.exists(os.path.join(dist, "index.html")):
         print(f"{C.yel}web UI not built:{C.r} run  cd web && npm install && npm run build  first;")
         print("serving the API anyway (the dashboard will 404 until built).")
-    url = f"http://{a.host}:{a.port}/"
+    # A wildcard bind is not an address to connect to (Windows refuses 0.0.0.0).
+    shown = "127.0.0.1" if a.host in ("0.0.0.0", "") else a.host
+    url = f"http://{shown}:{a.port}/"
     if not getattr(a, "no_browser", False):
         import threading, urllib.request, webbrowser
         def opener():
@@ -3551,7 +3569,7 @@ def cmd_web(a):
             while True:
                 time.sleep(2); waited += 2
                 try:
-                    urllib.request.urlopen(f"http://{a.host}:{a.port}/health", timeout=5)
+                    urllib.request.urlopen(f"{url}health", timeout=5)
                 except OSError:
                     # Say something once, rather than looking hung. A 93-layer K3 load
                     # is 40+ minutes and the user has no way to tell waiting from stuck.

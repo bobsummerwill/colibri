@@ -192,6 +192,19 @@ class MuseGatewayTest(unittest.TestCase):
                          {"city": "Rome &amp; co", "days": 3, "units": ["C", "mm"]})
         self.assertEqual(openai_server._tool_stream_markers(), ("<atem:function_calls>",))
 
+    def test_a_nullable_string_parameter_stays_a_string(self):
+        tool = {"type": "function", "function": {"name": "lookup", "parameters": {
+            "type": "object", "properties": {"order_id": {"type": ["string", "null"]},
+                                             "note": {"type": ["string", "null"]}},
+            "required": ["order_id", "note"], "additionalProperties": False}}}
+        reply = ('<atem:function_calls>\n<atem:invoke name="lookup">\n'
+                 '<atem:parameter name="order_id">12345</atem:parameter>\n'
+                 '<atem:parameter name="note">null</atem:parameter>\n'
+                 "</atem:invoke>\n</atem:function_calls>")
+        _text, calls = openai_server.parse_arch_tool_calls(reply, [tool])
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"order_id": "12345", "note": None})
+
     def test_turn_ends_on_eot(self):
         self.assertEqual(openai_server.stop_policy({}, True)[0], openai_server.MUSE_STOP_SEQUENCES)
 

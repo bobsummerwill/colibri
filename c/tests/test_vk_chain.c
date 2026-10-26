@@ -1091,7 +1091,7 @@ static void test_mla(MlaCase c) {
     float *Wqa = c.q_lora ? malloc((size_t)c.q_lora * D * 4) : NULL, *Wqb = malloc((size_t)H * QR * qin * 4);
     float *Wkva = malloc((size_t)KR * D * 4), *Wo = malloc((size_t)D * H * V * 4);
     float *Wkvb = malloc((size_t)H * (Q + V) * K * 4), *Wk = malloc((size_t)H * K * Q * 4), *Wv = malloc((size_t)H * V * K * 4);
-    VkcMla m = {H, Q, R, V, K, D, c.q_lora, eps, scale, c.style, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0};
+    VkcMla m = {H, Q, R, V, K, D, c.q_lora, eps, scale, c.style, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0};
     if (c.q_lora) m.q_a = mk_tensor(c.fq, c.q_lora, D, 1.f / sqrtf((float)D) * 2.f, Wqa);
     m.q_b = mk_tensor(c.fq, H * QR, qin, 1.f / sqrtf((float)qin) * 2.f, Wqb);
     m.kv_a = mk_tensor(c.fkv, KR, D, 1.f / sqrtf((float)D) * 2.f, Wkva);
@@ -1214,7 +1214,7 @@ static void test_mla(MlaCase c) {
         if (plan == 2) {
             VkcMlaCache dc = {vkc_buf((size_t)ks.rows * K * 4, VKC_DEV), R ? vkc_buf((size_t)ks.rows * R * 4, VKC_DEV) : NULL, ks.rows};
             VkcMlaCache tc = {vkc_buf((size_t)S * K * 4, VKC_DEV), R ? vkc_buf((size_t)S * R * 4, VKC_DEV) : NULL, S};
-            VkcKvPart pt[2] = {{1, K, lat, 0, dc.lat, 0}, {1, R ? R : 1, rope, 0, dc.rope, 0}};
+            VkcKvPart pt[2] = {{1, K, lat, 0, dc.lat, 0, 0}, {1, R ? R : 1, rope, 0, dc.rope, 0, 0}};
             VkcBuf *ob2 = vkc_buf((size_t)S * D * 4, VKC_DEV), *dn2 = vkc_buf((size_t)S * KR * 4, VKC_DOWN);
             vkc_kv_place(&ks, 0, pb, S);
             unsigned long long sp = ks.splits;
@@ -2449,8 +2449,8 @@ static void test_kvs_gqa(int T, int step, int H, int KVH, int hd, int vd, int B,
             free(sc);
         }
         /* the engine's order: the window placed, the rows below uploaded, the new rows stored */
-        VkcKvPart pk = {kv_pm ? 1 : KVH, kv_pm ? KVH * hd : hd, Kx, (size_t)T * hd, kc, 0};
-        VkcKvPart pv = {kv_pm ? 1 : KVH, kv_pm ? KVH * vd : vd, Vx, (size_t)T * vd, vc, 0};
+        VkcKvPart pk = {kv_pm ? 1 : KVH, kv_pm ? KVH * hd : hd, Kx, (size_t)T * hd, kc, 0, 0};
+        VkcKvPart pv = {kv_pm ? 1 : KVH, kv_pm ? KVH * vd : vd, Vx, (size_t)T * vd, vc, 0, 0};
         VkcKvPart parts[2] = {pk, pv};
         vkc_kv_place(&ks, 0, pb, S);
         ok = vkc_begin() && vkc_kv_push(&ks, 0, parts, 2, pb) &&
@@ -2462,7 +2462,7 @@ static void test_kvs_gqa(int T, int step, int H, int KVH, int hd, int vd, int B,
         VkcKvGqa ga = {&ks, 0, qb, kc, vc, qb, lists ? lb : NULL, sb, ob, S, H, KVH, hd, vd, pb, win, kv_pm, sink, 3,
                        qrow, 2 * hd, gated, hd, qrow, 2 * hd, H * vd, 0, sel_row, scale,
                        Kx, Vx, kv_pm ? (size_t)hd : (size_t)T * hd, kv_pm ? (size_t)KVH * hd : (size_t)hd,
-                       kv_pm ? (size_t)vd : (size_t)T * vd, kv_pm ? (size_t)KVH * vd : (size_t)vd};
+                       kv_pm ? (size_t)vd : (size_t)T * vd, kv_pm ? (size_t)KVH * vd : (size_t)vd, 0};
         ok = ok && vkc_kv_gqa(&ga);
         if (ks.splits > sp) splits++; else fins++;
         ok = ok && vkc_submit(1);
@@ -2543,7 +2543,7 @@ static void test_kvs_mla(int T, int step, int H, int K, int R, int B, int rows, 
             }
             free(sc);
         }
-        VkcKvPart pl = {1, K, Lx, 0, lat, 0}, pr = {1, R ? R : 1, Rx, 0, rope, 0};
+        VkcKvPart pl = {1, K, Lx, 0, lat, 0, 0}, pr = {1, R ? R : 1, Rx, 0, rope, 0, 0};
         VkcKvPart parts[2] = {pl, pr};
         vkc_kv_place(&ks, li, pb, S);
         ok = vkc_begin() && vkc_kv_push(&ks, li, parts, R ? 2 : 1, pb) && vkc_write(qab, 0, q, (size_t)S * H * (K + R) * 4) &&
@@ -2552,7 +2552,7 @@ static void test_kvs_mla(int T, int step, int H, int K, int R, int B, int rows, 
              (!R || vkc_kv_store(&ks, li, &pr, nl, (size_t)S * K, (size_t)R, 0, pb, S));
         unsigned long long sp = ks.splits;
         VkcKvMla ma = {&ks, li, qab, qab, lat, rope, lists ? lb : NULL, ob, S, H, K, R, pb, kv_start,
-                       0, H * K, K, S * H * K, H * R, R, 0, H * K, K, 0, sel_row, scale, Lx, Rx, 0};
+                       0, H * K, K, S * H * K, H * R, R, 0, H * K, K, 0, sel_row, scale, Lx, Rx, 0, 0};
         ok = ok && vkc_kv_mla(&ma);
         if (ks.splits > sp) splits++;
         ok = ok && vkc_submit(1);
@@ -2627,7 +2627,7 @@ static void test_kvs_rel(int T, int step, int H, int KVH, int hd, int ext, int d
             }
             free(sc);
         }
-        VkcKvPart pk = {KVH, hd, Kx, (size_t)T * hd, kc, 0}, pv = {KVH, hd, Vx, (size_t)T * hd, vc, 0};
+        VkcKvPart pk = {KVH, hd, Kx, (size_t)T * hd, kc, 0, 0}, pv = {KVH, hd, Vx, (size_t)T * hd, vc, 0, 0};
         VkcKvPart parts[2] = {pk, pv};
         vkc_kv_place(&ks, 0, pb, S);
         memcpy(vkc_ptr(tb), tau, (size_t)(S + 2) * 4);
@@ -2715,7 +2715,7 @@ static void test_kvs_ds(int S, int H, int hd, int nwin, int ncmp, int cnt, int v
         if (r != 2) { vkc_kv_free(&ks); continue; }
         if (pass) { ks.nw = ks.ns; ks.np = 0; }        /* every block in the window */
         VkcBuf *dc = vkc_buf((size_t)ks.rows * hd * 4, VKC_DEV);
-        VkcKvPart pc = {1, hd, cmp, 0, dc, 0};
+        VkcKvPart pc = {1, hd, cmp, 0, dc, 0, 0};
         vkc_kv_place(&ks, 0, ncmp - 1, 1);
         unsigned long long sp = ks.splits;
         ok = vkc_kv_parts(&ks, (size_t)S * H * (hd + 2)) && vkc_begin() && vkc_kv_push(&ks, 0, &pc, 1, ncmp);
@@ -3538,7 +3538,7 @@ static void bench_xb(void) {
             for (int m = 0; m < 3 && good; m++)
                 good = coli_vk_tensor_info(t[e * 3 + m], &ti[m]) && (r[m] = coli_vk_tensor_host_rows(t[e * 3 + m], NULL)) != NULL;
             if (good) hv[e] = (VktHostExpert){r[0], r[1], r[2], ti[0].fmt - 100, ti[2].fmt - 100,
-                                              (size_t)ti[0].rowWords * 4, (size_t)ti[2].rowWords * 4};
+                                              (size_t)ti[0].rowWords * 4, (size_t)ti[2].rowWords * 4, NULL, NULL, NULL, 0, 0};
         }
         double best = 1e9;
         for (int r = -1; r < 3 && good; r++) {

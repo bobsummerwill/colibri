@@ -1842,6 +1842,10 @@ tests/test_qwen36_tok_merges$(EXE): tests/test_qwen36_tok_merges.c qwen36.c $(QW
 tests/test_qwen36_eos$(EXE): tests/test_qwen36_eos.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
+# The MTP head's depth: the plain step that keeps T(1) measured, only where the trim reads it.
+tests/test_qwen36_mtp_depth$(EXE): tests/test_qwen36_mtp_depth.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
 # A byte-counted serving payload may end mid-character; the pre-tokenizer must
 # not read past it.  qwen38 already gates this (tests/test_qwen38_tokenizer.c).
 tests/test_qwen36_tok_truncated$(EXE): tests/test_qwen36_tok_truncated.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
@@ -2165,6 +2169,9 @@ tests/test_st_overlay$(EXE): tests/test_st_overlay.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_compat_mem$(EXE): tests/test_compat_mem.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_compat_cgroup$(EXE): tests/test_compat_cgroup.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_st_missing$(EXE): tests/test_st_missing.c

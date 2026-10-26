@@ -44,6 +44,7 @@
 #define Q38CC_HOST 0
 #define Q38CC_DEV  1
 #define Q38CC_BOTH 2
+#define Q38CC_PROMO_WIN 64   /* frames the brake looks back on (q38cc_braked) */
 
 typedef struct {
     int ok, failed, rows, cap, dev;
@@ -92,6 +93,11 @@ typedef struct {
     unsigned rng;
     unsigned long long promos, promo_victims;
     unsigned long long pool_reads;   /* slots a step's table read from the pool */
+    /* the brake (q38cc_braked): the routes and pool reads of the last Q38CC_PROMO_WIN frames;
+     * at promo_hits percent on the card or more nothing moves (the baselines: the counters at
+     * the last frame that was looked at) */
+    int promo_hits, pr_wi, pr_wn; unsigned pr_wroute[Q38CC_PROMO_WIN], pr_wmiss[Q38CC_PROMO_WIN];
+    unsigned long long routes, pr_routes0, pr_reads0, pr_braked;
 } Q38CChain;
 static Q38CChain *q38cc_of(Model *m) { return (Q38CChain *)m->cchain; }
 static int q38cc_dm_able(Q38CChain *ch, Model *m);
@@ -863,10 +869,39 @@ static int q38cc_pool_entry(Q38CChain *ch, Model *m, int i, int k, CcExpert *x) 
  * points to, and its entry turns to the slot once they landed. The warm start's set comes
  * from the history: a conversation on another topic found 69.5% of its experts there
  * (Qwen3.8-Flash-Next IQ2_XS on a 24 GB card, a story; simulated over its routes, 32 a
- * forward: 95%). COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set, =n sets the rate. */
-#define Q38CC_PROMOTE 32
+ * forward: 95%). COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set, =n sets the rate.
+ * The brake, like qwen36's (the same knob) but over every frame, a prompt chunk weighing its
+ * rows (qwen36's window leaves those out): where the last Q38CC_PROMO_WIN frames found at least
+ * COLI_CUDA_CHAIN_PROMOTE_HITS percent (90) of their routes on the card, the frame promotes
+ * nothing -- a conversation the history fits pays for every swap (the newcomer's bytes on the
+ * bus, a resident the history still routes to back to the pool) and gains little. 0 brakes
+ * never. UD-Q2_K_XL on an RTX PRO 4000, 128 tokens, 32 a forward without the brake against 128
+ * with it: code after a prose history 30.5 -> 42.2 tok/s (58% of its routes on the card),
+ * with the MTP head 30.7 -> 39.9; the prose that wrote the history 52.1 -> 52.7 (98%, the
+ * brake held in every frame; 128 without it: 51.9 -> 48.8). */
+#define Q38CC_PROMOTE 128
+#define Q38CC_PROMO_HITS 90
 #define Q38CC_DECAY 1024
 static int q38cc_promote_rate(void) { const char *e = getenv("COLI_CUDA_CHAIN_PROMOTE"); return e && *e ? atoi(e) : Q38CC_PROMOTE; }
+static int q38cc_promote_hits(void) {
+    const char *e = getenv("COLI_CUDA_CHAIN_PROMOTE_HITS"); int h = e && *e ? atoi(e) : Q38CC_PROMO_HITS;
+    return h < 0 ? 0 : h > 100 ? 100 : h;
+}
+/* the frame's routes and pool reads into the window; 1 when the brake holds: the last
+ * Q38CC_PROMO_WIN frames (this one among them) found promo_hits percent or more of their
+ * routes on the card */
+static int q38cc_braked(Q38CChain *ch) {
+    unsigned route = (unsigned)(ch->routes - ch->pr_routes0), miss = (unsigned)(ch->pool_reads - ch->pr_reads0);
+    ch->pr_routes0 = ch->routes; ch->pr_reads0 = ch->pool_reads;
+    ch->pr_wroute[ch->pr_wi] = route; ch->pr_wmiss[ch->pr_wi] = miss;
+    ch->pr_wi = (ch->pr_wi + 1) % Q38CC_PROMO_WIN; if (ch->pr_wn < Q38CC_PROMO_WIN) ch->pr_wn++;
+    if (ch->promo_hits <= 0) return 0;
+    unsigned long long wr = 0, wm = 0;
+    for (int j = 0; j < ch->pr_wn; j++) { wr += ch->pr_wroute[j]; wm += ch->pr_wmiss[j]; }
+    if (!wr || (wr - wm) * 100 < (unsigned long long)ch->promo_hits * wr) return 0;
+    ch->pr_braked++;
+    return 1;
+}
 static void q38cc_vram_entry(Q38CChain *ch, int slot, CcExpert *x) {
     const char *g = ch->ar_base + (size_t)slot * ch->ar_slot;
     memset(x, 0, sizeof *x);
@@ -899,8 +934,10 @@ static int q38cc_promote_init(Q38CChain *ch, Model *m) {
     qt_chain_own();
     ch->own = 1; ch->ar_base = (char *)base; ch->ar_slot = slot; ch->ar_off_u = ou; ch->ar_off_d = od; ch->ar_n = n;
     ch->promo_rate = q38cc_promote_rate(); ch->rng = 0x9e3779b9u; ch->dm_read = 0; ch->stage_dirty = 1;
+    ch->promo_hits = q38cc_promote_hits(); ch->pr_routes0 = ch->routes; ch->pr_reads0 = ch->pool_reads;
     fprintf(stderr, "[chain] qwen38: the card's %d slots are the chain's to fill (%d held): up to %d experts a forward promoted from the "
-                    "pool by this conversation's routes (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)\n", n, held, ch->promo_rate);
+                    "pool by this conversation's routes, none while the last %d frames found %d %% or more of their routes on the card "
+                    "(COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)\n", n, held, ch->promo_rate, Q38CC_PROMO_WIN, ch->promo_hits);
     return 1;
 }
 static const char *q38cc_pool_host(Q38CChain *ch, int k) {
@@ -942,6 +979,7 @@ static void q38cc_promote_books(Q38CChain *ch, Model *m, int n) {
         ch->heat_tick = 0;
         for (size_t j = 0; j < (size_t)L * E; j++) ch->heat[j] >>= 1;
     }
+    if (q38cc_braked(ch)) return;
     int done = 0;
     for (int i = 0; i < L && done < ch->promo_rate; i++) {
         if (!ch->dm_ran[i]) continue;
@@ -1305,6 +1343,7 @@ static void q38cc_dm_books(Q38CChain *ch, Model *m, int n, int pb) {
         for (int s = 0; s < n; s++) { rt_count(i, ids + s * K, K); if (!ch->own) qt_chain_count(i, ids + s * K, K); }
         for (int j = 0; j < n * K; j++) if (ids[j] >= 0) {
             q38_ehit_mark(m, i, ids[j]);
+            ch->routes++;
             if (ch->dm_res[(size_t)i * c->experts + ids[j]] >= 2) ch->pool_reads++;
         }
     }
@@ -1453,6 +1492,8 @@ static void q38cc_report(Model *m) {
         fprintf(stderr, "[chain] qwen38: %llu prompt layer steps staged the host pool's experts (%.2f GB copied over the bus)\n",
                 ch->dm_staged, ch->dm_stage_bytes / 1073741824.0);
     if (ch->own)
-        fprintf(stderr, "[chain] qwen38: %llu experts promoted to the card (%llu residents back to the pool), %d on their way\n",
-                ch->promos, ch->promo_victims, ch->npend);
+        fprintf(stderr, "[chain] qwen38: %llu experts promoted to the card (%llu residents back to the pool), %d on their way; "
+                        "%llu frames braked, %.1f %% of the routes on the card\n",
+                ch->promos, ch->promo_victims, ch->npend, ch->pr_braked,
+                ch->routes ? 100.0 * (double)(ch->routes - ch->pool_reads) / (double)ch->routes : 0.0);
 }
