@@ -31,8 +31,8 @@ __device__ __forceinline__ float e4m3_round(float value) {
     return e4m3(e4m3_code(value));
 }
 
-/* dev's table decode. The bit-built form made the batched MoE's expert
- * compute 1.5x slower in prefill on sm_86 (final31/final32 on 2x RTX 3090). */
+/* A table decode. Building the float from bits made the generic batched
+ * MoE's expert compute 1.5x slower in prefill on sm_86 (2x RTX 3090). */
 __device__ __forceinline__ float f4(uint8_t q) {
     const float a[8] = {0, .5f, 1, 1.5f, 2, 3, 4, 6};
     return q & 8 ? -a[q & 7] : a[q];
