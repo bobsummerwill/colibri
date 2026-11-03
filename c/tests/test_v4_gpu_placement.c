@@ -24,6 +24,19 @@ int dsv4_cuda_init(const int *devices, int count) {
     return 1;
 }
 void dsv4_cuda_shutdown(void) { shutdowns++; }
+int dsv4_cuda_peer_access(int a, int b) { (void)a; (void)b; return 0; }
+int dsv4_cuda_peer_compute(int a, int b) { (void)a; (void)b; return 0; }
+int dsv4_cuda_peer_healthy(int device) { (void)device; return 1; }
+int dsv4_cuda_peer_probe(int device, int peer, char *why, int why_size) {
+    (void)device; (void)peer;
+    if (why && why_size) why[0] = 0;
+    return 0;
+}
+int dsv4_cuda_lost(void) { return 0; }
+int coli_v4_hybrid_enabled(void) { return 0; }
+int coli_v4_gpu_resident_first(void) { return 0; }
+void (*coli_v4_expert_store_vram_held)(ColiExpertStore *store, int layer,
+                                       unsigned char *held, int experts);
 /* Backend entries dev gained after #1766's base (the bank-sized mirror reserve,
  * the prefill bank's activations): this test never reaches them. */
 int dsv4_cuda_expert_bank_slots(int experts) { (void)experts; return 0; }
