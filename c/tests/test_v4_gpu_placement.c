@@ -25,6 +25,7 @@ int dsv4_cuda_init(const int *devices, int count) {
 }
 void dsv4_cuda_shutdown(void) { shutdowns++; }
 int dsv4_cuda_peer_access(int a, int b) { (void)a; (void)b; return 0; }
+void dsv4_cuda_set_peer_best_effort(int on) { (void)on; }
 int dsv4_cuda_peer_compute(int a, int b) { (void)a; (void)b; return 0; }
 int dsv4_cuda_peer_healthy(int device) { (void)device; return 1; }
 int dsv4_cuda_peer_probe(int device, int peer, char *why, int why_size) {
