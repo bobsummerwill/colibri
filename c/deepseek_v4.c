@@ -5776,8 +5776,19 @@ static int moe_token_pipeline(float *output,
                               const ColiDeepSeekV4Config *config,
                               ColiExpertStore *store,
                               const float *input, int token) {
+    moe_reason_clear();
 #ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
     double profile_moe_began = coli_v4_block_profile_now();
+#endif
+#if defined(COLI_V4_GPU_TIER) && !defined(COLI_V4_DISABLE_BF16_ROUTE)
+    int device_moe = coli_v4_gpu_resident_route(output, weights, config, store, input, token);
+    if (device_moe) {
+#ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
+        coli_v4_block_profile_add(COLI_V4_BLOCK_PROFILE_MOE_TOTAL,
+                                  coli_v4_block_profile_now() - profile_moe_began);
+#endif
+        return device_moe > 0 ? 0 : moe_fail("resident device routing failed");
+    }
 #endif
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
     /* decode MoE counters (deepseek_v4_internal.h): the routing included */
@@ -5821,7 +5832,6 @@ static int moe_token_pipeline(float *output,
 #endif
     const int64_t *table = value(weights, "ffn.gate.tid2eid", NULL);
     const float *bias = value(weights, "ffn.gate.bias", NULL);
-    moe_reason_clear();
     int result = token < 0 || token >= config->vocab_size;
     if (result) moe_fail("layer %d: token %d is outside the vocabulary of %d",
                          weights->plan.layer, token, config->vocab_size);
@@ -6359,6 +6369,9 @@ static int moe_token_pipeline(float *output,
         if (!job.result)
             coli_expert_release(store, &job.view);
     }
+#endif
+#if defined(COLI_V4_GPU_TIER) && defined(COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER)
+moe_done:
 #endif
     free(shared_output); free(expert_output); free(expert_weights);
     free(expert_ids); free(indices); free(route_weights); free(gate);
@@ -12852,7 +12865,7 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                         cache->capacity);
         }
         if (grow && !cache->unified &&
-            (cache->count > 0 || cache->last_free_mb >= 0)) {
+            (cache->count > 0 || cache->upload_failed || cache->last_free_mb >= 0)) {
             if (cache->last_free_mb < 0 ||
                 (cache->probes++ % COLI_V4_MIRROR_PROBE_EVERY) == 0) {
                 cache->last_free_mb = dsv4_cuda_mem_free_mb(cache->device);
