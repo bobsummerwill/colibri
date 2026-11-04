@@ -81,6 +81,7 @@ static Dev g[16];static int ng;
  * again. The latch outlives dsv4_cuda_shutdown on purpose: a sticky fault
  * stays in the device's context for the life of the process. */
 static unsigned char g_peer[16][16],g_peer_lost[16];
+static int g_peer_best_effort;   /* layer placement: P2P is optional */
 static bool dev_lost(int d){return d>=0&&d<16&&g_peer_lost[d];}
 static int g_cuda_lost;   /* see cuda_lost */
 static bool dev_ok(int a,int b){return !g_cuda_lost&&(a==b||(a>=0&&a<16&&b>=0&&b<16&&g_peer[a][b]&&!g_peer_lost[a]&&!g_peer_lost[b]));}
@@ -1535,6 +1536,9 @@ static int tc_dev_init(Dev*c){return bok(cublasLtCreate(&c->lt),"cuBLASLt create
 static int tc_dev_init(Dev*){return 1;}
 #endif
 extern "C" int dsv4_cuda_peer_access(int a,int b){return a!=b&&dev_ok(a,b)&&dev_ok(b,a);}
+/* #1766 layer placement does not need P2P; #2405's peer mirror pool does.
+ * The engine sets this to 1 only around the multi-device layer-split init. */
+extern "C" void dsv4_cuda_set_peer_best_effort(int on){g_peer_best_effort=on?1:0;}
 extern "C" int dsv4_cuda_peer_healthy(int device){return !dev_lost(device);}
 /* DSV4_CUDA_BATCHED (1): the fused decode MoE runs its routed experts as
  * grouped launches; 0 = one launch chain per expert, no peer compute. */
@@ -1649,7 +1653,15 @@ extern "C" int dsv4_cuda_init(const int *dev,int n){if(!dev||n<1||n>16||g_cuda_l
             cudaGetLastError();return 0;}
         for(int j=0;j<i;j++)if(dev[j]==dev[i])return 0;
     }
-    float scale[256];for(int b=0;b<256;b++)scale[b]=b?ldexpf(1.f,b-127):ldexpf(1.f,-127);ng=0;for(int i=0;i<n;i++){cudaDeviceProp p{};g[i].id=dev[i];if(!ok(cudaSetDevice(dev[i]),"select device")||!ok(cudaMemcpyToSymbol(e8_table,scale,sizeof(scale)),"scale table upload")||!ok(cudaGetDeviceProperties(&p,dev[i]),"device properties")||!ok(cudaStreamCreateWithFlags(&g[i].stream,cudaStreamNonBlocking),"stream")||!ok(cudaStreamCreateWithFlags(&g[i].aux,cudaStreamNonBlocking),"aux stream")||!ok(cudaEventCreateWithFlags(&g[i].ready,cudaEventDisableTiming),"device event")||!ok(cudaEventCreateWithFlags(&g[i].fork,cudaEventDisableTiming),"fork event")||!ok(cudaEventCreateWithFlags(&g[i].join,cudaEventDisableTiming),"join event")||!tc_dev_init(&g[i])||!ok(cudaMalloc(&g[i].decode_state,2*sizeof(int)),"decode state allocation"))return init_fail(dev,n,i+1,dev[i],-1);g[i].sms=p.multiProcessorCount;g[i].sm=p.major*10+p.minor;ng++;fprintf(stderr,"[DSV4 CUDA] device %d: %s %.1f GB sm_%d%d\n",dev[i],p.name,p.totalGlobalMem/1e9,p.major,p.minor);}for(int i=0;i<n;i++)for(int j=0;j<n;j++)if(i!=j){int can=0;if(!ok(cudaDeviceCanAccessPeer(&can,dev[i],dev[j]),"peer query"))return init_fail(dev,n,n,dev[i],dev[j]);if(can){if(!ok(cudaSetDevice(dev[i]),"select peer device"))return init_fail(dev,n,n,dev[i],dev[j]);cudaError_t e=cudaDeviceEnablePeerAccess(dev[j],0);if(e!=cudaSuccess&&e!=cudaErrorPeerAccessAlreadyEnabled){ok(e,"enable peer access");return init_fail(dev,n,n,dev[i],dev[j]);}if(e==cudaErrorPeerAccessAlreadyEnabled)cudaGetLastError();if(dev[i]>=0&&dev[i]<16&&dev[j]>=0&&dev[j]<16)g_peer[dev[i]][dev[j]]=1;}}
+    float scale[256];for(int b=0;b<256;b++)scale[b]=b?ldexpf(1.f,b-127):ldexpf(1.f,-127);ng=0;for(int i=0;i<n;i++){cudaDeviceProp p{};g[i].id=dev[i];if(!ok(cudaSetDevice(dev[i]),"select device")||!ok(cudaMemcpyToSymbol(e8_table,scale,sizeof(scale)),"scale table upload")||!ok(cudaGetDeviceProperties(&p,dev[i]),"device properties")||!ok(cudaStreamCreateWithFlags(&g[i].stream,cudaStreamNonBlocking),"stream")||!ok(cudaStreamCreateWithFlags(&g[i].aux,cudaStreamNonBlocking),"aux stream")||!ok(cudaEventCreateWithFlags(&g[i].ready,cudaEventDisableTiming),"device event")||!ok(cudaEventCreateWithFlags(&g[i].fork,cudaEventDisableTiming),"fork event")||!ok(cudaEventCreateWithFlags(&g[i].join,cudaEventDisableTiming),"join event")||!tc_dev_init(&g[i])||!ok(cudaMalloc(&g[i].decode_state,2*sizeof(int)),"decode state allocation"))return init_fail(dev,n,i+1,dev[i],-1);g[i].sms=p.multiProcessorCount;g[i].sm=p.major*10+p.minor;ng++;fprintf(stderr,"[DSV4 CUDA] device %d: %s %.1f GB sm_%d%d\n",dev[i],p.name,p.totalGlobalMem/1e9,p.major,p.minor);}for(int i=0;i<n;i++)for(int j=0;j<n;j++)if(i!=j){
+    int can=0;cudaError_t q=cudaDeviceCanAccessPeer(&can,dev[i],dev[j]);
+    if(q!=cudaSuccess){if(!g_peer_best_effort)return init_fail(dev,n,n,dev[i],dev[j]);const char*why=cudaGetErrorString(q);cudaGetLastError();fprintf(stderr,"[DSV4 CUDA] peer query %d -> %d unavailable (%s); continuing without peer access\n",dev[i],dev[j],why);continue;}
+    if(!can)continue;
+    if(!ok(cudaSetDevice(dev[i]),"select peer device"))return init_fail(dev,n,n,dev[i],dev[j]);
+    cudaError_t e=cudaDeviceEnablePeerAccess(dev[j],0);
+    if(e!=cudaSuccess&&e!=cudaErrorPeerAccessAlreadyEnabled){if(!g_peer_best_effort)return init_fail(dev,n,n,dev[i],dev[j]);const char*why=cudaGetErrorString(e);cudaGetLastError();fprintf(stderr,"[DSV4 CUDA] peer access %d -> %d unavailable (%s); continuing without it\n",dev[i],dev[j],why);}
+    else {if(e==cudaErrorPeerAccessAlreadyEnabled)cudaGetLastError();if(dev[i]>=0&&dev[i]<16&&dev[j]>=0&&dev[j]<16)g_peer[dev[i]][dev[j]]=1;}
+}
 #ifdef COLI_DSV4_NCCL
     if(n==6)for(int pair=0;pair<3;pair++){int ids[2]={dev[2*pair],dev[2*pair+1]};ncclComm_t comm[2];if(!nok(ncclCommInitAll(comm,2,ids),"EP2 communicator init"))return init_fail(dev,n,n,-1,-1);g[2*pair].ep_comm=comm[0];g[2*pair+1].ep_comm=comm[1];}
 #endif

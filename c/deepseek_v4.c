@@ -12047,9 +12047,14 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
         fprintf(stderr, "v4_gpu warning=backend-unavailable; continuing-CPU\n");
         return 0;
     }
-    if (count > 1 && !dsv4_cuda_init(engine->gpu.devices, count)) {
-        fprintf(stderr, "v4_gpu warning=backend-unavailable\n");
-        return -1;
+    if (count > 1) {
+        dsv4_cuda_set_peer_best_effort(1);
+        int split_ok = dsv4_cuda_init(engine->gpu.devices, count);
+        dsv4_cuda_set_peer_best_effort(0);
+        if (!split_ok) {
+            fprintf(stderr, "v4_gpu warning=backend-unavailable\n");
+            return -1;
+        }
     }
     /* A build whose kernels cannot run on a device (a DeepGEMM sm_120a
      * binary on an older card -- Linux links one flavour, no DLL selection)
